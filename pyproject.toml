@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keiba-scraper"
+version = "0.1.0"
+description = "Cached netkeiba race data collector for personal analysis"
+requires-python = ">=3.11"
+dependencies = ["beautifulsoup4==4.14.3", "requests==2.32.5"]
+
+[project.scripts]
+keiba-scraper = "keiba_scraper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
