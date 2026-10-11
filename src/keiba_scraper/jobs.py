@@ -12,7 +12,6 @@ import sqlite3
 import threading
 import time
 import uuid
-from zoneinfo import ZoneInfo
 
 from . import urls
 from .client import AccessRestricted, Client, FetchError
@@ -20,7 +19,9 @@ from .parsers import parse_horse_history, parse_race
 from .storage import Store, StorageError
 
 
-JST = ZoneInfo("Asia/Tokyo")
+# Japan has used UTC+9 without DST throughout the supported historical window.
+# A fixed offset also works on Windows without a system IANA timezone database.
+JST = timezone(timedelta(hours=9), name="JST")
 
 
 def historical_window(years: int = 5, *, today: date | None = None,

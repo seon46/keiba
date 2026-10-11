@@ -9,7 +9,40 @@ cd /workspace/keiba
 bash scripts/setup.sh
 ```
 
-依存バージョンは `requirements.txt` に固定しています。以降は `.venv/bin/keiba-scraper` を使います。
+依存バージョンは `requirements.txt` に固定しています。Linux・macOSでは以降の例の `.venv/bin/keiba-scraper` を使います。
+
+### Windows / PowerShell
+
+GitとPython 3.11以上をインストールし、PowerShellで実行します。
+
+```powershell
+# 初回のみ。すでにclone済みなら、そのkeibaフォルダーでgit pullする
+git clone https://github.com/seon46/keiba.git
+cd keiba
+
+# Windows PowerShell 5.1 / PowerShell 7向けセットアップ
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+
+# 中央・地方の過去5年間を収集
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper backfill --years 5 --region both
+```
+
+仮想環境のActivateは不要です。セットアップのPython自動検出は `py -3`、`python`、`python3` の順です。使用するPythonを明示する場合はセットアップコマンドに `-Python "C:\path with spaces\python.exe"` を追加します。実行ポリシーの指定はセットアップ用プロセスだけに適用されます。
+
+以降のLinux向け例の `.venv/bin/keiba-scraper` は、Windowsでは `.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper` に置き換えます。
+
+```powershell
+# 別のPowerShellで進捗確認。同じkeibaフォルダーで実行する
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper status
+
+# 中断後、表示されたjob_idを指定して再開（JOB_IDを実際のIDに置換）
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper backfill --resume JOB_ID
+
+# CSVはPythonから直接UTF-8で出力
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper export --page results --output data\results.csv
+```
+
+取得中はPowerShellを開いたままにし、PCのスリープを無効にしてください。Ctrl+Cで停止すると保存済みデータと進捗は残ります。Windowsの省電力設定をこのプログラムが変更することはありません。
 
 ## 過去5年間を収集する
 
