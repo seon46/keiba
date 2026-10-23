@@ -147,6 +147,10 @@ GitHubの名前解決に失敗するPCには、別途渡すGit bundleを `keiba-
 
 `reparse_summary.complete` は成功レース原本の再解析が終わったかを示します。収集全体の `status.complete`、未取得レースの再試行とは別に確認します。`reparse` は未取得ページをダウンロードしません。収集と再解析を同時に動かさないでください。開始時の実行中タスク確認は排他ロックではありません。
 
+Windows向けに別途配布する補完専用ZIPには、Git bundleと `reparse_saved_data.py` / `reparse_saved_data.cmd` を同梱します。ZIPをすべて展開してから `reparse_saved_data.cmd` を実行すると、`%USERPROFILE%\keiba` をローカルbundleからfast-forward更新し、既存の仮想環境で上記ジョブの成功済み原本だけを再解析します。Downloads等に展開したまま実行でき、bundleの移動は不要です。Gitの更新に失敗すれば補完を開始しません。`retry` / `backfill` やサイトへの再取得は実行しません。
+
+この起動用ファイルは進捗を `data/reparse_console.log`、最終集計を `data/reparse_report.json` に保存します。空き容量不足などで一時停止した場合も完了とは表示しません。同じファイルで残りから再開できます。補完で更新するのはSQLiteの解析結果です。既存CSVを使う場合は、完了後にexportで出力し直してください。
+
 地方の別表から補完したコーナー通過順では、並走グループはグループ先頭の順位を共有します。元の原文・並走グループ・corner番号も `race_corner_passages`、`corner_positions`、`corner_group_ids` 等に保持します。既存の馬ごとの通過順は上書きせず、未知の馬番・破損した表・不足したcornerは推測しません。問題がある別表は `race_parse_warnings` に残します。
 
 ## データセットを出力する
