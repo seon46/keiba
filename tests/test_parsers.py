@@ -40,6 +40,27 @@ RESULT_ROW = ['1', '1', '2', HORSE, '牡3', '57', JOCKEY, '1:25.6', '',
               '2', '4.6', '36.8', '3-3-2-1', TRAINER, '499(+2)']
 
 
+def corner_table(rows):
+    return '<table class="RaceCommon_Table Corner_Num">' + ''.join(
+        f'<tr><th><strong>{corner}</strong>コーナー</th><td>{order}</td></tr>'
+        for corner, order in rows
+    ) + '</table>'
+
+
+def result_rows(numbers, scratched=()):
+    rows = []
+    for index, number in enumerate(numbers, 1):
+        row = RESULT_ROW.copy()
+        row[0] = '取消' if number in scratched else str(index)
+        row[2] = str(number)
+        row[3] = HORSE.replace('2021100001', str(2021100000 + number))
+        row[12] = ''
+        if number in scratched:
+            row[7] = ''
+        rows.append(row)
+    return rows
+
+
 class RaceParserTests(unittest.TestCase):
     def parse(self, body, page="entries", region="central"):
         return parse_race(document(body), race_id=RACE_ID, region=region, page=page)
@@ -182,6 +203,105 @@ class RaceParserTests(unittest.TestCase):
         self.assertIsNone(runners[1]['finish_position'])
         self.assertEqual(runners[1]['finish_status'], 'scratched')
 
+    def test_local_personnel_mixed_ids_are_retained_without_guessing(self):
+        row = ENTRY_ROW.copy()
+        row[5] = JOCKEY.replace('00123', 'a03fd')
+        row[6] = TRAINER.replace('https://db.netkeiba.com/trainer/00456/',
+                                 'https://db.netkeiba.com/trainer/result/recent/a024c')
+        runner = self.parse(table(ENTRY_HEADERS, [row]), region='local')['runners'][0]
+        self.assertEqual((runner['jockey_id'], runner['trainer_id']), ('a03fd', 'a024c'))
+        row[5] = '<a href="https://db.netkeiba.com/jockey/result/recent/">騎手A</a>'
+        runner = self.parse(table(ENTRY_HEADERS, [row]), region='local')['runners'][0]
+        self.assertIsNone(runner['jockey_id'])
+        self.assertEqual(runner['jockey_name'], '騎手A')
+
+    def test_known_weight_survives_unknown_previous_measurement(self):
+        for text, expected in [('480(前計不)', (480, None)), ('480(計不)', (480, None)),
+                               ('４８０（前計不）', (480, None)), ('480()', (480, None)),
+                               ('480(-2)', (480, -2)), ('480(0)', (480, 0)),
+                               ('計不', (None, None)), ('不明480', (None, None))]:
+            with self.subTest(text=text):
+                row = ENTRY_ROW.copy()
+                row[7] = text
+                runner = self.parse(table(ENTRY_HEADERS, [row]), region='local')['runners'][0]
+                self.assertEqual((runner['weight_kg'], runner['weight_change_kg']), expected)
+
+    def test_local_corner_groups_share_leading_rank_and_preserve_original_structure(self):
+        body = table(RESULT_HEADERS, result_rows([1, 8, 2, 4], scratched=[4]))
+        body += corner_table([
+            (1, '(<span>1</span>,8),2'), (2, '(1,8)-2'),
+            (3, '2,(1,8)'), (4, '(1,8,2)'),
+        ])
+        result = self.parse(body, region='local', page='results')
+        race = result['race']
+        runners = {runner['horse_number']: runner for runner in result['runners']}
+        self.assertEqual(race['corner_passages'][0]['groups'], [[1, 8], [2]])
+        self.assertIn('-', race['corner_passages'][1]['raw'])
+        self.assertEqual(race['corner_position_basis'], 'parallel_group_leading_rank')
+        self.assertEqual(runners[1]['corner_positions'], {'1': 1, '2': 1, '3': 2, '4': 1})
+        self.assertEqual(runners[8]['corner_positions'], runners[1]['corner_positions'])
+        self.assertEqual(runners[2]['corner_positions'], {'1': 3, '2': 3, '3': 1, '4': 1})
+        self.assertEqual(runners[8]['corner_group_ids'], {'1': 1, '2': 1, '3': 2, '4': 1})
+        self.assertEqual(runners[1]['corner_order'], '1-1-2-1')
+        self.assertEqual(runners[1]['corner_order_corners'], [1, 2, 3, 4])
+        self.assertEqual(runners[1]['corner_order_source'], 'corner_table')
+        self.assertEqual(runners[4]['finish_status'], 'scratched')
+        self.assertIsNone(runners[4]['corner_order'])
+        self.assertNotIn('corner_positions', runners[4])
+
+    def test_missing_corner_for_a_horse_is_not_imputed(self):
+        body = table(RESULT_HEADERS, result_rows([1, 2, 3], scratched=[3]))
+        body += corner_table([(3, '1,2'), (4, '2')])
+        result = self.parse(body, region='local', page='results')
+        runners = {runner['horse_number']: runner for runner in result['runners']}
+        self.assertEqual(runners[1]['corner_positions'], {'3': 1})
+        self.assertIsNone(runners[1]['corner_order'])
+        self.assertEqual(runners[2]['corner_order'], '2-1')
+        self.assertEqual(runners[2]['corner_order_corners'], [3, 4])
+        self.assertTrue(any('missing_finished_runners' in warning
+                            for warning in result['race']['parse_warnings']))
+
+    def test_broken_or_unknown_corner_values_are_warned_without_fabricating_order(self):
+        for passage in ['(1,2', '1,99', '1,1,2', '1,x,2', '1,,2', '1 2', '1,2,3']:
+            with self.subTest(passage=passage):
+                body = table(RESULT_HEADERS, result_rows([1, 2, 3], scratched=[3]))
+                body += corner_table([(3, passage), (4, '1,2')])
+                result = self.parse(body, region='local', page='results')
+                self.assertTrue(any('corner_table_invalid' in warning
+                                    for warning in result['race']['parse_warnings']))
+                self.assertEqual([row['corner'] for row in result['race']['corner_passages']], [4])
+                self.assertEqual(result['runners'][0]['corner_positions'], {'4': 1})
+                self.assertIsNone(result['runners'][0]['corner_order'])
+
+    def test_duplicate_corner_rows_are_ambiguous_and_primary_column_is_preserved(self):
+        body = table(RESULT_HEADERS, result_rows([1, 2]))
+        body += corner_table([(3, '1,2'), (3, '2,1'), (4, '1,2')])
+        result = self.parse(body, region='local', page='results')
+        self.assertTrue(any('duplicate_corner' in warning for warning in result['race']['parse_warnings']))
+        self.assertEqual([row['corner'] for row in result['race']['corner_passages']], [4])
+        self.assertIsNone(result['runners'][0]['corner_order'])
+
+        body = table(RESULT_HEADERS, [RESULT_ROW]) + corner_table([(3, '2'), (4, '2')])
+        for region in ('central', 'local'):
+            with self.subTest(region=region):
+                result = self.parse(body, region=region, page='results')
+                self.assertEqual(result['runners'][0]['corner_order'], '3-3-2-1')
+                self.assertNotIn('corner_order_source', result['runners'][0])
+
+    def test_truncated_corner_html_is_warned_before_dom_repairs_it(self):
+        for fragment in (
+            '<table class="Corner_Num"><tr><th>3コーナー</th><td>1,2',
+            '<table class="Corner_Num"><tr><th>3コーナー</th><td>1,2</tr></table>',
+        ):
+            with self.subTest(fragment=fragment):
+                body = table(RESULT_HEADERS, result_rows([1, 2])) + fragment
+                result = self.parse(body, region='local', page='results')
+                self.assertTrue(any('corner_table_malformed_html' in warning
+                                    for warning in result['race']['parse_warnings']))
+                self.assertNotIn('corner_passages', result['race'])
+                self.assertNotIn('corner_positions', result['runners'][0])
+                self.assertIsNone(result['runners'][0]['corner_order'])
+
 
 class HorseHistoryParserTests(unittest.TestCase):
     def test_history_retains_overseas_ids_and_ignores_paid_indices(self):
@@ -209,6 +329,16 @@ class HorseHistoryParserTests(unittest.TestCase):
     def test_profile_without_public_history_is_error(self):
         with self.assertRaises(ParseError):
             parse_horse_history('<h1>テスト馬</h1><div>戦績を読み込み中</div>', horse_id='2021100001')
+
+    def test_local_history_retains_mixed_jockey_id_and_known_weight(self):
+        html = '<h1>テスト馬</h1>' + table(
+            ['日付', 'レース名', '着順', '騎手', '馬体重'],
+            [['2025/03/02', '<a href="/race/202535030201/">テスト賞</a>', '1',
+              JOCKEY.replace('00123', 'a02e2'), '480(前計不)']], css='db_h_race_results')
+        run = parse_horse_history(html, horse_id='2021100001')['runs'][0]
+        self.assertEqual(run['jockey_id'], 'a02e2')
+        self.assertEqual(run['weight_kg'], 480)
+        self.assertIsNone(run['weight_change_kg'])
 
     def test_history_name_and_response_identity(self):
         html = (

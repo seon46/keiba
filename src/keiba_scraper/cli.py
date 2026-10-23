@@ -80,8 +80,18 @@ def parser() -> argparse.ArgumentParser:
     backfill.add_argument('--min-free-mb', type=nonnegative, default=1024, help='空き容量が指定MB未満なら一時停止')
     status = commands.add_parser('status', help='収集進捗・未取得・失敗を表示（通信なし）')
     status.add_argument('--job-id')
+    diagnose = commands.add_parser('diagnose', help='失敗全件と原因別件数を出力（通信なし）')
+    diagnose.add_argument('--job-id', required=True)
+    diagnose.add_argument('--output', type=Path, help='診断結果をUTF-8 JSONファイルに保存')
+    diagnose.add_argument('--overwrite', action='store_true')
     retry = commands.add_parser('retry', help='失敗・取得制限のタスクを再実行待ちに戻す（通信なし）')
     retry.add_argument('--job-id', required=True)
+    retry.add_argument('--error-type', action='append', help='指定した例外種別だけ戻す（複数指定可）')
+    retry.add_argument('--kind', choices=('day', 'race', 'horse'))
+    reparse = commands.add_parser('reparse', help='保存済みレース原本を再解析し、取り漏らしを補完（通信なし）')
+    reparse.add_argument('--job-id', required=True)
+    reparse.add_argument('--max-tasks', type=nonnegative, default=0)
+    reparse.add_argument('--min-free-mb', type=nonnegative, default=1024)
     export = commands.add_parser('export', help='保存済みデータをCSV/JSONLへ出力')
     export.add_argument('--dataset', choices=('runners', 'horse-runs'), default='runners')
     export.add_argument('--page', choices=('entries', 'results'))
@@ -99,10 +109,7 @@ def report(**payload) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-def export_data(store: Store, args) -> int:
-    """Two CSV scans share one SQLite snapshot; publication is atomic."""
-    options = dict(dataset=args.dataset, page=args.page, region=args.region,
-                   all_snapshots=args.all_snapshots, start_date=args.start_date, end_date=args.end_date)
+def output_destination(store: Store, args) -> Path:
     destination = args.output.resolve()
     protected = {store.directory / ('keiba.sqlite3' + suffix) for suffix in ('', '-wal', '-shm', '-journal')}
     if destination in protected or destination.is_relative_to(store.directory / 'raw'):
@@ -110,6 +117,34 @@ def export_data(store: Store, args) -> int:
     if destination.exists() and not args.overwrite:
         raise FileExistsError(f'出力先は既に存在します: {destination}')
     destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination
+
+
+def write_diagnostic(store: Store, args, payload: dict) -> None:
+    destination = output_destination(store, args)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=destination.parent,
+                                         prefix='.keiba-diagnose-', suffix='.tmp', delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write('\n')
+            file.flush()
+            os.fsync(file.fileno())
+        if args.overwrite:
+            os.replace(temporary, destination)
+        else:
+            os.link(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def export_data(store: Store, args) -> int:
+    """Two CSV scans share one SQLite snapshot; publication is atomic."""
+    options = dict(dataset=args.dataset, page=args.page, region=args.region,
+                   all_snapshots=args.all_snapshots, start_date=args.start_date, end_date=args.end_date)
+    destination = output_destination(store, args)
     temporary = None
     rows = None
     count = 0
@@ -160,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         app.error('--offline と --refresh は同時に指定できません。')
     if args.command == 'export' and args.dataset == 'horse-runs' and (args.page or args.region):
         app.error('horse-runs には --page/--region フィルターはありません。')
+    if args.command == 'reparse' and args.refresh:
+        app.error('reparse は保存済み原本のみを使います。--refresh は指定できません。')
     if args.command == 'backfill' and args.resume:
         # Avoid silently ignoring changes to a resumed job's immutable scope.
         tokens = argv if argv is not None else sys.argv[1:]
@@ -175,14 +212,35 @@ def main(argv: list[str] | None = None) -> int:
             count = export_data(store, args)
             report(output=str(args.output), rows=count, dataset=args.dataset)
             return 0
-        if args.command in ('backfill', 'status', 'retry'):
+        if args.command in ('backfill', 'status', 'retry', 'diagnose', 'reparse'):
             queue = JobQueue(store)
             if args.command == 'status':
                 for summary in queue.summaries(args.job_id):
                     report(**summary)
                 return 0
+            if args.command == 'diagnose':
+                store.db.execute('BEGIN')
+                try:
+                    diagnosis = queue.diagnostics(args.job_id)
+                    store.db.commit()
+                except BaseException:
+                    store.db.rollback()
+                    raise
+                if args.output:
+                    write_diagnostic(store, args, diagnosis)
+                    report(event='diagnosis_saved', output=str(args.output),
+                           failed_task_count=diagnosis['failed_task_count'], error_groups=diagnosis['error_groups'])
+                else:
+                    report(**diagnosis)
+                return 0
+            if args.command == 'reparse':
+                from .maintenance import Reparser
+                summary = Reparser(queue, report=report).run(args.job_id, max_tasks=args.max_tasks,
+                                                            min_free_mb=args.min_free_mb)
+                report(event='reparse_summary', **summary)
+                return 2 if summary['failed'] else 0
             if args.command == 'retry':
-                count = queue.retry(args.job_id, refresh=args.refresh)
+                count = queue.retry(args.job_id, refresh=args.refresh, error_types=args.error_type, kind=args.kind)
                 report(event='retry_scheduled', job_id=args.job_id, tasks=count, refresh=args.refresh)
                 return 0
             if args.resume:

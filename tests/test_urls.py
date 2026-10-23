@@ -21,6 +21,22 @@ def race_card(identifier, *, host=None):
             f'<a href="../race/movie.html?race_id={identifier}">映像</a></li>')
 
 
+def unpublished_fragment(public_cards=(), *, reason='開催2~3日前 公開予定です。'):
+    unpublished = (
+        '<dl class="RaceList_DataList" style="display:none">'
+        '<dt class="RaceList_DataHeader"><p class="RaceList_DataTitle">'
+        '<small>-回</small> 帯広(ば) <small>-日目</small></p></dt>'
+        '<dd class="RaceList_Data RaceList_Data_Infomation"><ul></ul>'
+        '<div class="Race_Infomation_Box">' + reason + '</div></dd></dl>'
+    )
+    if public_cards:
+        html = daily_fragment(public_cards, day='20250427', marker='d')
+        return html.rsplit('</div></div>', 1)[0] + unpublished + '</div></div>'
+    return ('<!-- block=race_list_sub (d) -->'
+            '<div class="RaceList_Body RaceList_Top"><div class="RaceList_Box">'
+            + unpublished + '</div></div>')
+
+
 class URLTests(unittest.TestCase):
     def test_exact_source_urls_and_identifier_validation(self):
         self.assertEqual(race_url('202405021211', 'central', 'results'),
@@ -57,7 +73,22 @@ class URLTests(unittest.TestCase):
         self.assertEqual(result['card_count'], 2)
         self.assertTrue(result['day_verified'])
         self.assertTrue(result['region_verified'])
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['unavailable_meetings'], [])
         self.assertEqual(result['field_sizes'], {'202105040301': 12, '202105040302': 12})
+
+    def test_declared_count_comes_from_metadata_not_numeric_race_title(self):
+        card = race_card('202147102805').replace(
+            '<div class="RaceData">',
+            '<div class="RaceList_ItemTitle">テスト競馬465頭の記念</div><div class="RaceData">')
+        card = card.replace('12頭', '9頭')
+        result = discover_day(daily_fragment([card], day='20211028', marker='d'),
+                              day='2021-10-28', region='local')
+        self.assertEqual(result['field_sizes'], {'202147102805': 9})
+        ambiguous = card.replace('9頭', '9頭 10頭')
+        with self.assertRaises(ValueError):
+            discover_day(daily_fragment([ambiguous], day='20211028', marker='d'),
+                         day='2021-10-28', region='local')
 
     def test_known_empty_day_retains_unverified_date(self):
         html = ('<meta charset="UTF-8"><!-- block=race_list_sub (cp) -->'
@@ -68,6 +99,62 @@ class URLTests(unittest.TestCase):
         self.assertEqual(result['race_ids'], [])
         self.assertFalse(result['day_verified'])
         self.assertEqual(result['empty_evidence'], 'empty_list_fragment')
+
+    def test_known_local_empty_selector_is_not_missing_data(self):
+        html = ('<meta charset="UTF-8"><!-- block=race_list_sub (d) -->'
+                '<div class="RaceList_Body RaceList_Top"><div>'
+                '<ul class="RaceList_ProvinceSelect"></ul></div>'
+                '<div class="RaceList_Box"></div><!-- /.RaceList_Box -->'
+                '</div><!-- .RaceList_Body RaceList_Top -->')
+        result = discover_day(html, day='2025-02-03', region='local')
+        self.assertTrue(result['empty'])
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['day_verified'])
+        self.assertEqual(result['empty_evidence'], 'empty_list_fragment')
+        for unknown in (html.replace('<ul class="RaceList_ProvinceSelect"></ul>', '<div></div>'),
+                        html.replace('</ul>', '<li>読み込み中</li></ul>'), html[:-60]):
+            with self.subTest(html=unknown[-100:]), self.assertRaises(ValueError):
+                discover_day(unknown, day='2025-02-03', region='local')
+
+    def test_explicitly_unpublished_meeting_requires_partial_opt_in(self):
+        html = unpublished_fragment([race_card('202536042701')])
+        with self.assertRaisesRegex(ValueError, '未公開'):
+            discover_day(html, day='2025-04-27', region='local')
+        result = discover_day(html, day='2025-04-27', region='local', allow_partial=True)
+        self.assertEqual(result['race_ids'], ['202536042701'])
+        self.assertEqual(result['card_count'], 1)
+        self.assertEqual(result['meeting_count'], 2)
+        self.assertFalse(result['empty'])
+        self.assertFalse(result['complete'])
+        self.assertTrue(result['day_verified'])
+        self.assertEqual(result['unavailable_meetings'], [{
+            'name': '帯広(ば)', 'reason': '開催2~3日前 公開予定です。',
+            'meeting_index': 2, 'source_state': 'not_published',
+        }])
+
+    def test_only_unpublished_meetings_are_never_an_empty_complete_day(self):
+        result = discover_day(unpublished_fragment(), day='2025-04-27', region='local', allow_partial=True)
+        self.assertEqual(result['race_ids'], [])
+        self.assertFalse(result['empty'])
+        self.assertFalse(result['complete'])
+        self.assertFalse(result['day_verified'])
+        self.assertEqual(result['unavailable_meetings'][0]['name'], '帯広(ば)')
+
+    def test_partial_mode_does_not_allow_unknown_or_invalid_sections(self):
+        malformed = [
+            unpublished_fragment(reason='読み込み中です。'),
+            unpublished_fragment().replace('class="RaceList_DataHeader"', 'class="UnknownHeader"'),
+            unpublished_fragment(['<li class="RaceList_DataItem">壊れたカード</li>']),
+            unpublished_fragment([race_card('invalid')]),
+        ]
+        for html in malformed:
+            with self.subTest(html=html[-100:]), self.assertRaises(ValueError):
+                discover_day(html, day='2025-04-27', region='local', allow_partial=True)
+        dated = unpublished_fragment([race_card('202536042701')])
+        with self.assertRaises(ValueError):
+            discover_day(dated, day='2025-04-28', region='local', allow_partial=True)
+        with self.assertRaises(ValueError):
+            discover_day(dated, day='2025-04-27', region='central', allow_partial=True)
 
     def test_explicit_empty_day_and_unknown_empty_are_distinct(self):
         box = ('<div class="RaceList_Body RaceList_Top"><div class="RaceList_Box">'

@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import date
+from html.parser import HTMLParser
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -130,11 +131,13 @@ def _rows(table: Tag, headers: list[str | None]):
 def _entity(cell: Tag | None, entity: str) -> tuple[str | None, str | None]:
     if cell is None:
         return None, None
-    pattern = rf"/{entity}/(?:(?:result/(?:recent/)?)|profile/)?([A-Za-z]?\d+)(?:/|$)"
+    # NAR personnel include mixed IDs such as a03fd, not just numeric/B IDs.
+    identifier = r"[A-Za-z0-9]+" if entity in ("jockey", "trainer") else r"[A-Za-z]?\d+"
+    pattern = rf"/{entity}/(?:(?:result/(?:recent/)?)|profile/)?({identifier})(?:/|$)"
     for anchor in cell.find_all("a", href=True):
         path = unquote(urlsplit(anchor["href"]).path)
         match = re.search(pattern, path)
-        if match:
+        if match and any(character.isdigit() for character in match[1]):
             return match[1], _text(anchor) or anchor.get("title") or None
     return None, _cell_text(cell) or None
 
@@ -155,10 +158,11 @@ def _finish(value: str) -> tuple[int | None, str]:
 
 def _weight(value: str) -> dict:
     value = _normalized(value)
-    match = re.fullmatch(r"(\d+)(?:\(([+-]?\d+)\))?", value)
+    # A known weight remains usable when the previous measurement is unknown.
+    match = re.fullmatch(r"(\d+)(?:\(([^()]*)\))?", value)
     return {
         "weight_kg": int(match[1]) if match else None,
-        "weight_change_kg": int(match[2]) if match and match[2] else None,
+        "weight_change_kg": _number(match[2], integer=True) if match and match[2] else None,
     }
 
 
@@ -215,6 +219,149 @@ def _runner(row: Tag, cells: dict[str, Tag], *, page: str) -> dict:
         if status != "unknown":
             result.update(finish_position=None, finish_status=status)
     return result
+
+
+def _corner_groups(raw: str, allowed: set[int]) -> list[list[int]]:
+    """Parse only known horse numbers and explicit parallel-group syntax."""
+    normalized = unicodedata.normalize("NFKC", raw)
+    if re.search(r"[0-9]\s+[0-9]", normalized):
+        raise ValueError("horse numbers separated only by whitespace")
+    normalized = re.sub(r"\s+", "", normalized)
+    token = r"(?:\([1-9][0-9]*(?:,[1-9][0-9]*)*\)|[1-9][0-9]*)"
+    if not re.fullmatch(rf"{token}(?:[,=-]{token})*", normalized):
+        raise ValueError("unsupported or broken passage syntax")
+    groups = [[int(number) for number in value.strip("()").split(",")]
+              for value in re.findall(token, normalized)]
+    numbers = [number for group in groups for number in group]
+    if len(numbers) != len(set(numbers)):
+        raise ValueError("duplicate horse numbers")
+    if not set(numbers) <= allowed:
+        raise ValueError(f"unknown or non-starting horse numbers {sorted(set(numbers) - allowed)}")
+    return groups
+
+
+class _CornerMarkup(HTMLParser):
+    """Check explicit corner-table endings before the DOM repairs truncation."""
+
+    structural_tags = {"table", "tr", "th", "td"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+        self.active = False
+        self.seen = 0
+        self.broken = False
+
+    def handle_starttag(self, tag, attrs):
+        if not self.active:
+            classes = dict(attrs).get("class") or ""
+            if tag != "table" or "Corner_Num" not in classes.split():
+                return
+            self.active = True
+            self.seen += 1
+        if tag in self.structural_tags:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if self.active and tag in self.structural_tags:
+            if self.stack and self.stack[-1] == tag:
+                self.stack.pop()
+            else:
+                self.broken = True
+            if not self.stack:
+                self.active = False
+
+
+def _add_corner_passages(soup: BeautifulSoup, race: dict, runners: list[dict], html: str) -> None:
+    """Supplement NAR result columns from its separate corner table.
+
+    Horses in a parallel group share its leading rank. The original groups and
+    corner labels remain available; a group's internal order is never a rank.
+    """
+    tables = soup.select("table.Corner_Num")
+    if not tables:
+        return
+    structure = _CornerMarkup()
+    structure.feed(html)
+    structure.close()
+    if structure.broken or structure.stack or structure.seen != len(tables):
+        race.setdefault("parse_warnings", []).append("corner_table_malformed_html: incomplete table structure")
+        return
+    warnings = []
+    numbers = [runner.get("horse_number") for runner in runners]
+    if (len(tables) != 1 or any(type(number) is not int or number <= 0 for number in numbers)
+            or len(set(numbers)) != len(numbers)):
+        race.setdefault("parse_warnings", []).append(
+            "corner_table_unusable: ambiguous table or missing/duplicate runner numbers")
+        return
+    allowed = {runner["horse_number"] for runner in runners
+               if runner.get("finish_status") not in ("scratched", "excluded")}
+    passages = {}
+    seen = set()
+    invalid_corners = set()
+    structural_error = False
+    for row in tables[0].find_all("tr"):
+        if row.find_parent("table") is not tables[0]:
+            continue
+        labels = row.find_all("th", recursive=False)
+        values = row.find_all("td", recursive=False)
+        label = _normalized(_text(labels[0])) if len(labels) == 1 else ""
+        match = re.fullmatch(r"([1-4])コーナー", label)
+        if match is None or len(values) != 1:
+            warnings.append(f"corner_table_invalid_row: {label or 'unknown corner'}")
+            structural_error = True
+            continue
+        corner = int(match[1])
+        if corner in seen:
+            warnings.append(f"corner_table_duplicate_corner: {corner}")
+            invalid_corners.add(corner)
+            structural_error = True
+            continue
+        seen.add(corner)
+        raw = _text(values[0])
+        try:
+            groups = _corner_groups(raw, allowed)
+        except ValueError as exc:
+            warnings.append(f"corner_table_invalid: corner {corner}: {exc}")
+            structural_error = True
+            continue
+        passages[corner] = {"corner": corner, "raw": raw, "groups": groups}
+        present = {number for group in groups for number in group}
+        missing = sorted(runner["horse_number"] for runner in runners
+                         if runner.get("finish_status") == "finished"
+                         and runner["horse_number"] not in present)
+        if missing:
+            warnings.append(f"corner_table_missing_finished_runners: corner {corner}: {missing}")
+    for corner in invalid_corners:
+        passages.pop(corner, None)
+    if not passages:
+        warnings.append("corner_table_empty: no usable corner passages")
+    else:
+        ordered = sorted(passages)
+        race["corner_passages"] = [passages[corner] for corner in ordered]
+        race["corner_position_basis"] = "parallel_group_leading_rank"
+        for runner in runners:
+            number = runner["horse_number"]
+            positions, group_ids = {}, {}
+            for corner in ordered:
+                rank = 1
+                for group_id, group in enumerate(passages[corner]["groups"], 1):
+                    if number in group:
+                        positions[str(corner)] = rank
+                        group_ids[str(corner)] = group_id
+                        break
+                    rank += len(group)
+            if positions:
+                runner["corner_positions"] = positions
+                runner["corner_group_ids"] = group_ids
+            # Do not manufacture missing passages or replace the primary column.
+            if (positions and len(positions) == len(ordered) and not structural_error
+                    and not runner.get("corner_order")):
+                runner["corner_order"] = "-".join(str(positions[str(corner)]) for corner in ordered)
+                runner["corner_order_corners"] = ordered.copy()
+                runner["corner_order_source"] = "corner_table"
+    if warnings:
+        race.setdefault("parse_warnings", []).extend(warnings)
 
 
 def _check_race_identity(soup: BeautifulSoup, race_id: str) -> bool:
@@ -317,6 +464,8 @@ def parse_race(html: str, *, race_id: str, region: str, page: str) -> dict:
             raise ParseError("The response explicitly marks its results as unconfirmed.")
     race = _race_metadata(soup, race_id, region, page)
     race["race_id_verified"] = identity_verified
+    if region == "local" and page == "results":
+        _add_corner_passages(soup, race, runners, html)
     return {"race": race, "runners": runners}
 
 

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import threading
@@ -22,6 +23,10 @@ from .storage import Store, StorageError
 # Japan has used UTC+9 without DST throughout the supported historical window.
 # A fixed offset also works on Windows without a system IANA timezone database.
 JST = timezone(timedelta(hours=9), name="JST")
+
+
+class IncompleteDay(ValueError):
+    """A daily list exposes some races but withholds another meeting."""
 
 
 def historical_window(years: int = 5, *, today: date | None = None,
@@ -183,8 +188,13 @@ class JobQueue:
                     "VALUES (?,'race',?,?,?,?,?)",
                     ((job_id, f"{task.region}:{race_id}:{page}", task.region, task.day, race_id, page)
                      for page in config["pages"]))
-            self._finish(task, "done", snapshot_id=observation.id,
-                         items=len(discovery["race_ids"]), result=discovery)
+            incomplete = discovery.get("complete") is False
+            error = None
+            if incomplete:
+                names = [meeting.get("name") or "不明" for meeting in discovery.get("unavailable_meetings", [])]
+                error = IncompleteDay("開催一覧に未公開の区画があります: " + ", ".join(names))
+            self._finish(task, "failed" if incomplete else "done", snapshot_id=observation.id,
+                         items=len(discovery["race_ids"]), result=discovery, error=error)
 
     def complete_race(self, task: Task, observation, parsed: dict) -> None:
         with self.db:
@@ -228,14 +238,80 @@ class JobQueue:
             self.db.execute("UPDATE collection_jobs SET state=?,updated_at=? WHERE job_id=?",
                             (state, datetime.now(timezone.utc).isoformat(), job_id))
 
-    def retry(self, job_id: str, *, refresh: bool = False) -> int:
+    def retry(self, job_id: str, *, refresh: bool = False, error_types: list[str] | None = None,
+              kind: str | None = None) -> int:
         self.config(job_id)
+        conditions = ["job_id=?", "state IN ('failed','blocked')"]
+        values = [int(refresh), job_id]
+        if error_types:
+            conditions.append("error_type IN (" + ",".join("?" for _ in error_types) + ")")
+            values.extend(error_types)
+        if kind:
+            conditions.append("kind=?")
+            values.append(kind)
         with self.db:
             cursor = self.db.execute(
                 "UPDATE collection_tasks SET state='pending',attempts=0,available_at=0,force_refresh=?,"
-                "last_error=NULL,error_type=NULL WHERE job_id=? AND state IN ('failed','blocked')",
-                (int(refresh), job_id))
+                "last_error=NULL,error_type=NULL WHERE " + " AND ".join(conditions), values)
         return cursor.rowcount
+
+    def validate_race(self, task_id: int, parsed: dict) -> None:
+        task = self.db.execute("SELECT * FROM collection_tasks WHERE id=? AND kind='race'", (task_id,)).fetchone()
+        if task is None:
+            raise StorageError("照合対象のレースタスクがありません。")
+        race, runners = parsed["race"], parsed["runners"]
+        if any(race.get(key) != task[key] for key in ("race_id", "region", "page")):
+            raise ValueError("解析したレースのID・地域・ページが収集予定と一致しません。")
+        if not race.get("race_id_verified") or race.get("race_date") != task["day"]:
+            raise ValueError(f"結果ページのIDまたは開催日を照合できません: 予定={task['day']}, 実際={race.get('race_date')}")
+        if race.get("declared_field_size") is not None and race["declared_field_size"] != len(runners):
+            raise ValueError("掲載頭数と取得した出走行数が一致しません。原本を確認してください。")
+        expected = self.db.execute(
+            "SELECT expected_field_size FROM collection_races WHERE job_id=? AND region=? AND race_id=?",
+            (task["job_id"], task["region"], task["race_id"])).fetchone()
+        if expected and expected[0] is not None and expected[0] != len(runners):
+            raise ValueError("開催一覧の頭数と取得した出走行数が一致しません。原本を確認してください。")
+
+    def diagnostics(self, job_id: str) -> dict:
+        """Include every failed task, unlike status's twenty examples. No HTTP."""
+        summary = self.summary(job_id)
+        problems, groups = [], {}
+        for row in self.db.execute(
+                "SELECT id,kind,region,day,race_id,page,horse_id,state,last_error,error_type,attempts,result_json "
+                "FROM collection_tasks WHERE job_id=? AND state IN ('failed','blocked') ORDER BY id", (job_id,)):
+            problem = dict(row)
+            evidence = problem.pop("result_json")
+            if evidence:
+                problem["discovery_evidence"] = json.loads(evidence)
+            if row["kind"] == "day":
+                url = urls.list_url(row["day"], row["region"])
+            elif row["kind"] == "race":
+                url = urls.race_url(row["race_id"], row["region"], row["page"])
+            elif row["kind"] == "horse":
+                url = urls.horse_url(row["horse_id"])
+            else:
+                url = None
+            observation = self.store.cached(url) if url else None
+            problem.update(source_url=url, cached_html=observation is not None)
+            if observation:
+                problem.update(snapshot_id=observation.id, retrieved_at=observation.retrieved_at,
+                               raw_path=observation.raw_path)
+            message = re.sub(r"https://\S+", "<URL>", row["last_error"] or "")
+            message = re.sub(r"\b[0-9]{12}\b", "<RACE_ID>", message)
+            message = re.sub(r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}\b", "<DATE>", message)
+            key = (row["kind"], row["error_type"], message)
+            if key not in groups:
+                groups[key] = dict(kind=row["kind"], error_type=row["error_type"], message=message,
+                                   count=0, sample_task_ids=[])
+            group = groups[key]
+            group["count"] += 1
+            if len(group["sample_task_ids"]) < 3:
+                group["sample_task_ids"].append(row["id"])
+            problems.append(problem)
+        return dict(**summary, generated_at=datetime.now(timezone.utc).isoformat(),
+                    failed_task_count=len(problems),
+                    error_groups=sorted(groups.values(), key=lambda group: -group["count"]),
+                    all_problems=problems)
 
     def next_wait(self, job_id: str) -> float | None:
         row = self.db.execute(
@@ -335,23 +411,13 @@ class Worker:
     def process(self, task: Task) -> None:
         if task.kind == "day":
             observation, html, cached = self.load(urls.list_url(task.day, task.region), task.force_refresh)
-            discovered = urls.discover_day(html, day=task.day, region=task.region)
+            discovered = urls.discover_day(html, day=task.day, region=task.region, allow_partial=True)
             self.queue.complete_day(task, observation, discovered)
             items = len(discovered["race_ids"])
         elif task.kind == "race":
             observation, html, cached = self.load(urls.race_url(task.race_id, task.region, task.page), task.force_refresh)
             parsed = parse_race(html, race_id=task.race_id, region=task.region, page=task.page)
-            race = parsed["race"]
-            if not race.get("race_id_verified") or race.get("race_date") != task.day:
-                raise ValueError(f"結果ページのIDまたは開催日を照合できません: 予定={task.day}, 実際={race.get('race_date')}")
-            if race.get("declared_field_size") is not None and race["declared_field_size"] != len(parsed["runners"]):
-                raise ValueError("掲載頭数と取得した出走行数が一致しません。原本を確認してください。")
-            expected = self.queue.db.execute(
-                "SELECT expected_field_size FROM collection_races WHERE job_id="
-                "(SELECT job_id FROM collection_tasks WHERE id=?) AND region=? AND race_id=?",
-                (task.id, task.region, task.race_id)).fetchone()
-            if expected and expected[0] is not None and expected[0] != len(parsed["runners"]):
-                raise ValueError("開催一覧の頭数と取得した出走行数が一致しません。原本を確認してください。")
+            self.queue.validate_race(task.id, parsed)
             self.store.save_race(observation, parsed)
             self.queue.complete_race(task, observation, parsed)
             items = len(parsed["runners"])
@@ -363,7 +429,8 @@ class Worker:
             items = len(parsed["runs"])
         else:
             raise ValueError(f"不明なタスク: {task.kind}")
-        self.report(event="saved", task_id=task.id, kind=task.kind, day=task.day, region=task.region,
+        incomplete = task.kind == "day" and discovered.get("complete") is False
+        self.report(event="partial" if incomplete else "saved", task_id=task.id, kind=task.kind, day=task.day, region=task.region,
                     race_id=task.race_id, page=task.page, horse_id=task.horse_id,
                     items=items, cached=cached, snapshot_id=observation.id, retrieved_at=observation.retrieved_at)
 

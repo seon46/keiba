@@ -108,6 +108,41 @@ Ctrl+Cで停止すると保存済みの原本・解析結果・収集予定を�
 
 パーサーを修正した場合は通常の `retry` で原本を再解析できます。ページ自体が更新・復旧した場合は `--refresh retry` を使います。元の観測は削除しません。取得制限を受けた場合は条件が解消してから再開してください。`retry` は保存した通信停止期間を解除しません。
 
+### 収集後の診断と取り漏らしの補完
+
+`status` の `problems` は失敗の先頭20件です。日別一覧の失敗が先に並ぶと、レース結果の失敗理由は表示されません。全件を確認するには `diagnose` を使います。通信せず、原因別の件数、全失敗タスクのURL、保存済みHTMLの有無、未公開開催の情報をUTF-8 JSONへ保存します。認証情報やHTML本文は含めません。
+
+```powershell
+# Windows: keibaフォルダーで最新版へ更新（収集は停止しておく）
+git pull
+
+# 全失敗を診断し、data/recovery_report.jsonへ保存
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper diagnose --job-id 64bca8f8ad301623 --output data\recovery_report.json --overwrite
+
+# 通信エラーだけを再試行待ちに戻す場合
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper retry --job-id 64bca8f8ad301623 --error-type FetchError
+
+# 通常の全失敗retryや、ページ更新時の--refresh retryも引き続き使える
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper backfill --resume 64bca8f8ad301623
+```
+
+`--error-type` は複数指定でき、`--kind day/race/horse` でも絞れます。HTTP 503等はサイト復旧後に取得できる可能性がありますが、解析未対応や開催未公開の問題は再取得だけでは解消しません。失敗を再予約する前に診断を保存すると、元の失敗理由を残せます。
+
+日別一覧に一部の競馬場だけ「公開予定」と表示されている場合は、公開済みのレースを収集し、未公開の競馬場を `unavailable_meetings` に記録します。その日の一覧タスクは失敗のまま保持するので、`complete=true` にはなりません。空区画を開催中止・開催なしと推測して埋めません。
+
+以前のバージョンで成功したレースにも、地方の通過順や英数字の騎手・調教師ID等の取り漏らしがあります。更新後、保存済みの成功レース原本を `reparse` で再解析できます。
+
+```powershell
+# 収集・他のreparseを停止し、単独で実行する。ネットワーク通信なし
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper reparse --job-id 64bca8f8ad301623
+```
+
+原本の取得時刻・snapshot_idは変えず、ID・開催日・頭数を照合してから解析結果を更新します。解析・検証が失敗した場合は元の解析結果を残し、`reparse_error` を表示します。成功した原本はパーサーの内容ごとに記録するため、Ctrl+C等で止めても同じコマンドで残りから再開できます。保存直後に強制終了して記録が残らなかった原本は再解析しますが、同じsnapshotを更新するため重複行は作りません。`--max-tasks`で今回の件数を制限できます。
+
+`reparse_summary.complete` は成功レース原本の再解析が終わったかを示します。収集全体の `status.complete`、未取得レースの再試行とは別に確認します。`reparse` は未取得ページをダウンロードしません。収集と再解析を同時に動かさないでください。開始時の実行中タスク確認は排他ロックではありません。
+
+地方の別表から補完したコーナー通過順では、並走グループはグループ先頭の順位を共有します。元の原文・並走グループ・corner番号も `race_corner_passages`、`corner_positions`、`corner_group_ids` 等に保持します。既存の馬ごとの通過順は上書きせず、未知の馬番・破損した表・不足したcornerは推測しません。問題がある別表は `race_parse_warnings` に残します。
+
 ## データセットを出力する
 
 ```bash

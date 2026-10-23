@@ -76,13 +76,45 @@ class _ListStructure(HTMLParser):
                 self.broken = True
 
 
-def discover_day(html: str, *, day: str, region: str) -> dict:
+def _empty_list_fragment(body, box, *, region: str) -> bool:
+    """Recognize complete empty list layouts, including NAR's empty selector."""
+    if box.find(True) is not None or body.get_text(strip=True):
+        return False
+    children = body.find_all(recursive=False)
+    if len(children) == 1 and children[0] is box:
+        return True
+    if region != "local" or len(children) != 2 or children[1] is not box:
+        return False
+    selector_wrapper = children[0]
+    selector_children = selector_wrapper.find_all(recursive=False)
+    if selector_wrapper.name != "div" or len(selector_children) != 1:
+        return False
+    selector = selector_children[0]
+    return (selector.name == "ul" and "RaceList_ProvinceSelect" in selector.get("class", [])
+            and selector.find(True) is None and not selector.get_text(strip=True))
+
+
+def _declared_field_size(card) -> int | None:
+    """Read race metadata, since a race title can itself contain e.g. 465頭."""
+    metadata = card.select(".RaceData")
+    counts = {
+        int(value) for item in metadata
+        for value in re.findall(r"(\d+)\s*頭", item.get_text(" ", strip=True))
+    }
+    if len(counts) > 1:
+        raise ValueError("レースカードの宣言頭数を一意に確認できません。")
+    return next(iter(counts)) if counts else None
+
+
+def discover_day(html: str, *, day: str, region: str, allow_partial: bool = False) -> dict:
     """Discover every race card in one official daily-list response.
 
     The empty central list fragment does not contain its requested date. Its
     known complete structure is accepted, with ``day_verified=False`` so the
     caller can retain that limitation alongside the request URL and raw body.
     Neither dates nor regions are decoded from the twelve-digit race IDs.
+    With allow_partial, explicitly unpublished meetings are reported separately;
+    their absence is never converted to an empty or complete day.
     """
     source_url = list_url(day, region)
     compact = date.fromisoformat(day).strftime("%Y%m%d")
@@ -141,30 +173,40 @@ def discover_day(html: str, *, day: str, region: str) -> dict:
 
     meetings = box.select(".RaceList_DataList")
     cards = box.select(".RaceList_DataItem")
-    if not cards:
-        if meetings:
-            raise ValueError("開催セクションにレースカードがありません。壊れた一覧を確認してください。")
+    unavailable_meetings = []
+    for index, meeting in enumerate(meetings, 1):
+        header = meeting.select_one(".RaceList_DataHeader")
+        if header is None:
+            raise ValueError("開催ヘッダーまたは開催内のレースカードが欠落しています。")
+        if meeting.select(".RaceList_DataItem"):
+            continue
+        information = meeting.select_one(".RaceList_Data_Infomation .Race_Infomation_Box")
+        reason = information.get_text(" ", strip=True) if information else ""
+        if not information or not re.search(r"公開予定(?:です)?[。．.]?$", reason):
+            raise ValueError("開催ヘッダーまたは開催内のレースカードが欠落しています。")
+        title = header.select_one(".RaceList_DataTitle")
+        name = " ".join(str(text).strip() for text in title.strings
+                        if text.strip() and text.find_parent("small") is None) if title else ""
+        if not allow_partial:
+            raise ValueError(f"開催のレース一覧が未公開です: {name or '名称不明'}: {reason}")
+        unavailable_meetings.append({"name": name or None, "reason": reason,
+                                     "meeting_index": index, "source_state": "not_published"})
+    if not cards and not unavailable_meetings:
         explicit_empty = bool(re.search(r"(?:開催(?:は|が)ありません|開催はございません|開催がない日)",
                                         body.get_text(" ", strip=True)))
-        # BeautifulSoup repairs missing end tags. A strict source-level match
-        # prevents a truncated empty-looking response from being skipped.
-        complete_empty_fragment = bool(re.search(
-            r'<div\b[^>]*class=[\"\'][^\"\']*RaceList_Body[^\"\']*[\"\'][^>]*>\s*'
-            r'<div\b[^>]*class=[\"\'][^\"\']*RaceList_Box[^\"\']*[\"\'][^>]*>\s*'
-            r'</div>\s*</div>\s*$', html, re.S))
-        known_empty = markers == {expected_marker} and complete_empty_fragment and not box.get_text(strip=True)
+        # _ListStructure already rejected missing end tags before soup repaired
+        # them. The NAR layout also has an empty province-selection wrapper.
+        known_empty = (markers == {expected_marker} and not visible
+                       and _empty_list_fragment(body, box, region=region))
         if not explicit_empty and not known_empty:
             raise ValueError("レースカードがなく、正常な開催なし応答も確認できません。")
         return {"race_ids": [], "empty": True, "day_verified": bool(observed_days),
                 "region_verified": bool(markers), "card_count": 0, "meeting_count": 0,
-                "field_sizes": {},
+                "field_sizes": {}, "complete": True, "unavailable_meetings": [],
                 "empty_evidence": "explicit_no_meeting" if explicit_empty else "empty_list_fragment"}
 
     if not meetings:
         raise ValueError("レースカードに対応する開催セクションがありません。")
-    for meeting in meetings:
-        if not meeting.select_one(".RaceList_DataHeader") or not meeting.select(".RaceList_DataItem"):
-            raise ValueError("開催ヘッダーまたは開催内のレースカードが欠落しています。")
 
     identifiers = []
     field_sizes = {}
@@ -193,14 +235,12 @@ def discover_day(html: str, *, day: str, region: str) -> dict:
             raise ValueError("レースカードを1つのレースIDに対応付けできません。")
         identifier = next(iter(card_ids))
         identifiers.append(identifier)
-        declared = re.findall(r"(\d+)\s*頭", card.get_text(" ", strip=True))
-        if len(declared) > 1:
-            raise ValueError("レースカードの宣言頭数を一意に確認できません。")
-        field_sizes[identifier] = int(declared[0]) if declared else None
+        field_sizes[identifier] = _declared_field_size(card)
     if len(set(identifiers)) != len(cards):
         raise ValueError("レースカード数と一意なレースID数が一致しません。")
     return {"race_ids": sorted(identifiers), "empty": False,
             "day_verified": bool(observed_days),
             "region_verified": bool(markers) or absolute_host_verified,
             "card_count": len(cards), "meeting_count": len(meetings),
-            "field_sizes": field_sizes, "empty_evidence": None}
+            "field_sizes": field_sizes, "empty_evidence": None,
+            "complete": not unavailable_meetings, "unavailable_meetings": unavailable_meetings}
