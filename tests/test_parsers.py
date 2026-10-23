@@ -76,6 +76,57 @@ class RaceParserTests(unittest.TestCase):
         self.assertEqual((runner['odds'], runner['popularity']), (8.5, 3))
         self.assertNotIn('finish_position', runner)
 
+    def test_date_in_race_name_never_replaces_the_title_metadata(self):
+        for name, metadata, expected in [
+            ('2023年7月7日ゆりさん生誕記念', '2023年7月11日 金沢6R', ('2023-07-11', '金沢', 6)),
+            ('2024年7月7日ゆりさん生誕記念', '2024年7月9日 金沢1R', ('2024-07-09', '金沢', 1)),
+            ('2026年2月30日記念', '2026年10月11日 東京11R', ('2026-10-11', '東京', 11)),
+            ('2023年7月7日・2024年7月7日記念', '2026年10月11日 東京11R', ('2026-10-11', '東京', 11)),
+            ('2025年1月1日 東京1R 記念', '2026年10月11日 東京11R', ('2026-10-11', '東京', 11)),
+        ]:
+            with self.subTest(name=name):
+                html = document(table(ENTRY_HEADERS, [ENTRY_ROW])).replace(
+                    'テスト賞 出馬表 | 2026年10月11日 東京11R - netkeiba',
+                    f'{name} 出馬表 | {metadata} 地方競馬レース情報 - netkeiba')
+                race = parse_race(html, race_id=RACE_ID, region='local', page='entries')['race']
+                self.assertEqual((race['race_date'], race['course'], race['race_number']), expected)
+
+    def test_invalid_or_absent_title_metadata_never_falls_back_to_name_dates(self):
+        for metadata in ('2026年2月30日 東京11R レース情報 - netkeiba', 'レース情報 - netkeiba'):
+            with self.subTest(metadata=metadata):
+                html = document(table(ENTRY_HEADERS, [ENTRY_ROW])).replace(
+                    'テスト賞 出馬表 | 2026年10月11日 東京11R - netkeiba',
+                    f'2023年7月7日 東京1R 記念 出馬表 | {metadata}')
+                race = parse_race(html, race_id=RACE_ID, region='local', page='entries')['race']
+                self.assertNotIn('race_date', race)
+                if metadata.startswith('レース情報'):
+                    self.assertNotIn('course', race)
+                    self.assertNotIn('race_number', race)
+
+    def test_explicitly_cancelled_empty_results_are_integrated_with_evidence(self):
+        empty = table(RESULT_HEADERS, [], css='RaceTable01', identifier='All_Result_Table')
+        notice = '<div class="Race_Infomation_Box">走路状況の悪化により取り止めになりました。</div>'
+        html = document('<div class="ResultTableWrap">' + notice + empty + '</div>').replace(
+            'https://race.netkeiba.com/race/shutuba.html',
+            'https://nar.netkeiba.com/race/result.html').replace(
+                'テスト賞 出馬表 |', 'テスト賞 結果・払戻 |')
+        result = parse_race(html, race_id=RACE_ID, region='local', page='results')
+        self.assertEqual(result['runners'], [])
+        self.assertEqual(result['race']['race_status'], 'cancelled')
+        self.assertIn('取り止め', result['race']['cancellation_reason'])
+        self.assertTrue(result['race']['race_id_verified'])
+        self.assertEqual(result['race']['race_date'], '2026-10-11')
+
+    def test_cancelled_word_outside_result_scope_does_not_accept_empty_results(self):
+        empty = table(RESULT_HEADERS, [], css='RaceTable01', identifier='All_Result_Table')
+        body = '<nav>走路状況の悪化により取り止めになりました。</nav>'
+        body += '<div class="ResultTableWrap">' + empty + '</div>'
+        html = document(body).replace('https://race.netkeiba.com/race/shutuba.html',
+                                     'https://nar.netkeiba.com/race/result.html').replace(
+                                         'テスト賞 出馬表 |', 'テスト賞 結果・払戻 |')
+        with self.assertRaises(ParseError):
+            parse_race(html, race_id=RACE_ID, region='local', page='results')
+
     def test_nar_malformed_nested_weight_cell_and_missing_values(self):
         body = (
             '<table class="ShutubaTable"><tr>'

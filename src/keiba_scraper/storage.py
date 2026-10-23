@@ -15,6 +15,8 @@ import time
 import uuid
 import zlib
 
+from .cancellations import is_confirmed_cancellation
+
 
 class StorageError(RuntimeError):
     pass
@@ -144,8 +146,10 @@ class Store:
 
     def save_race(self, observation: Observation, parsed: dict) -> None:
         race, runners = parsed["race"], parsed["runners"]
-        if not runners:
+        if not runners and not is_confirmed_cancellation(parsed):
             raise StorageError("出走馬が0件のため保存しません。")
+        if race.get("race_status") == "cancelled" and not is_confirmed_cancellation(parsed):
+            raise StorageError("開催中止の根拠と空の結果表を確認できません。")
         with self.db:
             self.db.execute(
                 "INSERT INTO races VALUES (?,?,?,?,?) ON CONFLICT(snapshot_id) "

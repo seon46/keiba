@@ -9,7 +9,7 @@ from pathlib import Path
 import shutil
 import time
 
-from . import parsers
+from . import cancellations, parsers
 from .jobs import JobQueue
 from .storage import Observation, StorageError
 
@@ -18,7 +18,11 @@ class Reparser:
     def __init__(self, queue: JobQueue, *, report=None):
         self.queue, self.store, self.db = queue, queue.store, queue.db
         self.report = report or (lambda **payload: None)
-        self.revision = hashlib.sha256(Path(parsers.__file__).read_bytes()).hexdigest()
+        source = hashlib.sha256()
+        for module in (parsers, cancellations):
+            source.update(module.__name__.encode() + b"\0")
+            source.update(Path(module.__file__).read_bytes())
+        self.revision = source.hexdigest()
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS snapshot_reparses (
                 task_id INTEGER NOT NULL REFERENCES collection_tasks(id),
@@ -88,7 +92,9 @@ class Reparser:
                     # is parsed again idempotently on the next run.
                     self.store.save_race(observation, parsed)
                     details = json.loads(row["result_json"] or "{}")
-                    details.update(parser_revision=self.revision, race_type=parsed["race"].get("race_type"))
+                    details.update(parser_revision=self.revision, race_type=parsed["race"].get("race_type"),
+                                   race_status=parsed["race"].get("race_status", "held"),
+                                   cancellation_reason=parsed["race"].get("cancellation_reason"))
                     with self.db:
                         self.db.execute("UPDATE collection_tasks SET items=?,result_json=? "
                                         "WHERE id=? AND state='done' AND snapshot_id=?",

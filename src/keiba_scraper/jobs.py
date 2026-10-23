@@ -16,6 +16,7 @@ import uuid
 
 from . import urls
 from .client import AccessRestricted, Client, FetchError
+from .cancellations import is_confirmed_cancellation
 from .parsers import parse_horse_history, parse_race
 from .storage import Store, StorageError
 
@@ -205,7 +206,9 @@ class JobQueue:
                     ((job_id, runner["horse_id"], runner["horse_id"]) for runner in parsed["runners"]))
             self._finish(task, "done", snapshot_id=observation.id, items=len(parsed["runners"]),
                          result={"race_date": parsed["race"]["race_date"],
-                                 "race_type": parsed["race"].get("race_type")})
+                                 "race_type": parsed["race"].get("race_type"),
+                                 "race_status": parsed["race"].get("race_status", "held"),
+                                 "cancellation_reason": parsed["race"].get("cancellation_reason")})
 
     def complete_horse(self, task: Task, observation, parsed: dict) -> None:
         with self.db:
@@ -264,6 +267,10 @@ class JobQueue:
             raise ValueError("解析したレースのID・地域・ページが収集予定と一致しません。")
         if not race.get("race_id_verified") or race.get("race_date") != task["day"]:
             raise ValueError(f"結果ページのIDまたは開催日を照合できません: 予定={task['day']}, 実際={race.get('race_date')}")
+        if is_confirmed_cancellation(parsed):
+            return  # Scheduled entries have no results when the source confirms cancellation.
+        if not runners or race.get("race_status") == "cancelled":
+            raise ValueError("空の結果表を開催中止と確認できません。原本を確認してください。")
         if race.get("declared_field_size") is not None and race["declared_field_size"] != len(runners):
             raise ValueError("掲載頭数と取得した出走行数が一致しません。原本を確認してください。")
         expected = self.db.execute(
@@ -346,10 +353,14 @@ class JobQueue:
         discovered = self.db.execute("SELECT COUNT(*) FROM collection_races WHERE job_id=?", (job_id,)).fetchone()[0]
         items = self.db.execute("SELECT COALESCE(SUM(items),0) FROM collection_tasks WHERE job_id=? "
                                 "AND kind='race' AND page='results' AND state='done'", (job_id,)).fetchone()[0]
+        cancelled = self.db.execute("SELECT COUNT(*) FROM collection_tasks WHERE job_id=? AND kind='race' "
+                                    "AND page='results' AND state='done' "
+                                    "AND json_extract(result_json,'$.race_status')='cancelled'", (job_id,)).fetchone()[0]
         state = self.db.execute("SELECT state FROM collection_jobs WHERE job_id=?", (job_id,)).fetchone()[0]
         return dict(job_id=job_id, state=state, complete=complete, config=config, tasks=counts,
                     expected_day_tasks=expected_days, discovered_races=discovered,
-                    result_runner_rows=items, empty_days_without_date_metadata=unverified_empty,
+                    result_runner_rows=items, cancelled_races=cancelled,
+                    empty_days_without_date_metadata=unverified_empty,
                     problems=problems)
 
 
@@ -430,9 +441,12 @@ class Worker:
         else:
             raise ValueError(f"不明なタスク: {task.kind}")
         incomplete = task.kind == "day" and discovered.get("complete") is False
+        status_fields = ({"race_status": parsed["race"].get("race_status", "held")}
+                         if task.kind == "race" else {})
         self.report(event="partial" if incomplete else "saved", task_id=task.id, kind=task.kind, day=task.day, region=task.region,
                     race_id=task.race_id, page=task.page, horse_id=task.horse_id,
-                    items=items, cached=cached, snapshot_id=observation.id, retrieved_at=observation.retrieved_at)
+                    items=items, cached=cached, snapshot_id=observation.id,
+                    retrieved_at=observation.retrieved_at, **status_fields)
 
     def run(self, job_id: str, *, max_tasks: int = 0, max_hours: float | None = None,
             min_free_mb: int = 1024) -> dict:

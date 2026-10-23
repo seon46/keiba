@@ -80,6 +80,21 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.store.export_rows(dataset='runners'), before)
         self.assertTrue(self.queue.summary(job)['complete'])
 
+    def test_cancellation_parser_update_invalidates_reparse_checkpoint(self):
+        from keiba_scraper import cancellations
+        job, observation = self.successful_job()
+        original = Reparser(self.queue)
+        self.assertTrue(original.run(job, min_free_mb=0)['complete'])
+        changed = Path(self.temp.name) / 'updated_cancellations.py'
+        changed.write_bytes(Path(cancellations.__file__).read_bytes() + b'\n# parser update\n')
+        with patch.object(cancellations, '__file__', str(changed)):
+            updated = Reparser(self.queue)
+            self.assertNotEqual(original.revision, updated.revision)
+            self.assertEqual(updated.summary(job)['pending'], 1)
+            self.assertTrue(updated.run(job, min_free_mb=0)['complete'])
+        self.assertEqual(self.store.export_rows(dataset='runners')[0]['snapshot_id'], observation.id)
+        self.client.session.get.assert_not_called()
+
     def test_wrong_date_never_overwrites_old_data_and_failed_reparse_can_retry(self):
         from keiba_scraper.parsers import parse_race
         job, observation = self.successful_job()

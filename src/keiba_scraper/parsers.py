@@ -13,6 +13,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from .cancellations import cancellation_evidence
+
 
 class ParseError(ValueError):
     """The response does not contain the requested usable public table."""
@@ -390,13 +392,18 @@ def _race_metadata(soup: BeautifulSoup, race_id: str, region: str, page: str) ->
     name = _text(soup.select_one(".RaceName"))
     if name:
         result["race_name"] = name
-    race_date = _date(title)
-    if race_date:
-        result["race_date"] = race_date
-    course = re.search(r"\d{4}年\d{1,2}月\d{1,2}日\s+([^\s|]+?)(\d+)R", title)
-    if course:
-        result.update(course=course[1], race_number=int(course[2]))
-        if "帯広(ば)" in course[1] or "ばんえい" in course[1]:
+    # A race name can itself contain a valid or invalid date. Only the final
+    # title metadata section establishes its date, venue, and race number.
+    metadata = re.search(
+        r"[|｜]\s*(?P<day>\d{4}年\d{1,2}月\d{1,2}日)\s+"
+        r"(?P<course>[^\s|｜]+?)(?P<number>\d+)R(?=\s|$)[^|｜]*$", title,
+    )
+    if metadata:
+        race_date = _date(metadata["day"])
+        if race_date:
+            result["race_date"] = race_date
+        result.update(course=metadata["course"], race_number=int(metadata["number"]))
+        if "帯広(ば)" in metadata["course"] or "ばんえい" in metadata["course"]:
             result["race_type"] = "banei"
     detail = _text(soup.select_one(".RaceData01"))
     if detail:
@@ -424,11 +431,13 @@ def _race_metadata(soup: BeautifulSoup, race_id: str, region: str, page: str) ->
 
 
 def parse_race(html: str, *, race_id: str, region: str, page: str) -> dict:
-    """Return a race and its linked runners, or raise instead of saving empty data."""
+    """Return runners or an evidenced cancelled race; reject ordinary empty data."""
     if page not in ("entries", "results"):
         raise ValueError("page must be 'entries' or 'results'")
     soup = BeautifulSoup(html, "html.parser")
     identity_verified = _check_race_identity(soup, race_id)
+    race = _race_metadata(soup, race_id, region, page)
+    race["race_id_verified"] = identity_verified
     candidates = []
     for table in soup.find_all("table"):
         headers = _headers(table)
@@ -450,6 +459,11 @@ def parse_race(html: str, *, race_id: str, region: str, page: str) -> dict:
             continue
         runners.append(_runner(row, cells, page=page))
     if not runners:
+        if page == "results":
+            evidence = cancellation_evidence(soup, table, race)
+            if evidence:
+                race.update(evidence)
+                return {"race": race, "runners": []}
         raise ParseError("The public race table has no runners.")
     identities = [runner["horse_id"] for runner in runners]
     if len(set(identities)) != len(identities):
@@ -462,8 +476,6 @@ def parse_race(html: str, *, race_id: str, region: str, page: str) -> dict:
         visible_text = _text(soup)
         if re.search(r"(?:結果(?:は|が)?未確定|レース結果は確定していません|着順(?:は|が)?未確定)", visible_text):
             raise ParseError("The response explicitly marks its results as unconfirmed.")
-    race = _race_metadata(soup, race_id, region, page)
-    race["race_id_verified"] = identity_verified
     if region == "local" and page == "results":
         _add_corner_passages(soup, race, runners, html)
     return {"race": race, "runners": runners}

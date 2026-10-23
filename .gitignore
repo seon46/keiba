@@ -221,3 +221,6 @@ __marimo__/
 
 # Local scraped observations and SQLite database
 /data/
+
+# Offline source update package downloaded from this chat
+/keiba-recovery.bundle
