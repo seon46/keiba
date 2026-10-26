@@ -215,7 +215,60 @@ IDは文字列、欠損は `null`（CSVでは空欄）です。取消等は順�
 
 結果の着順・時計・確定オッズを、そのレースの予想入力に使わないでください。過去戦績は予想対象より前の出走に絞って特徴量にし、学習・評価も時系列で分割します。予想時刻の出馬表・オッズは、その時点で `--refresh fetch` して観測を蓄積してください。
 
-この段階で生成するのは公開のレース・出走データセットです。調教、会員向け指数、払戻金の構造化、ログイン、予測モデルの学習は未実装です。
+収集するのは公開のレース・出走データセットです。調教、会員向け指数、払戻金の構造化、ログインは未実装です。以下の初版モデルは公開の出走データを使います。
+
+## 3着以内の確率を学習する
+
+補完後のCSVから、各馬の3着以内の確率を推定します。中央平地・中央障害・地方平地・ばんえいは別モデルです。モデルの精度は自分のデータで出した `evaluation.json` を確認してください。サンプルで処理が動いたことは、本番での予測精度の証明にはなりません。
+
+Windowsでは、収集・再解析を終えてから次を実行します。CPUで動作し、GPUは不要です。依存ライブラリの導入後、学習と予測はネットワーク通信を使いません。
+
+```powershell
+Set-Location -LiteralPath (Join-Path $env:USERPROFILE "keiba")
+& {
+    $ErrorActionPreference = "Stop"
+    git pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw "Code update failed." }
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-ml.ps1
+    if ($LASTEXITCODE -ne 0) { throw "ML setup failed." }
+    .\.venv\Scripts\python.exe -X utf8 -m keiba_ai fit --input data\results_5years_reparsed.csv --output-dir data\ml_top3
+}
+```
+
+Linuxでは `.venv/bin/python -m pip install -r requirements-ml.txt`、`.venv/bin/python -m pip install --no-deps --no-build-isolation -e .` の後、`.venv/bin/python -m keiba_ai fit --input data/results_5years_reparsed.csv --output-dir data/ml_top3` を実行します。
+
+`fit` はCSVの検査、履歴特徴量の作成、学習・評価を順に行います。既存のCSV・収集DBは変更しません。約100万行では時間と追加ディスク容量が必要です。PCをスリープさせず、処理中の表示を確認してください。既存の出力先には上書きしません。
+
+- `data/ml_top3/quality_report.json`: 読み込んだ行数、欠損、除外したレースと理由、期間・区分別の件数。
+- `data/ml_top3/features.sqlite3`: 検査済みの元行と、過去日だけから作った学習入力。
+- `data/ml_top3/models/evaluation.json`: 区分ごとの2025年検証・2026年最終評価、基準予測との比較、確率の校正表。
+- `data/ml_top3/models/*.joblib`: 学習済みモデル。自分で学習して保存したファイルだけを読み込んでください。
+
+CSVの検査だけから進める場合は `prepare --input ... --output-dir data/ml_top3` を使えます。prepare完了後に学習が中断・失敗した場合は、次で学習から再実行できます。学習途中の木からの再開は行わず、学習を最初からやり直します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai train --dataset data\ml_top3\features.sqlite3 --output-dir data\ml_top3\models
+```
+
+既定では2024年末までで候補を学習し、2025年の成績で設定を選びます。選んだ設定を2025年末までのデータで再学習し、その後初めて2026年分を評価します。モデルの重みには2026年の正解を使いません。`--validation-start` / `--test-start` で境界を指定できます。各区分に学習200行・検証50行・最終評価50行と正例/負例の両方が必要です。不足した区分は理由付きで除外します。
+
+入力は出走条件、年齢・性別・負担重量、前日までの馬・騎手・調教師の成績などです。今回レースの着順・時計・上がり・通過順・確定オッズ・人気・馬体重・天候・馬場状態は入力にしません。同日の全レースの特徴量を作ってから履歴を更新するので、同日の別レースの結果も先取りしません。未取得の戦績は未知のままです。取得期間より前の成績や取得漏れまで復元するものではありません。品質レポートに月・区分別の件数を残しますが、CSVだけでは未開催の日と取り漏らした日を区別できません。
+
+予測は発走前に出馬表と出走馬が確定した段階を想定します。その時点で既知の取消・除外を反映し、変更があれば再予測してください。取消・除外を除いた相手関係も使うため、過去の結果CSVでの評価は、この時点の情報が揃っていたという前提があります。結果ページを今取得したデータでは、当時の変更履歴や厳密な公開時刻までは再現できません。馬券購入時点での実証には、その時点の出馬表観測を別途蓄積してください。
+
+3着以内は `finished` かつ着順3以内を正例、競走中止・失格を負例とし、取消・除外は対象外です。同着では正例が4頭以上になる場合もあります。確率をレース内で合計1に揃える処理は行いません。「3着以内」と「複勝の的中条件」は別で、少頭数などの複勝ルールや払戻金はこのモデルに含めません。
+
+評価の `race_log_loss` / `race_brier` は小さいほど良く、各レースを等しく重み付けします。`top_pick_top3_rate` はモデル最上位の馬が3着以内だった割合、`precision_at_3` は推奨上位3頭のうち3着以内だった割合です。比較対象はモデルと同じ出走対象頭数からの `3/頭数` と、順位指標についての確定人気上位3頭です。確定人気は参考比較にだけ使います。回収率・利益は評価していません。
+
+## 学習済みモデルで出馬表を予測する
+
+予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai predict --dataset data\ml_top3\features.sqlite3 --model-dir data\ml_top3\models --entries data\entries.csv --output data\top3_predictions.csv
+```
+
+出力の `top3_probability` が各馬の3着以内の確率です。学習期間内の日付は拒否し、履歴は常に予測日より前だけから再構築します。`history_last_date` と `days_since_history` に履歴の古さを表示します。元データが2026-10-10までなら、その後の戦績は自動では増えません。新しい成績を追加した場合は、新しい出力先でprepareと学習をやり直してください。コードと特徴量の版が変わった場合も再作成が必要です。
 
 ## 検証
 
