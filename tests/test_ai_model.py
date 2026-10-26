@@ -11,13 +11,14 @@ import unittest
 from unittest.mock import patch
 
 from keiba_ai.cli import prepare, predict
-from keiba_ai.model import evaluate, train
+from keiba_ai.model import evaluate, select_feature_columns, train
 
 
 def fixture_csv(path, *, years=(2023,2025,2026), days=40, page='results'):
     fields = ['race_id','region','page','race_date','horse_id','horse_number','frame','sex','age',
               'jockey_id','trainer_id','carried_weight_kg','finish_position','finish_status',
-              'race_course','race_surface','race_distance_m','race_declared_field_size','snapshot_id','race_id_verified']
+              'race_course','race_surface','race_distance_m','race_declared_field_size','snapshot_id','race_id_verified',
+              'time_seconds','last_3f_seconds']
     with path.open('w',encoding='utf-8',newline='') as file:
         writer=csv.DictWriter(file,fieldnames=fields)
         writer.writeheader()
@@ -30,7 +31,9 @@ def fixture_csv(path, *, years=(2023,2025,2026), days=40, page='results'):
                         sex='牡',age=4,jockey_id=f'{horse:05d}',trainer_id=f'{horse:05d}',carried_weight_kg=57,
                         finish_position=horse if page=='results' else '',finish_status='finished' if page=='results' else '',
                         race_course='東京',race_surface='芝',race_distance_m=1600,race_declared_field_size=10,
-                        snapshot_id=f'snapshot-{year}-{number}',race_id_verified='True'))
+                        snapshot_id=f'snapshot-{year}-{number}',race_id_verified='True',
+                        time_seconds=95+horse if page=='results' else '',
+                        last_3f_seconds=33+horse/5 if page=='results' else ''))
 
 
 @unittest.skipUnless(importlib.util.find_spec('sklearn'), 'Install requirements-ml.txt for model tests')
@@ -83,6 +86,10 @@ class ModelTests(unittest.TestCase):
             self.assertLess(group['trained_through'],'2026-01-01')
             self.assertEqual(group['test']['rows'],400)
             self.assertEqual(group['test']['races'],40)
+            comparison=group['validation_comparison']
+            self.assertEqual(set(comparison),{'baseline','enhanced'})
+            self.assertLessEqual(group['validation']['race_log_loss'],comparison['baseline']['metrics']['race_log_loss'])
+            self.assertEqual(group['validation']['race_log_loss'],min(item['metrics']['race_log_loss'] for item in comparison.values()))
             original=joblib.load(root/'model/central_flat.joblib')
             with closing(sqlite3.connect(database)) as db, db:
                 # Alter only held-out labels. The fitted estimator and selection
@@ -91,8 +98,11 @@ class ModelTests(unittest.TestCase):
             changed=train(database,root/'changed',threads=1,iterations=8)
             alternative=joblib.load(root/'changed/central_flat.joblib')
             probes=np.zeros((2,len(FEATURE_NAMES)),dtype=np.float32)
-            np.testing.assert_array_equal(original['estimator'].predict_proba(probes),alternative['estimator'].predict_proba(probes))
+            np.testing.assert_array_equal(original['estimator'].predict_proba(probes[:,select_feature_columns(original)]),
+                                          alternative['estimator'].predict_proba(probes[:,select_feature_columns(alternative)]))
             self.assertEqual(group['selected_max_leaf_nodes'],changed['groups']['central_flat']['selected_max_leaf_nodes'])
+            self.assertEqual(group['selected_feature_set'],changed['groups']['central_flat']['selected_feature_set'])
+            self.assertEqual(group['validation_comparison'],changed['groups']['central_flat']['validation_comparison'])
             self.assertNotEqual(group['test']['log_loss'],changed['groups']['central_flat']['test']['log_loss'])
             entries=root/'entries.csv'
             fixture_csv(entries,years=(2027,),days=1,page='entries')
@@ -113,6 +123,40 @@ class ModelTests(unittest.TestCase):
                 predict(database,root/'model',entries,root/'old-predictions.csv')
             with self.assertRaises(ValueError):
                 prepare(source,root/'prepared')
+
+    def test_each_explicit_profile_predicts_using_its_selected_columns(self):
+        import joblib
+        from keiba_ai.features import BASE_FEATURE_NAMES, FEATURE_NAMES
+        with TemporaryDirectory() as name, redirect_stdout(io.StringIO()):
+            root=Path(name)
+            fixture_csv(root/'source.csv',days=20)
+            fixture_csv(root/'entries.csv',years=(2027,),days=1,page='entries')
+            database=prepare(root/'source.csv',root/'prepared')
+            for profile,names in (('baseline',BASE_FEATURE_NAMES),('enhanced',FEATURE_NAMES)):
+                directory=root/profile
+                result=train(database,directory,threads=1,iterations=3,feature_set=profile)
+                bundle=joblib.load(directory/'central_flat.joblib')
+                self.assertEqual(bundle['selected_feature_names'],list(names))
+                self.assertEqual(bundle['estimator'].n_features_in_,len(names))
+                self.assertEqual(result['groups']['central_flat']['selected_feature_set'],profile)
+                predict(database,directory,root/'entries.csv',root/(profile+'.csv'))
+                self.assertTrue((root/(profile+'.csv')).is_file())
+
+    def test_auto_keeps_baseline_when_new_features_offer_no_validation_gain(self):
+        from keiba_ai.features import BASE_FEATURE_NAMES
+        with TemporaryDirectory() as name, redirect_stdout(io.StringIO()):
+            root=Path(name)
+            fixture_csv(root/'source.csv',days=20)
+            database=prepare(root/'source.csv',root/'prepared')
+            # Equivalent candidates represent an extension with no additional
+            # information. A newer profile alone must not justify promotion.
+            profiles={key:list(BASE_FEATURE_NAMES) for key in ('baseline','enhanced')}
+            with patch('keiba_ai.model.feature_sets',return_value=profiles):
+                report=train(database,root/'models',threads=1,iterations=3)
+            group=report['groups']['central_flat']
+            self.assertEqual(group['selected_feature_set'],'baseline')
+            self.assertEqual(group['validation_comparison']['baseline']['metrics'],
+                             group['validation_comparison']['enhanced']['metrics'])
 
 
 if __name__=='__main__':

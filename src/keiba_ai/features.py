@@ -18,7 +18,7 @@ from pathlib import Path
 import sqlite3
 
 
-FEATURE_NAMES = (
+BASE_FEATURE_NAMES = (
     "course_code", "surface_code", "sex_code", "frame", "horse_number", "age",
     "carried_weight_kg", "distance_m", "declared_field_size", "field_size", "month",
     "horse_prior_starts", "horse_prior_win_rate", "horse_prior_top3_rate",
@@ -29,6 +29,17 @@ FEATURE_NAMES = (
     "jockey_prior_starts", "jockey_prior_win_rate", "jockey_prior_top3_rate", "jockey_id_missing",
     "trainer_prior_starts", "trainer_prior_win_rate", "trainer_prior_top3_rate", "trainer_id_missing",
     "horse_top3_rate_vs_field", "horse_recent5_rank_vs_field",
+)
+FEATURE_NAMES = BASE_FEATURE_NAMES + (
+    "horse_group_recent5_speed_mps", "horse_group_previous_speed_mps",
+    "horse_group_recent5_winner_gap_per_km", "horse_group_previous_winner_gap_per_km",
+    "horse_group_recent5_mean_time_gap_per_km", "horse_group_previous_mean_time_gap_per_km",
+    "horse_group_recent5_last3f_seconds", "horse_group_previous_last3f_seconds",
+    "horse_group_recent5_last3f_vs_mean", "horse_group_previous_last3f_vs_mean",
+    "horse_group_recent5_timed_starts", "horse_group_recent5_section_timed_starts",
+    "horse_course_surface_starts", "horse_course_surface_top3_rate",
+    "horse_surface_distance_starts", "horse_surface_distance_top3_rate",
+    "horse_course_surface_distance_starts", "horse_course_surface_distance_top3_rate",
 )
 CATEGORICAL_FEATURES = ("course_code", "surface_code", "sex_code")
 
@@ -43,6 +54,7 @@ _COURSES = {
 _SEX = {"牡": 0, "牝": 1, "セ": 2, "騸": 2}
 _SURFACES = {"芝": 0, "ダ": 1, "ダート": 1, "障": 2, "障芝": 2, "障ダ": 2, "直": 3}
 _GROUPS = {"central_flat", "central_jump", "local_flat", "local_banei"}
+_GROUP_NAMES = {group: group for group in _GROUPS}
 _WITHDRAWN = {"scratched", "excluded"}
 _STARTED = {"finished", "did_not_finish", "disqualified"}
 
@@ -61,6 +73,40 @@ def _identifier(value) -> str | None:
     return value.strip() or None if isinstance(value, str) else None
 
 
+def _positive(value) -> float | None:
+    number = _number(value)
+    return number if number is not None and number > 0 else None
+
+
+def _mean(values) -> float | None:
+    known = [value for value in values if value is not None]
+    return sum(known) / len(known) if known else None
+
+
+def _course_code(row: dict) -> int | None:
+    course = row.get("course")
+    return _COURSES.get("帯広(ば)" if course == "帯広" else course)
+
+
+def _aptitude_keys(row: dict, group: str) -> tuple[tuple | None, tuple | None, tuple | None]:
+    """Group-specific course/surface/200m-band contexts; unknown flat surfaces stay unknown."""
+    course = _course_code(row)
+    if group == "local_banei":
+        surface = 3  # Race domain, not an assertion of turf/dirt ground type.
+    elif group == "central_jump":
+        surface = 2
+    else:
+        surface = _SURFACES.get(row.get("surface"))
+    distance = _positive(row.get("distance_m"))
+    band = int(distance // 200) if distance is not None else None
+    horse = _identifier(row.get("horse_id"))
+    course_key = (group, horse, course, surface) if course is not None and surface is not None else None
+    distance_key = (group, horse, surface, band) if surface is not None and band is not None else None
+    combined_key = ((group, horse, course, surface, band)
+                    if course_key is not None and band is not None else None)
+    return course_key, distance_key, combined_key
+
+
 def _day(value) -> date:
     if not isinstance(value, str):
         raise ValueError("特徴量の開催日がありません。")
@@ -74,9 +120,10 @@ def _context(race: list[dict]) -> tuple[date, str]:
     if not race:
         raise ValueError("空のレースから特徴量は作れません。")
     first = race[0]
-    day, group = _day(first.get("day")), first.get("group_name")
-    if group not in _GROUPS:
-        raise ValueError(f"未対応のモデル区分です: {group}")
+    day, raw_group = _day(first.get("day")), first.get("group_name")
+    group = _GROUP_NAMES.get(raw_group)
+    if group is None:
+        raise ValueError(f"未対応のモデル区分です: {raw_group}")
     keys = ("day", "region", "race_id", "group_name")
     if any(any(row.get(key) != first.get(key) for key in keys) for row in race):
         raise ValueError("異なる日付・地域・レース・区分の行が混在しています。")
@@ -99,7 +146,7 @@ def _outcome(row: dict) -> tuple[int | None, int, int]:
     return rank, int(rank == 1), int(rank <= 3)
 
 
-@dataclass
+@dataclass(slots=True)
 class _Aggregate:
     starts: int = 0
     wins: int = 0
@@ -115,7 +162,7 @@ class _Aggregate:
                 self.top3 / self.starts if self.starts else None)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Run:
     day: date
     key: tuple
@@ -124,18 +171,30 @@ class _Run:
     top3: int
     rank_fraction: float
     distance_m: float | None
+    speed_mps: float | None = None
+    winner_gap_per_km: float | None = None
+    mean_time_gap_per_km: float | None = None
+    last3f_seconds: float | None = None
+    last3f_vs_mean: float | None = None
 
 
-@dataclass
+def _append_recent(recent: deque, run: _Run) -> deque:
+    # Normal input is chronological, so keep the common case O(1). The ID only
+    # makes exceptional same-day ordering deterministic; it is not race time.
+    if not recent or (recent[-1].day, recent[-1].key) <= (run.day, run.key):
+        recent.append(run)
+        return recent
+    return deque(sorted((*recent, run), key=lambda item: (item.day, item.key))[-5:], maxlen=5)
+
+
+@dataclass(slots=True)
 class _Horse:
     starts: int = 0
     recent: deque = field(default_factory=lambda: deque(maxlen=5))
 
     def add(self, run: _Run) -> None:
         self.starts += 1
-        # ID is only a deterministic tie breaker for rare same-day records,
-        # never evidence of their chronological race order.
-        self.recent = deque(sorted((*self.recent, run), key=lambda item: (item.day, item.key))[-5:], maxlen=5)
+        self.recent = _append_recent(self.recent, run)
 
 
 class HistoryState:
@@ -144,6 +203,10 @@ class HistoryState:
     def __init__(self):
         self.horses: dict[str, _Horse] = {}
         self.horse_groups: dict[tuple[str, str], _Aggregate] = {}
+        self.group_recent: dict[tuple[str, str], deque] = {}
+        self.course_surface: dict[tuple, _Aggregate] = {}
+        self.surface_distance: dict[tuple, _Aggregate] = {}
+        self.course_surface_distance: dict[tuple, _Aggregate] = {}
         self.jockeys: dict[tuple[str, str], _Aggregate] = {}
         self.trainers: dict[tuple[str, str], _Aggregate] = {}
         self._races: set[tuple] = set()
@@ -165,20 +228,46 @@ class HistoryState:
             raise ValueError("同じレースの履歴を二重に更新しようとしました。")
         updates = []
         size = len(active)
-        for row in active:
-            position, win, top3 = _outcome(row)
+        outcomes = [_outcome(row) for row in active]
+        # These are outcomes of this historical race. They become usable only
+        # after build_features has frozen every feature vector for this date.
+        times = [_positive(row.get("time_seconds")) if result[0] is not None else None
+                 for row, result in zip(active, outcomes)]
+        sections = [_positive(row.get("last_3f_seconds")) if result[0] is not None else None
+                    for row, result in zip(active, outcomes)]
+        winner_times = [value for value, result in zip(times, outcomes) if result[0] == 1 and value is not None]
+        winner_time = min(winner_times) if winner_times else None
+        mean_time = _mean(times) if sum(value is not None for value in times) >= 2 else None
+        mean_section = _mean(sections) if sum(value is not None for value in sections) >= 2 else None
+        for row, result, time_value, section in zip(active, outcomes, times, sections):
+            position, win, top3 = result
             if position is not None and position > size:
                 raise ValueError("確定順位が実出走馬数を超えています。")
             fraction = (position - 1) / max(size - 1, 1) if position is not None else 1.0
+            distance = _positive(row.get("distance_m"))
             run = _Run(day, (str(row.get("region")), str(row.get("race_id")),
                             _number(row.get("horse_number")) or 0),
-                       position, win, top3, fraction, _number(row.get("distance_m")))
+                       position, win, top3, fraction, _number(row.get("distance_m")),
+                       speed_mps=distance / time_value if distance is not None and time_value is not None else None,
+                       winner_gap_per_km=((time_value - winner_time) * 1000 / distance
+                                          if time_value is not None and winner_time is not None and distance is not None else None),
+                       mean_time_gap_per_km=((time_value - mean_time) * 1000 / distance
+                                             if time_value is not None and mean_time is not None and distance is not None else None),
+                       last3f_seconds=section,
+                       last3f_vs_mean=section - mean_section if section is not None and mean_section is not None else None)
             updates.append((row, run))
         # Validate every outcome before mutating any aggregate.
         for row, run in updates:
             horse = _identifier(row["horse_id"])
             self.horses.setdefault(horse, _Horse()).add(run)
             self.horse_groups.setdefault((group, horse), _Aggregate()).add(run.win, run.top3)
+            recent_key = (group, horse)
+            recent = self.group_recent.get(recent_key)
+            self.group_recent[recent_key] = _append_recent(recent if recent is not None else deque(maxlen=5), run)
+            for key, lookup in zip(_aptitude_keys(row, group),
+                                   (self.course_surface, self.surface_distance, self.course_surface_distance)):
+                if key is not None:
+                    lookup.setdefault(key, _Aggregate()).add(run.win, run.top3)
             for field_name, lookup in (("jockey_id", self.jockeys), ("trainer_id", self.trainers)):
                 identifier = _identifier(row.get(field_name))
                 if identifier is not None:
@@ -210,15 +299,12 @@ def race_features(race: list[dict], histories: HistoryState) -> list[list[float 
         # rates, but do not claim one specific finish/distance was the last one.
         previous = latest if latest and sum(run.day == latest.day for run in recent) == 1 else None
         distance = _number(row.get("distance_m"))
-        course = row.get("course")
-        if course == "帯広":
-            course = "帯広(ば)"
         sex, surface = row.get("sex"), row.get("surface")
         jockey_id, trainer_id = _identifier(row.get("jockey_id")), _identifier(row.get("trainer_id"))
         jockey = histories.jockeys.get((group, jockey_id), empty) if jockey_id else empty
         trainer = histories.trainers.get((group, trainer_id), empty) if trainer_id else empty
         vector = [
-            _COURSES.get(course), _SURFACES.get(surface), _SEX.get(sex),
+            _course_code(row), _SURFACES.get(surface), _SEX.get(sex),
             _number(row.get("frame")), _number(row.get("horse_number")), _number(row.get("age")),
             _number(row.get("carried_weight_kg")), distance, _number(row.get("declared_field_size")),
             float(len(race)), float(day.month), *horse_group.features(),
@@ -233,6 +319,20 @@ def race_features(race: list[dict], histories: HistoryState) -> list[list[float 
             *jockey.features(), float(jockey_id is None),
             *trainer.features(), float(trainer_id is None), None, None,
         ]
+        timed_recent = list(histories.group_recent.get((group, identifier), ()))
+        group_latest = timed_recent[-1] if timed_recent else None
+        group_previous = (group_latest if group_latest and
+                          sum(run.day == group_latest.day for run in timed_recent) == 1 else None)
+        for name in ("speed_mps", "winner_gap_per_km", "mean_time_gap_per_km",
+                     "last3f_seconds", "last3f_vs_mean"):
+            vector.extend((_mean(getattr(run, name) for run in timed_recent),
+                           getattr(group_previous, name) if group_previous else None))
+        vector.extend((float(sum(run.speed_mps is not None for run in timed_recent)),
+                       float(sum(run.last3f_seconds is not None for run in timed_recent))))
+        for key, lookup in zip(_aptitude_keys(row, group),
+                               (histories.course_surface, histories.surface_distance, histories.course_surface_distance)):
+            aggregate = lookup.get(key, empty) if key is not None else empty
+            vector.extend((float(aggregate.starts), aggregate.top3 / aggregate.starts if aggregate.starts else None))
         vectors.append(vector)
     # Relative form uses only opponents' already-causal histories.
     for source, destination in (("horse_prior_top3_rate", "horse_top3_rate_vs_field"),

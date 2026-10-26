@@ -71,7 +71,7 @@ def _numeric(value, name: str, *, integer=False, required=False, positive=False)
             raise RowValidationError(f"{name}: expected an integer")
         return int(number)
     result = float(number)
-    if result in (float("inf"), float("-inf")):
+    if result in (float("inf"), float("-inf")) or (positive and result <= 0):
         raise RowValidationError(f"{name}: number is outside the supported range")
     return result
 
@@ -163,6 +163,13 @@ def normalize_row(raw: Mapping, page: str = "results") -> dict:
     horse_number = _numeric(raw.get("horse_number"), "horse_number", integer=True, required=True, positive=True)
     if horse_number > 99:
         raise RowValidationError("horse_number: expected a domestic number from 1 to 99")
+    # These are outcomes, never attributes of an entries row. Non-completions
+    # can contain provisional times which must not enter performance history.
+    completed = page == "results" and status == "finished"
+    times = {
+        key: _numeric(raw.get(key), key, positive=True) if completed else None
+        for key in ("time_seconds", "last_3f_seconds")
+    }
     return {
         "race_id": identifier, "region": region, "day": day, "horse_id": horse_id,
         "horse_number": horse_number,
@@ -172,6 +179,7 @@ def normalize_row(raw: Mapping, page: str = "results") -> dict:
         **identifiers,
         "carried_weight_kg": _numeric(raw.get("carried_weight_kg"), "carried_weight_kg", positive=True),
         "finish_position": position, "finish_status": status, "course": course,
+        **times,
         "surface": surface, "distance_m": distance,
         "declared_field_size": _numeric(raw.get("race_declared_field_size"), "race_declared_field_size",
                                          integer=True, positive=True),

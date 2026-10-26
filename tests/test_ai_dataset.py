@@ -91,6 +91,56 @@ class DatasetTests(unittest.TestCase):
         scratched = normalize_row(row(page="entries", finish_status="scratched", finish_position=""), page="entries")
         self.assertEqual(scratched["finish_status"], "scratched")
 
+    def test_completed_times_are_optional_positive_seconds_as_floats(self):
+        result = normalize_row(row(time_seconds="145.0", last_3f_seconds="34.4"))
+        self.assertEqual((result["time_seconds"], result["last_3f_seconds"]), (145.0, 34.4))
+        self.assertIsInstance(result["time_seconds"], float)
+        self.assertIsInstance(result["last_3f_seconds"], float)
+        legacy = normalize_row(row())
+        self.assertIsNone(legacy["time_seconds"])
+        self.assertIsNone(legacy["last_3f_seconds"])
+        explicit_missing = normalize_row(row(time_seconds="null", last_3f_seconds=""))
+        self.assertIsNone(explicit_missing["time_seconds"])
+        self.assertIsNone(explicit_missing["last_3f_seconds"])
+
+    def test_invalid_completed_times_do_not_silently_become_history_values(self):
+        for field in ("time_seconds", "last_3f_seconds"):
+            for value in ("NaN", "Inf", "0", "-1", "1:25.6", "0." + "0" * 400 + "1"):
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    normalize_row(row(**{field: value}))
+
+    def test_noncompletions_never_keep_raw_result_times(self):
+        for status in ("did_not_finish", "disqualified", "scratched", "excluded"):
+            for time, closing in (("85.6", "36.8"), ("NaN", "not-a-result")):
+                with self.subTest(status=status, time=time):
+                    normalized = normalize_row(row(finish_status=status, finish_position="",
+                                                   time_seconds=time, last_3f_seconds=closing))
+                    self.assertIsNone(normalized["time_seconds"])
+                    self.assertIsNone(normalized["last_3f_seconds"])
+
+    def test_entries_ignore_current_result_times_even_when_values_are_malformed(self):
+        source = row(page="entries", finish_status="", finish_position="")
+        baseline = normalize_row(source, page="entries")
+        for time, closing in (("85.6", "36.8"), ("NaN", "not-a-result")):
+            with self.subTest(time=time):
+                with_results = normalize_row(dict(source, time_seconds=time, last_3f_seconds=closing), page="entries")
+                self.assertEqual(with_results, baseline)
+
+    def test_csv_times_roundtrip_and_missing_counts_include_legacy_and_dnf(self):
+        first = row(time_seconds="145.0", last_3f_seconds="34.4", race_declared_field_size="3")
+        legacy = row(horse_id="2021100002", horse_number="2", finish_position="2", race_declared_field_size="3")
+        dnf = row(horse_id="2021100003", horse_number="3", finish_status="did_not_finish", finish_position="",
+                  time_seconds="150.0", last_3f_seconds="37.2", race_declared_field_size="3")
+        self.write([first, legacy, dnf])
+        report = ingest_csv(self.csv, self.db)
+        self.assertEqual(report["usable_rows"], 3)
+        self.assertEqual(report["missing_values"]["time_seconds"], 2)
+        self.assertEqual(report["missing_values"]["last_3f_seconds"], 2)
+        runners = next(iter_races(self.db))
+        self.assertEqual((runners[0]["time_seconds"], runners[0]["last_3f_seconds"]), (145.0, 34.4))
+        self.assertIsNone(runners[1]["time_seconds"])
+        self.assertIsNone(runners[2]["time_seconds"])
+
     def test_nonfinite_fractional_ranks_invalid_booleans_and_false_identity_are_rejected(self):
         for changes in ({"odds": "NaN"}, {"carried_weight_kg": "inf"}, {"age": "-1"},
                         {"finish_position": "1.2"}, {"finish_position": ""},

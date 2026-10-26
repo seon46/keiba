@@ -14,7 +14,7 @@ import sqlite3
 import tempfile
 
 from . import SCHEMA_VERSION
-from .model import feature_revision, libraries, readonly, train
+from .model import feature_revision, libraries, readonly, select_feature_columns, train
 
 
 def emit(**message):
@@ -131,6 +131,7 @@ def predict(database, models, entries, output):
             raise ValueError(f'学習期間内の日付には予測できません: {day}')
         x = np.asarray([[np.nan if value is None else value for value in values]
                         for values in race_features(active,history)],dtype=np.float32)
+        x = x[:, select_feature_columns(bundle)]
         with threadpool_limits(limits=bundle.get('threads',4)):
             probabilities = bundle['estimator'].predict_proba(x)[:,1]
         for row, probability in sorted(zip(active,probabilities),key=lambda pair:(-pair[1],pair[0]['horse_number'])):
@@ -171,6 +172,8 @@ def main(argv=None):
         command.add_argument('--test-start',default='2026-01-01')
         command.add_argument('--threads',type=int,default=4)
         command.add_argument('--iterations',type=int,default=150)
+        command.add_argument('--feature-set', choices=('auto','baseline','enhanced'), default='auto',
+                             help='検証期間で従来特徴と拡張特徴を比較（既定: auto）')
     prediction = commands.add_parser('predict')
     prediction.add_argument('--dataset',required=True,type=Path)
     prediction.add_argument('--model-dir',required=True,type=Path)
@@ -186,7 +189,7 @@ def main(argv=None):
             destination = args.output_dir/'models' if args.command == 'fit' else args.output_dir
             with fresh_directory(destination) as temporary:
                 train(database,temporary,validation_start=args.validation_start,test_start=args.test_start,
-                      threads=args.threads,iterations=args.iterations,report=emit)
+                      threads=args.threads,iterations=args.iterations,feature_set=args.feature_set,report=emit)
             emit(event='training_complete',report=str(destination/'evaluation.json'))
         else:
             predict(args.dataset,args.model_dir,args.entries,args.output)

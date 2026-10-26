@@ -7,7 +7,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
-from keiba_ai.features import FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
+from keiba_ai.features import BASE_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
 
 
 def race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
@@ -25,6 +25,13 @@ def race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
 
 def values(vector):
     return dict(zip(FEATURE_NAMES, vector))
+
+
+def timed_race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
+    result = race(day, number, positions=positions, group=group)
+    for index, row in enumerate(result):
+        row.update(time_seconds=100 + index * 2, last_3f_seconds=35 + index)
+    return result
 
 
 def write_database(path, races):
@@ -141,6 +148,156 @@ class HistoryFeatureTests(unittest.TestCase):
         self.assertTrue(vector['trainer_id_missing'])
 
 
+class HistoricalTimingAndAptitudeTests(unittest.TestCase):
+    def test_relative_times_and_sections_are_historical_and_distance_adjusted(self):
+        state = HistoryState()
+        state.update_race(timed_race('2024-01-01', 1))
+        result = values(race_features(race('2024-01-02', 2), state)[1])
+        self.assertAlmostEqual(result['horse_group_previous_speed_mps'], 1600 / 102)
+        self.assertAlmostEqual(result['horse_group_recent5_winner_gap_per_km'], 1.25)
+        self.assertAlmostEqual(result['horse_group_previous_mean_time_gap_per_km'], -.625)
+        self.assertEqual(result['horse_group_recent5_last3f_seconds'], 36)
+        self.assertAlmostEqual(result['horse_group_previous_last3f_vs_mean'], -.5)
+        self.assertEqual(result['horse_group_recent5_timed_starts'], 1)
+        self.assertEqual(result['horse_group_recent5_section_timed_starts'], 1)
+
+    def test_dead_heat_winner_reference_and_missing_winner_time(self):
+        tied = timed_race('2024-01-01', 1, positions=(1, 1, 3, 4))
+        tied[1]['time_seconds'] = tied[0]['time_seconds']
+        state = HistoryState()
+        state.update_race(tied)
+        vectors = [values(vector) for vector in race_features(race('2024-01-02', 2), state)]
+        self.assertEqual(vectors[0]['horse_group_previous_winner_gap_per_km'], 0)
+        self.assertEqual(vectors[1]['horse_group_previous_winner_gap_per_km'], 0)
+        no_winner_time = timed_race('2024-01-01', 1)
+        no_winner_time[0]['time_seconds'] = None
+        state = HistoryState()
+        state.update_race(no_winner_time)
+        result = values(race_features(race('2024-01-02', 2), state)[1])
+        self.assertIsNone(result['horse_group_previous_winner_gap_per_km'])
+        self.assertIsNotNone(result['horse_group_previous_mean_time_gap_per_km'])
+
+    def test_dnf_disqualification_and_invalid_clocks_never_become_zero_times(self):
+        old = timed_race('2024-01-01', 1)
+        old[2].update(finish_status='did_not_finish', time_seconds=1, last_3f_seconds=1)
+        old[3].update(finish_status='disqualified', time_seconds=1, last_3f_seconds=1)
+        state = HistoryState()
+        state.update_race(old)
+        vectors = [values(vector) for vector in race_features(race('2024-01-02', 2), state)]
+        self.assertAlmostEqual(vectors[1]['horse_group_previous_mean_time_gap_per_km'], .625)
+        self.assertAlmostEqual(vectors[1]['horse_group_previous_last3f_vs_mean'], .5)
+        for index in (2, 3):
+            self.assertIsNone(vectors[index]['horse_group_previous_speed_mps'])
+            self.assertIsNone(vectors[index]['horse_group_previous_last3f_seconds'])
+            self.assertEqual(vectors[index]['horse_group_recent5_timed_starts'], 0)
+        invalid = timed_race('2024-01-01', 1)
+        for row, value in zip(invalid, (None, 0, -1, float('inf'))):
+            row.update(time_seconds=value, last_3f_seconds=value)
+        state = HistoryState()
+        state.update_race(invalid)
+        for vector in race_features(race('2024-01-02', 2), state):
+            result = values(vector)
+            self.assertIsNone(result['horse_group_recent5_speed_mps'])
+            self.assertIsNone(result['horse_group_recent5_last3f_seconds'])
+
+    def test_single_timed_finisher_does_not_invent_mean_comparison(self):
+        old = timed_race('2024-01-01', 1)
+        for row in old[1:]:
+            row.update(time_seconds=None, last_3f_seconds=None)
+        state = HistoryState()
+        state.update_race(old)
+        result = values(race_features(race('2024-01-02', 2), state)[0])
+        self.assertIsNotNone(result['horse_group_previous_speed_mps'])
+        self.assertEqual(result['horse_group_previous_winner_gap_per_km'], 0)
+        self.assertIsNone(result['horse_group_previous_mean_time_gap_per_km'])
+        self.assertIsNone(result['horse_group_previous_last3f_vs_mean'])
+
+    def test_aptitude_is_course_surface_and_200m_band_specific(self):
+        state = HistoryState()
+        state.update_race(timed_race('2024-01-01', 1))
+        second = timed_race('2024-01-02', 2, positions=(4, 1, 2, 3))
+        for row in second:
+            row['distance_m'] = 1700
+        state.update_race(second)
+        upcoming = race('2024-01-03', 3)
+        result = values(race_features(upcoming, state)[0])
+        self.assertEqual(result['horse_course_surface_starts'], 2)
+        self.assertEqual(result['horse_surface_distance_starts'], 2)
+        self.assertEqual(result['horse_course_surface_distance_top3_rate'], .5)
+        other_course = deepcopy(upcoming)
+        for row in other_course:
+            row['course'] = '中山'
+        result = values(race_features(other_course, state)[0])
+        self.assertEqual(result['horse_course_surface_starts'], 0)
+        self.assertEqual(result['horse_surface_distance_starts'], 2)
+        self.assertEqual(result['horse_course_surface_distance_starts'], 0)
+        for row in upcoming:
+            row.update(surface='芝', distance_m=1800)
+        result = values(race_features(upcoming, state)[0])
+        self.assertEqual(result['horse_course_surface_starts'], 0)
+        self.assertEqual(result['horse_surface_distance_starts'], 0)
+        self.assertIsNone(result['horse_course_surface_top3_rate'])
+
+    def test_timing_and_aptitude_do_not_cross_flat_jump_or_banei_groups(self):
+        state = HistoryState()
+        state.update_race(timed_race('2024-01-01', 1))
+        banei = timed_race('2024-01-02', 2, group='local_banei')
+        for row in banei:
+            row.update(course='帯広(ば)', surface=None, distance_m=200)
+        state.update_race(banei)
+        jumping = race('2024-01-03', 3, group='central_jump')
+        flat = race('2024-01-03', 3)
+        for row in jumping:
+            row['surface'] = '障'
+        jump_result = values(race_features(jumping, state)[0])
+        flat_result = values(race_features(flat, state)[0])
+        self.assertEqual(jump_result['horse_group_recent5_timed_starts'], 0)
+        self.assertIsNone(jump_result['horse_group_previous_speed_mps'])
+        self.assertEqual(jump_result['horse_course_surface_starts'], 0)
+        self.assertEqual(flat_result['horse_group_previous_speed_mps'], 16)
+        self.assertEqual(flat_result['horse_course_surface_starts'], 1)
+        next_banei = deepcopy(banei)
+        for row in next_banei:
+            row['day'] = '2024-01-03'
+        result = values(race_features(next_banei, state)[0])
+        self.assertEqual(result['horse_group_previous_speed_mps'], 2)
+        self.assertEqual(result['horse_course_surface_starts'], 1)
+
+    def test_clock_only_changes_preserve_every_baseline_feature(self):
+        original = timed_race('2024-01-01', 1)
+        changed = deepcopy(original)
+        for row in changed:
+            row['time_seconds'] *= 1.1
+            row['last_3f_seconds'] += 4
+        first, second = HistoryState(), HistoryState()
+        first.update_race(original)
+        second.update_race(changed)
+        upcoming = race('2024-01-02', 2)
+        a, b = race_features(upcoming, first), race_features(upcoming, second)
+        self.assertEqual(len(BASE_FEATURE_NAMES), 34)
+        self.assertEqual(FEATURE_NAMES[:34], BASE_FEATURE_NAMES)
+        self.assertEqual([row[:34] for row in a], [row[:34] for row in b])
+        self.assertNotEqual([row[34:] for row in a], [row[34:] for row in b])
+
+    def test_latest_missing_clock_stays_missing_and_recent_window_is_five_starts(self):
+        state = HistoryState()
+        for number in range(1, 7):
+            old = timed_race(f'2024-01-{number:02d}', number)
+            for row in old:
+                row['time_seconds'] += number
+            state.update_race(old)
+        result = values(race_features(race('2024-01-07', 7), state)[0])
+        self.assertEqual(result['horse_group_recent5_timed_starts'], 5)
+        self.assertAlmostEqual(result['horse_group_recent5_speed_mps'], sum(1600 / (100+i) for i in range(2, 7)) / 5)
+        last = timed_race('2024-01-07', 7)
+        last[0].update(finish_status='did_not_finish', time_seconds=None, last_3f_seconds=None)
+        state.update_race(last)
+        result = values(race_features(race('2024-01-08', 8), state)[0])
+        self.assertIsNone(result['horse_group_previous_speed_mps'])
+        self.assertIsNotNone(result['horse_group_recent5_speed_mps'])
+        self.assertEqual(result['horse_group_recent5_timed_starts'], 4)
+
+
 class StreamingFeatureBuildTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -167,7 +324,8 @@ class StreamingFeatureBuildTests(unittest.TestCase):
         races = [race('2024-01-01', 1), race('2024-01-02', 2), race('2026-01-03', 3)]
         changed = deepcopy(races)
         for row, position in zip(changed[-1], (4, 3, 2, 1)):
-            row.update(finish_position=position, odds=9999, popularity=99, corner_order='9-9')
+            row.update(finish_position=position, odds=9999, popularity=99, corner_order='9-9',
+                       time_seconds=9999, last_3f_seconds=777)
         _, original_rows, _ = self.build('original.sqlite3', races)
         _, changed_rows, _ = self.build('changed.sqlite3', changed)
         self.assertEqual([row for row in original_rows if row[0] < '2026-01-03'],
@@ -192,6 +350,19 @@ class StreamingFeatureBuildTests(unittest.TestCase):
         self.assertEqual(sum(row[3] for row in rows), 4)
         self.assertEqual(build_features(path)['rows'], 5)
         self.assertEqual(len(read_features(path)), 5)
+
+    def test_same_day_clock_outcomes_are_not_used_by_any_race_that_day(self):
+        first, second = timed_race('2024-01-01', 1), timed_race('2024-01-01', 2)
+        second[0].update(time_seconds=500, last_3f_seconds=100)
+        _, rows, _ = self.build('same-day-clock.sqlite3', [first, second, race('2024-01-02', 3)])
+        for row in rows:
+            vector = values(json.loads(row[4]))
+            if row[0] == '2024-01-01':
+                self.assertIsNone(vector['horse_group_recent5_speed_mps'])
+                self.assertEqual(vector['horse_group_recent5_timed_starts'], 0)
+            else:
+                self.assertEqual(vector['horse_group_recent5_timed_starts'], 2)
+                self.assertIsNone(vector['horse_group_previous_speed_mps'])
 
 
 if __name__ == '__main__':
