@@ -8,7 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .model import evaluate, feature_revision, feature_sets, libraries, load_group, readonly
+from .model import evaluate, feature_revision, feature_sets, libraries, load_bias_variant, load_group, readonly
 
 
 def race_seed(identifier, seed=42):
@@ -51,7 +51,7 @@ def load_rank_group(database, group):
             valid[indices] = False
             exclusions['tied_or_noncontiguous_finish_positions'] += 1
     data['x'] = data['x'][valid]
-    for key in ('y','days','declared','popularity'):
+    for key in ('y','days','declared','popularity','regions','race_numbers'):
         data[key] = data[key][valid]
     data['identities'] = [value for i,value in enumerate(data['identities']) if valid[i]]
     data['positions'], data['finished'], data['field_sizes'] = positions[valid], finished[valid], field_sizes[valid]
@@ -65,7 +65,8 @@ def estimate_completion(estimator, constant, x):
     return np.full(len(x),constant,dtype=float) if estimator is None else estimator.predict_proba(x)[:,1]
 
 
-def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=42,uniform=False,prediction_sink=None):
+def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=42,uniform=False,
+                 prediction_sink=None,stratify=False):
     from .ranking import rank_distribution
     np, *_ = libraries()
     indices = np.flatnonzero(mask)
@@ -73,6 +74,15 @@ def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=4
     positions, finished = data['positions'][mask], data['finished'][mask]
     top3 = np.empty(len(indices))
     losses, briers, race_losses, race_briers, errors = [], [], [], [], []
+    strata = {}
+    if stratify:
+        from .features import FEATURE_NAMES
+        support = data['x'][mask, FEATURE_NAMES.index('day_bias_races')]
+        numbers = data['race_numbers'][mask]
+        strata = {kind: {key: dict(rows=0, races=0, losses=[]) for key in keys}
+                  for kind, keys in (('by_race_number', ('1_4','5_8','9_plus','unknown')),
+                                     ('by_intraday_support', ('zero','positive','unknown')),
+                                     ('by_first_race', ('first','later','unknown')))}
     for identifier, iterator in groupby(range(len(indices)),key=lambda i:identities[i][0]):
         selected = list(iterator)
         n = len(selected)
@@ -84,6 +94,18 @@ def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=4
         brier = (probabilities**2).sum(axis=1)+1-2*truth
         losses.extend(loss.tolist()); briers.extend(brier.tolist())
         race_losses.append(float(loss.mean())); race_briers.append(float(brier.mean()))
+        if stratify:
+            number, used = numbers[selected[0]], support[selected[0]]
+            number_key = ('unknown' if not np.isfinite(number) else
+                          '1_4' if number <= 4 else '5_8' if number <= 8 else '9_plus')
+            support_key = 'unknown' if not np.isfinite(used) else 'positive' if used > 0 else 'zero'
+            first_key = 'unknown' if not np.isfinite(number) else 'first' if number == 1 else 'later'
+            for kind, key in (('by_race_number', number_key), ('by_intraday_support', support_key),
+                              ('by_first_race', first_key)):
+                accumulator = strata[kind][key]
+                accumulator['rows'] += n
+                accumulator['races'] += 1
+                accumulator['losses'].append(float(loss.mean()))
         top3[selected] = np.clip(probabilities[:,:min(3,n)].sum(axis=1),0,1)
         if prediction_sink is not None:
             for local,index in enumerate(selected):
@@ -92,6 +114,9 @@ def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=4
                     actual_finish_position=int(positions[index]) if finished[index] else None,
                     actual_nonfinish=not bool(finished[index]),top3_probability=float(top3[index]),
                     nonfinish_probability=float(probabilities[local,-1]))
+                if stratify:
+                    row.update(race_number=int(number) if np.isfinite(number) else None,
+                               day_bias_races=float(used) if np.isfinite(used) else None)
                 row.update({f'rank_{rank}_probability':float(value)
                             for rank,value in enumerate(probabilities[local,:n],1)})
                 prediction_sink(row)
@@ -100,7 +125,7 @@ def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=4
         errors.extend(abs(expected[j]-positions[selected[j]]) for j in range(n)
                       if finished[selected[j]] and rank_mass[j]>0)
     nonfinish = 1-completion
-    return dict(rows=len(indices),races=len(race_losses),finished_rows=int(finished.sum()),
+    result = dict(rows=len(indices),races=len(race_losses),finished_rows=int(finished.sum()),
         nonfinished_rows=int((~finished).sum()),outcome_log_loss=float(np.mean(losses)),
         race_outcome_log_loss=float(np.mean(race_losses)),multiclass_brier=float(np.mean(briers)),
         race_multiclass_brier=float(np.mean(race_briers)),
@@ -108,6 +133,11 @@ def rank_metrics(data, mask, scores, completion, *, temperature, samples, seed=4
         conditional_rank_rows=len(errors),
         nonfinish_brier=float(np.mean((nonfinish-(~finished))**2)),
         top3=evaluate(data['y'][mask],top3,identities,popularity=data['popularity'][mask]))
+    for kind, buckets in strata.items():
+        result[kind] = {key: dict(rows=value['rows'],races=value['races'],
+                                  race_outcome_log_loss=float(np.mean(value['losses'])) if value['races'] else None)
+                        for key,value in buckets.items()}
+    return result
 
 
 def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',test_start='2026-01-01',
@@ -116,6 +146,7 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
     from datetime import date
     from sklearn.ensemble import HistGradientBoostingRegressor
     from .features import FEATURE_NAMES,CATEGORICAL_FEATURES
+    from .bias import BIAS_CONFIGS, DEFAULT_BIAS_CONFIG
     np,joblib,Classifier,threadpool_limits = libraries()
     if any(date.fromisoformat(value).isoformat()!=value for value in (validation_start,test_start)):
         raise ValueError('期間の境界はYYYY-MM-DDで指定してください。')
@@ -124,7 +155,7 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
     profiles = feature_sets()
     if feature_set not in ('auto',*profiles):
         raise ValueError('未対応のfeature_setです。')
-    requested = ['enhanced','context'] if feature_set=='auto' else [feature_set]
+    requested = ['enhanced','context','bias'] if feature_set=='auto' else [feature_set]
     report = report or (lambda **message:None)
     connection = readonly(database)
     try:
@@ -142,7 +173,9 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
         rank_definition='1..N (without dead heats); nonfinish includes DNF and disqualification',
         method='regression utilities + Plackett-Luce order + independent completion probabilities',
         validation_samples=validation_samples,evaluation_samples=evaluation_samples,prediction_samples=4096,
-        smoothing=.001,seed=42)
+        smoothing=.001,seed=42,
+        bias_candidate_configs=[dict(config.as_dict(),identifier=config.identifier) for config in BIAS_CONFIGS],
+        intraday_availability_assumption='Earlier numbered races at the same course/date are treated as available; actual result publication times are not in historical exports.')
     trained = 0
     for group in groups:
         report(event='training_rank_group',group=group)
@@ -152,6 +185,11 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
         sizes = {name:int(mask.sum()) for name,mask in masks.items()}
         finished_train = masks['train']&data['finished']
         info = dict(rows=sizes,excluded_rows=data['excluded_rows'],excluded_races=data['excluded_races'])
+        group_requested = [name for name in requested if name != 'bias' or group in ('central_flat','local_flat')]
+        if not group_requested:
+            result['groups'][group]=dict(state='skipped',reason='当日バイアスは中央・地方平地だけが対象',**info)
+            report(event='skipped_group',group=group,**result['groups'][group])
+            continue
         if sizes['train']<200 or sizes['validation']<50 or sizes['test']<50 or finished_train.sum()<100:
             result['groups'][group]=dict(state='skipped',reason='順位モデルの期間別データが不足',**info)
             report(event='skipped_group',group=group,**result['groups'][group])
@@ -175,26 +213,42 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
                 finisher.fit(matrix(mask,columns),data['finished'][mask].astype(np.uint8))
             return ranker,finisher,constant,columns
         with threadpool_limits(limits=threads):
-            for profile in requested:
-                for leaves in (15,31):
-                    report(event='training_rank_candidate',group=group,feature_set=profile,max_leaf_nodes=leaves)
-                    ranker,finisher,constant,columns=fit_pair(masks['train'],profiles[profile],leaves)
-                    x=matrix(masks['validation'],columns)
-                    scores=-ranker.predict(x)
-                    completion=estimate_completion(finisher,constant,x)
-                    for temperature in (.1,.2,.4):
-                        metrics=rank_metrics(data,masks['validation'],scores,completion,temperature=temperature,
-                                             samples=validation_samples)
-                        candidates.append(dict(feature_set=profile,max_leaf_nodes=leaves,temperature=temperature,metrics=metrics))
+            for profile in group_requested:
+                configurations = BIAS_CONFIGS if profile == 'bias' else (None,)
+                for config in configurations:
+                    if config is not None:
+                        load_bias_variant(database,data,config.identifier)
+                    setting = dict(config.as_dict(),identifier=config.identifier) if config is not None else None
+                    for leaves in (15,31):
+                        report(event='training_rank_candidate',group=group,feature_set=profile,
+                               max_leaf_nodes=leaves,bias_config=setting)
+                        ranker,finisher,constant,columns=fit_pair(masks['train'],profiles[profile],leaves)
+                        x=matrix(masks['validation'],columns)
+                        scores=-ranker.predict(x)
+                        completion=estimate_completion(finisher,constant,x)
+                        for temperature in (.1,.2,.4):
+                            metrics=rank_metrics(data,masks['validation'],scores,completion,temperature=temperature,
+                                                 samples=validation_samples,stratify=True)
+                            candidates.append(dict(feature_set=profile,max_leaf_nodes=leaves,temperature=temperature,
+                                                   bias_config=setting,metrics=metrics))
             selected=min(candidates,key=lambda c:(c['metrics']['race_outcome_log_loss'],
-                len(profiles[c['feature_set']]),c['max_leaf_nodes'],c['temperature']))
+                len(profiles[c['feature_set']]),c['max_leaf_nodes'],c['temperature'],
+                c['bias_config'] is not None and c['bias_config']['identifier'] != DEFAULT_BIAS_CONFIG.identifier,
+                c['bias_config']['identifier'] if c['bias_config'] is not None else ''))
             profile=selected['feature_set']; names=profiles[profile]
+            selected_config=selected['bias_config']
+            if selected_config is not None:
+                load_bias_variant(database,data,selected_config['identifier'])
+            elif 'bias' in group_requested:
+                # Keep the support diagnostics tied to the declared default,
+                # even if a non-bias profile won model selection.
+                load_bias_variant(database,data,DEFAULT_BIAS_CONFIG.identifier)
             development=data['days']<test_start
             ranker,finisher,constant,columns=fit_pair(development,names,selected['max_leaf_nodes'])
             x=matrix(masks['test'],columns)
             maximum=int(data['field_sizes'][masks['test']].max())
             fields=['race_date','race_id','horse_id','horse_number','starters','actual_finish_position',
-                    'actual_nonfinish','top3_probability','nonfinish_probability']
+                    'actual_nonfinish','top3_probability','nonfinish_probability','race_number','day_bias_races']
             rank_fields=[f'rank_{rank}_probability' for rank in range(1,maximum+1)]
             prediction_file=group+'_test_rank_probabilities.csv'
             with (output/prediction_file).open('w',encoding='utf-8',newline='') as file:
@@ -204,7 +258,7 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
                     for name in rank_fields: row.setdefault(name,0.0)
                     writer.writerow(row)
                 test=rank_metrics(data,masks['test'],-ranker.predict(x),estimate_completion(finisher,constant,x),
-                    temperature=selected['temperature'],samples=evaluation_samples,prediction_sink=write_prediction)
+                    temperature=selected['temperature'],samples=evaluation_samples,prediction_sink=write_prediction,stratify=True)
             # Uniform rank order with the same development-period completion prior.
             prior=rank_metrics(data,masks['test'],np.zeros(len(x)),np.full(len(x),constant),
                                temperature=1,samples=evaluation_samples,uniform=True)
@@ -213,15 +267,23 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
             feature_revision=feature_revision(),selected_feature_names=names,feature_set=profile,
             rank_estimator=ranker,finish_estimator=finisher,finish_constant=constant,
             temperature=selected['temperature'],trained_through=through,threads=threads,
-            samples=4096,smoothing=.001,seed=42)
+            samples=4096,smoothing=.001,seed=42,bias_config=selected_config)
         joblib.dump(bundle,output/(group+'.joblib'),compress=3)
         comparison={}
-        for name in requested:
+        for name in group_requested:
             best=min((c for c in candidates if c['feature_set']==name),key=lambda c:c['metrics']['race_outcome_log_loss'])
             comparison[name]=dict(feature_count=len(profiles[name]),**best)
+        bias_comparison={}
+        if 'bias' in group_requested:
+            for config in BIAS_CONFIGS:
+                best=min((c for c in candidates if c['feature_set']=='bias'
+                          and c['bias_config']['identifier']==config.identifier),
+                         key=lambda c:(c['metrics']['race_outcome_log_loss'],c['max_leaf_nodes'],c['temperature']))
+                bias_comparison[config.identifier]=dict(feature_count=len(profiles['bias']),**best)
         result['groups'][group]=dict(state='trained',**info,trained_through=through,
             test_predictions_file=prediction_file,
             selected_feature_set=profile,selected_feature_names=names,
+            selected_bias_config=selected_config,bias_config_comparison=bias_comparison,
             selected_max_leaf_nodes=selected['max_leaf_nodes'],selected_temperature=selected['temperature'],
             validation=selected['metrics'],validation_comparison=comparison,test=test,uniform_rank_prior=prior)
         trained+=1

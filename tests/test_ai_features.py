@@ -7,7 +7,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
-from keiba_ai.features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, RANK_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
+from keiba_ai.features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, RANK_FEATURE_NAMES, CONTEXT_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
 
 
 def race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
@@ -160,7 +160,9 @@ class HistoryFeatureTests(unittest.TestCase):
 
     def test_unknown_categories_and_missing_rider_ids_remain_unknown(self):
         incoming = race('2024-01-02', 2)
-        incoming[0].update(course='未知の場', surface='不明', sex='不明', jockey_id=None, trainer_id='')
+        for row in incoming:
+            row.update(course='未知の場', surface='不明')
+        incoming[0].update(sex='不明', jockey_id=None, trainer_id='')
         vector = values(race_features(incoming, HistoryState())[0])
         for name in ('course_code', 'surface_code', 'sex_code', 'jockey_prior_top3_rate', 'trainer_prior_top3_rate'):
             self.assertIsNone(vector[name])
@@ -505,7 +507,7 @@ class HistoricalContextTests(unittest.TestCase):
     def test_unknown_context_remains_missing_and_banei_weights_are_not_flat_clamped(self):
         incoming = race('2024-01-02', 2)
         missing = values(race_features(incoming, HistoryState())[0])
-        for name in FEATURE_NAMES[len(RANK_FEATURE_NAMES):]:
+        for name in CONTEXT_FEATURE_NAMES[len(RANK_FEATURE_NAMES):]:
             if name.endswith('_starts'):
                 self.assertEqual(missing[name], 0)
             else:

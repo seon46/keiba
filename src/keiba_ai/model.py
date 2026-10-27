@@ -25,19 +25,20 @@ def readonly(database):
 
 
 def feature_revision():
-    from . import dataset, features, metadata
+    from . import bias, dataset, features, metadata, same_day
     from keiba_scraper import conditions
     digest = hashlib.sha256()
-    for module in (dataset, features, conditions, metadata):
+    for module in (dataset, features, conditions, metadata, bias, same_day):
         digest.update(module.__name__.encode() + b'\0')
         digest.update(Path(module.__file__).read_bytes().replace(b'\r\n',b'\n'))
     return digest.hexdigest()
 
 
 def feature_sets():
-    from .features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, RANK_FEATURE_NAMES, FEATURE_NAMES
+    from .features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, RANK_FEATURE_NAMES, CONTEXT_FEATURE_NAMES, FEATURE_NAMES
     return {'baseline': list(BASE_FEATURE_NAMES), 'form': list(FORM_FEATURE_NAMES),
-            'enhanced': list(RANK_FEATURE_NAMES),'context':list(FEATURE_NAMES)}
+            'enhanced': list(RANK_FEATURE_NAMES),'context':list(CONTEXT_FEATURE_NAMES),
+            'bias':list(FEATURE_NAMES)}
 
 
 def select_feature_columns(bundle):
@@ -50,6 +51,7 @@ def select_feature_columns(bundle):
 
 
 def load_group(database, group):
+    from .bias import race_order
     from .features import FEATURE_NAMES
     np, *_ = libraries()
     connection = readonly(database)
@@ -58,24 +60,92 @@ def load_group(database, group):
         x = np.empty((count, len(FEATURE_NAMES)), dtype=np.float32)
         y = np.empty(count, dtype=np.uint8)
         days = np.empty(count, dtype='U10')
+        regions = np.empty(count, dtype='U10')
+        race_numbers = np.full(count, np.nan)
         declared, popularity = np.empty(count), np.empty(count)
         identities = []
         rows = connection.execute(
             "SELECT f.day,f.race_id,f.horse_id,f.horse_number,f.target,f.feature_json,"
-            "json_extract(p.payload_json,'$.declared_field_size'),json_extract(p.payload_json,'$.popularity') "
+            "json_extract(p.payload_json,'$.declared_field_size'),json_extract(p.payload_json,'$.popularity'),"
+            "f.region,p.payload_json "
             "FROM features f JOIN input_rows p ON p.region=f.region AND p.race_id=f.race_id "
             "AND p.horse_id=f.horse_id WHERE f.group_name=? ORDER BY f.day,f.race_id,f.horse_number", (group,))
+        previous_race, race_number = None, None
+        observed = 0
         for index, row in enumerate(rows):
+            if index >= count:
+                raise ValueError('AI用データが処理中に変更されました。')
             values = json.loads(row[5])
             if len(values) != len(FEATURE_NAMES):
                 raise ValueError('特徴量の版が一致しません。prepareから作成し直してください。')
             x[index] = [float('nan') if value is None else value for value in values]
             y[index], days[index] = row[4], row[0]
+            regions[index] = row[8]
+            race_key = (row[0], row[8], row[1])
+            if race_key != previous_race:
+                race_number = race_order([json.loads(row[9])])
+                previous_race = race_key
+            if race_number is not None:
+                race_numbers[index] = race_number
             declared[index], popularity[index] = row[6] or float('nan'), row[7] or float('nan')
             identities.append((row[1], row[2], row[3]))
-        return dict(x=x, y=y, days=days, declared=declared, popularity=popularity, identities=identities)
+            observed += 1
+        if observed != count:
+            raise ValueError('AI用データが処理中に変更されました。')
+        return dict(x=x, y=y, days=days, regions=regions, race_numbers=race_numbers,
+                    declared=declared, popularity=popularity, identities=identities, group=group)
     finally:
         connection.close()
+
+
+def load_bias_variant(database, data, config_id):
+    """Replace only the eight bias columns after validating complete coverage.
+
+    One variant is streamed at a time. The context columns and labels remain
+    untouched, and a partial/corrupt variant is never silently used.
+    """
+    from .bias import BIAS_CONFIGS, BIAS_FEATURE_NAMES
+    from .features import CONTEXT_FEATURE_NAMES, FEATURE_NAMES
+    np, *_ = libraries()
+    if config_id not in {config.identifier for config in BIAS_CONFIGS}:
+        raise ValueError('保存済みバイアス設定が不正です。prepareから作成し直してください。')
+    if data['x'].shape != (len(data['identities']), len(FEATURE_NAMES)):
+        raise ValueError('バイアスの特徴量数が一致しません。')
+    expected = {(str(region), identity[0], identity[1]): index
+                for index, (region, identity) in enumerate(zip(data['regions'], data['identities']))}
+    if len(expected) != len(data['identities']):
+        raise ValueError('バイアスの照合対象が重複しています。')
+    values = np.empty((len(expected), len(BIAS_FEATURE_NAMES)), dtype=np.float32)
+    seen = set()
+    connection = readonly(database)
+    try:
+        rows = connection.execute(
+            'SELECT v.region,v.race_id,v.horse_id,v.feature_json FROM bias_variants v '
+            'JOIN features f ON f.region=v.region AND f.race_id=v.race_id AND f.horse_id=v.horse_id '
+            'WHERE f.group_name=? AND v.config_id=? ORDER BY f.day,f.race_id,f.horse_number',
+            (data['group'], config_id))
+        for region, identifier, horse, payload in rows:
+            key = (region, identifier, horse)
+            if key not in expected:
+                continue  # Tied/ambiguous races may have been excluded for rank fitting.
+            if key in seen:
+                raise ValueError('保存済みバイアス特徴量が重複しています。')
+            raw = json.loads(payload)
+            if not isinstance(raw, list) or len(raw) != len(BIAS_FEATURE_NAMES):
+                raise ValueError('保存済みバイアス特徴量の長さが不正です。')
+            normalized = np.asarray([np.nan if value is None else value for value in raw], dtype=np.float32)
+            if np.isinf(normalized).any():
+                raise ValueError('保存済みバイアス特徴量に無限大が含まれます。')
+            values[expected[key]] = normalized
+            seen.add(key)
+    except sqlite3.OperationalError as exc:
+        raise ValueError('バイアス候補の保存データを読み込めません。prepareから作成し直してください。') from exc
+    finally:
+        connection.close()
+    if len(seen) != len(expected):
+        raise ValueError('保存済みバイアス候補に不足があります。prepareから作成し直してください。')
+    data['x'][:, len(CONTEXT_FEATURE_NAMES):] = values
+    return data['x']
 
 
 def evaluate(y, probabilities, identities, *, popularity=None):
@@ -130,7 +200,7 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
         raise ValueError('threadsとiterationsは1以上にしてください。')
     profiles = feature_sets()
     if feature_set not in ('auto', *profiles):
-        raise ValueError('feature_setはauto/baseline/form/enhanced/contextで指定してください。')
+        raise ValueError('feature_setはauto/baseline/form/enhanced/context/biasで指定してください。')
     requested = list(profiles) if feature_set == 'auto' else [feature_set]
     report = report or (lambda **message: None)
     connection = readonly(database)
@@ -156,6 +226,11 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
                      validation=(data['days'] >= validation_start) & (data['days'] < test_start),
                      test=data['days'] >= test_start)
         sizes = {key: int(mask.sum()) for key, mask in masks.items()}
+        group_requested = [name for name in requested if name != 'bias' or group in ('central_flat', 'local_flat')]
+        if not group_requested:
+            evaluation['groups'][group] = dict(state='skipped', rows=sizes, reason='当日バイアスは中央・地方平地だけが対象')
+            report(event='skipped_group', group=group, **evaluation['groups'][group])
+            continue
         if sizes['train'] < 200 or sizes['validation'] < 50 or sizes['test'] < 50 or any(
                 len(np.unique(data['y'][mask])) != 2 for mask in masks.values()):
             evaluation['groups'][group] = dict(state='skipped', rows=sizes, reason='各期間の行数または正例・負例が不足')
@@ -169,7 +244,7 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
         parameters = dict(max_iter=iterations, learning_rate=.07, min_samples_leaf=30,
                           l2_regularization=2.0, early_stopping=False, random_state=42)
         with threadpool_limits(limits=threads):
-            for profile in requested:
+            for profile in group_requested:
                 names = profiles[profile]
                 columns = [FEATURE_NAMES.index(name) for name in names]
                 categories = [name in CATEGORICAL_FEATURES for name in names]
@@ -183,7 +258,7 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
                     candidates.append(dict(feature_set=profile, max_leaf_nodes=leaves, validation=validation))
                 del x_train, x_validation
             selected = min(candidates, key=lambda item: (item['validation']['race_log_loss'],
-                           item['feature_set'] != 'baseline', item['max_leaf_nodes']))
+                           len(profiles[item['feature_set']]), item['max_leaf_nodes']))
             profile, leaves = selected['feature_set'], selected['max_leaf_nodes']
             selected_validation = selected['validation']
             names = profiles[profile]
@@ -200,19 +275,22 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
                             float(data['y'][development].mean()))
         prior = metrics(masks['test'], baseline)
         trained_through = str(max(data['days'][development]))
+        from .bias import DEFAULT_BIAS_CONFIG
+        bias_config = dict(DEFAULT_BIAS_CONFIG.as_dict(), identifier=DEFAULT_BIAS_CONFIG.identifier) if profile == 'bias' else None
         bundle = dict(estimator=estimator, group=group, feature_names=list(FEATURE_NAMES),
                       feature_revision=feature_revision(), trained_through=trained_through,
                       target='top3', schema_version=1, threads=threads, feature_set=profile,
-                      selected_feature_names=names)
+                      selected_feature_names=names, bias_config=bias_config)
         joblib.dump(bundle, output / (group + '.joblib'), compress=3)
         comparison = {}
-        for name in requested:
+        for name in group_requested:
             best = min((candidate for candidate in candidates if candidate['feature_set'] == name),
                        key=lambda item: (item['validation']['race_log_loss'], item['max_leaf_nodes']))
             comparison[name] = dict(max_leaf_nodes=best['max_leaf_nodes'],
                                     feature_count=len(profiles[name]), metrics=best['validation'])
         evaluation['groups'][group] = dict(state='trained', rows=sizes, trained_through=trained_through,
             selected_feature_set=profile, selected_feature_names=names, validation_comparison=comparison,
+            selected_bias_config=bias_config,
             selected_max_leaf_nodes=leaves, validation=selected_validation, test=test, field_size_prior=prior,
             improves_prior_log_loss=test['race_log_loss'] < prior['race_log_loss'])
         trained += 1

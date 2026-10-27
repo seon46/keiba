@@ -75,9 +75,19 @@ def prepare(source, output, *, race_db=None):
     return Path(output) / 'features.sqlite3'
 
 
-def predict(database, models, entries, output, *, samples=None):
-    from .dataset import normalize_row, iter_races
-    from .features import FEATURE_NAMES, HistoryState, race_features
+def predict(database, models, entries, output, *, samples=None, same_day_results=None):
+    from .same_day import load_same_day_results
+    if Path(output).exists():
+        raise ValueError(f'出力先は既にあります: {Path(output).resolve()}')
+    with load_same_day_results(same_day_results) as observed:
+        _predict(database, models, entries, output, samples=samples, same_day_results=observed)
+
+
+def _predict(database, models, entries, output, *, samples=None, same_day_results=None):
+    from .dataset import normalize_row
+    from .features import FEATURE_NAMES, race_features
+    from .bias import BiasConfig, DEFAULT_BIAS_CONFIG, IntradayBiasState
+    from .same_day import rebuild_prediction_states
     np, joblib, _, threadpool_limits = libraries()
     output = Path(output).resolve()
     if output.exists():
@@ -100,7 +110,7 @@ def predict(database, models, entries, output, *, samples=None):
             grouped.setdefault((row['day'],row['region'],row['race_id']),[]).append(row)
     if not grouped:
         raise ValueError('出馬表がありません。')
-    results, loaded, cached_day, history = [], {}, None, None
+    results, loaded, cached_day, history, priors = [], {}, None, None, None
     targets = set()
     history_day = None
     for (day, region, race_id), race in sorted(grouped.items()):
@@ -116,10 +126,7 @@ def predict(database, models, entries, output, *, samples=None):
         if not active:
             continue
         if day != cached_day:
-            history, history_day = HistoryState(), None
-            for previous in iter_races(Path(database), before_date=day):
-                history.update_race(previous)
-                history_day = previous[0]['day']
+            history, priors, history_day = rebuild_prediction_states(Path(database), day)
             cached_day = day
         group = active[0]['group_name']
         if group not in loaded:
@@ -137,8 +144,20 @@ def predict(database, models, entries, output, *, samples=None):
             raise ValueError('モデルと特徴量の版が一致しません。')
         if day <= bundle['trained_through']:
             raise ValueError(f'学習期間内の日付には予測できません: {day}')
+        saved_bias = bundle.get('bias_config')
+        uses_bias = bundle.get('feature_set') == 'bias'
+        if uses_bias and not isinstance(saved_bias, dict):
+            raise ValueError('バイアスモデルの設定がありません。学習から作成し直してください。')
+        bias_config = (BiasConfig(prior_races=saved_bias['prior_races'], decay=saved_bias['decay'])
+                       if saved_bias is not None else DEFAULT_BIAS_CONFIG)
+        if saved_bias is not None and saved_bias.get('identifier') != bias_config.identifier:
+            raise ValueError('バイアスモデルの設定と識別子が一致しません。')
+        intraday = same_day_results.for_race(race) if same_day_results is not None else IntradayBiasState(day)
+        vectors = race_features(active,history,intraday=intraday,priors=priors,
+                                full_race=race,bias_config=bias_config)
+        bias_count = vectors[0][FEATURE_NAMES.index('day_bias_races')]
         x = np.asarray([[np.nan if value is None else value for value in values]
-                        for values in race_features(active,history)],dtype=np.float32)
+                        for values in vectors],dtype=np.float32)
         x = x[:, select_feature_columns(bundle)]
         with threadpool_limits(limits=bundle.get('threads',4)):
             if bundle['target']=='rank':
@@ -158,7 +177,15 @@ def predict(database, models, entries, output, *, samples=None):
             result=dict(race_date=day,region=region,race_id=race_id,horse_id=row['horse_id'],
                 horse_number=row['horse_number'],top3_probability=float(probability),group=group,
                 history_last_date=history_day,
-                days_since_history=(date.fromisoformat(day)-date.fromisoformat(history_day)).days if history_day else None)
+                days_since_history=(date.fromisoformat(day)-date.fromisoformat(history_day)).days if history_day else None,
+                feature_set=bundle.get('feature_set'),
+                day_bias_races=bias_count,
+                day_front_bias=vectors[index][FEATURE_NAMES.index('day_front_bias')],
+                day_inner_bias=vectors[index][FEATURE_NAMES.index('day_inner_bias')],
+                intraday_bias_used=bool(uses_bias and bias_count is not None and bias_count>0),
+                bias_prior_only=bool(uses_bias and not bias_count),
+                bias_config=bias_config.identifier if uses_bias else None,
+                same_day_results_sha256=same_day_results.sha256 if same_day_results is not None else None)
             if bundle['target']=='rank':
                 ranks=distribution[index,:len(active)]
                 finish=float(completion[index])
@@ -209,8 +236,8 @@ def main(argv=None):
         command.add_argument('--test-start',default='2026-01-01')
         command.add_argument('--threads',type=int,default=4)
         command.add_argument('--iterations',type=int,default=150)
-        command.add_argument('--feature-set', choices=('auto','baseline','form','enhanced','context'), default='auto',
-                             help='特徴量の指定。contextは保存済み条件を含む96項目（既定: auto）')
+        command.add_argument('--feature-set', choices=('auto','baseline','form','enhanced','context','bias'), default='auto',
+                             help='特徴量の指定。contextは96項目、biasは当日傾向を加えた104項目（既定: auto）')
         command.add_argument('--target',choices=('top3','rank'),default='top3',help='予測する対象（rank: 全順位と未完走）')
         command.add_argument('--validation-samples',type=int,default=128)
         command.add_argument('--evaluation-samples',type=int,default=1024)
@@ -220,6 +247,8 @@ def main(argv=None):
     prediction.add_argument('--entries',required=True,type=Path)
     prediction.add_argument('--output',required=True,type=Path)
     prediction.add_argument('--samples',type=int,help='順位モデルの順序サンプル数（既定4096）')
+    prediction.add_argument('--same-day-results',type=Path,
+                            help='当日確定済みの全頭結果CSV。同日同場同芝ダの対象より前のRだけ利用')
     args = parser.parse_args(argv)
     try:
         if args.command == 'prepare':
@@ -239,7 +268,8 @@ def main(argv=None):
                           threads=args.threads,iterations=args.iterations,feature_set=args.feature_set,report=emit)
             emit(event='training_complete',report=str(destination/'evaluation.json'))
         else:
-            predict(args.dataset,args.model_dir,args.entries,args.output,samples=args.samples)
+            predict(args.dataset,args.model_dir,args.entries,args.output,samples=args.samples,
+                    same_day_results=args.same_day_results)
         return 0
     except (ValueError,OSError,sqlite3.Error,KeyError,csv.Error) as exc:
         emit(event='error',message=str(exc))

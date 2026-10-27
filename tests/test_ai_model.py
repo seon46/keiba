@@ -87,7 +87,7 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(group['test']['rows'],400)
             self.assertEqual(group['test']['races'],40)
             comparison=group['validation_comparison']
-            self.assertEqual(set(comparison),{'baseline','form','enhanced','context'})
+            self.assertEqual(set(comparison),{'baseline','form','enhanced','context','bias'})
             self.assertLessEqual(group['validation']['race_log_loss'],comparison['baseline']['metrics']['race_log_loss'])
             self.assertEqual(group['validation']['race_log_loss'],min(item['metrics']['race_log_loss'] for item in comparison.values()))
             original=joblib.load(root/'model/central_flat.joblib')
@@ -126,13 +126,14 @@ class ModelTests(unittest.TestCase):
 
     def test_each_explicit_profile_predicts_using_its_selected_columns(self):
         import joblib
-        from keiba_ai.features import BASE_FEATURE_NAMES, RANK_FEATURE_NAMES, FEATURE_NAMES
+        from keiba_ai.features import BASE_FEATURE_NAMES, RANK_FEATURE_NAMES, CONTEXT_FEATURE_NAMES, FEATURE_NAMES
         with TemporaryDirectory() as name, redirect_stdout(io.StringIO()):
             root=Path(name)
             fixture_csv(root/'source.csv',days=20)
             fixture_csv(root/'entries.csv',years=(2027,),days=1,page='entries')
             database=prepare(root/'source.csv',root/'prepared')
-            for profile,names in (('baseline',BASE_FEATURE_NAMES),('enhanced',RANK_FEATURE_NAMES),('context',FEATURE_NAMES)):
+            for profile,names in (('baseline',BASE_FEATURE_NAMES),('enhanced',RANK_FEATURE_NAMES),
+                                  ('context',CONTEXT_FEATURE_NAMES),('bias',FEATURE_NAMES)):
                 directory=root/profile
                 result=train(database,directory,threads=1,iterations=3,feature_set=profile)
                 bundle=joblib.load(directory/'central_flat.joblib')

@@ -1,9 +1,10 @@
-"""Causal, day-delayed features shared by offline training and prediction.
+"""Previous-day form and separate earlier-race track tendencies.
 
-Only declared race/runner attributes and outcomes from earlier calendar days
-are used. IDs are opaque lookup keys, never numeric model inputs. Horse recent
-form spans groups; horse/jockey/trainer career rates are specific to the model
-group so that JRA, regional flat racing and banei are not pooled indiscriminately.
+Horse, jockey and trainer histories use earlier calendar days only. Separate
+day-local bias features use earlier numbered races at the same venue/surface.
+Horse recent form spans groups; career rates remain specific to each model
+group. Verified race-ID fields provide scheduled order and meeting day, while
+horse, jockey and trainer IDs remain opaque lookup keys.
 """
 
 from __future__ import annotations
@@ -16,6 +17,9 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+
+from .bias import (BIAS_FEATURE_NAMES, BIAS_CONFIGS, DEFAULT_BIAS_CONFIG,
+                   BiasPriorState, IntradayBiasState, bias_features, race_order)
 
 
 BASE_FEATURE_NAMES = (
@@ -50,7 +54,7 @@ RANK_FEATURE_NAMES = FORM_FEATURE_NAMES + (
     "horse_group_recent5_corner_leading_rate", "horse_group_recent5_corner_front_rate",
     "horse_group_recent5_corner_starts", "opponents_recent5_corner_front_rate",
 )
-FEATURE_NAMES = RANK_FEATURE_NAMES + (
+CONTEXT_FEATURE_NAMES = RANK_FEATURE_NAMES + (
     "race_class_code", "race_grade_code", "race_weight_rule_code",
     "race_age_min", "race_age_max", "race_first_prize_man",
     "horse_group_previous_class_code", "horse_group_previous_grade_code",
@@ -66,6 +70,7 @@ FEATURE_NAMES = RANK_FEATURE_NAMES + (
     "horse_group_dryish_starts", "horse_group_dryish_top3_rate",
     "horse_group_recent5_bodyweight_starts", "horse_group_recent5_odds_starts",
 )
+FEATURE_NAMES = CONTEXT_FEATURE_NAMES + BIAS_FEATURE_NAMES
 CATEGORICAL_FEATURES = (
     "course_code", "surface_code", "sex_code", "race_class_code", "race_grade_code", "race_weight_rule_code",
     "horse_group_previous_class_code", "horse_group_previous_grade_code",
@@ -435,7 +440,7 @@ class HistoryState:
         self._latest_day = day
 
 
-def race_features(race: list[dict], histories: HistoryState) -> list[list[float | None]]:
+def _context_features(race: list[dict], histories: HistoryState) -> list[list[float | None]]:
     """Return one vector per supplied runner, preserving the supplied order.
 
     Callers filter known scratched/excluded runners before this function. Its
@@ -539,6 +544,25 @@ def race_features(race: list[dict], histories: HistoryState) -> list[list[float 
     return vectors
 
 
+def race_features(race: list[dict], histories: HistoryState, *, intraday=None, priors=None,
+                  full_race=None, bias_config=DEFAULT_BIAS_CONFIG) -> list[list[float | None]]:
+    """Combine previous-day form with a separate, earlier-race bias state.
+
+    The historical state retains its same-day guard.  The bias state never
+    updates it, and a caller with no live results receives prior-only values.
+    ``full_race`` retains withdrawn horse numbers for gate normalization.
+    """
+    if not race:
+        return []
+    vectors = _context_features(race, histories)
+    day = race[0]["day"]
+    intraday = IntradayBiasState(day) if intraday is None else intraday
+    priors = BiasPriorState() if priors is None else priors
+    additions = bias_features(race, intraday, priors, form_vectors=vectors,
+                              config=bias_config, full_race=full_race)
+    return [vector + addition for vector, addition in zip(vectors, additions)]
+
+
 def build_features(database: Path, report=None) -> dict:
     """Stream races through daily frozen histories into the separate AI cache."""
     from .dataset import iter_races
@@ -557,33 +581,77 @@ def build_features(database: Path, report=None) -> dict:
             target INTEGER NOT NULL, feature_json TEXT NOT NULL,
             PRIMARY KEY(region,race_id,horse_id)
         )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS bias_variants (
+            region TEXT NOT NULL, race_id TEXT NOT NULL, horse_id TEXT NOT NULL,
+            config_id TEXT NOT NULL, feature_json TEXT NOT NULL,
+            PRIMARY KEY(region,race_id,horse_id,config_id)
+        )""")
+        connection.execute("CREATE INDEX IF NOT EXISTS bias_variants_config "
+                           "ON bias_variants(config_id,region,race_id,horse_id)")
         with connection:
             connection.execute("DELETE FROM features")
+            connection.execute("DELETE FROM bias_variants")
         histories = HistoryState()
+        priors = BiasPriorState()
         rows_count = races_count = days_count = skipped = 0
+        bias_races = bias_rows = 0
+        source_bias_races = 0
+        bias_skips = defaultdict(int)
         start = finish = None
         groups = defaultdict(lambda: {"rows": 0, "races": 0, "positives": 0})
         for day, iterator in groupby(iter_races(connection), key=lambda race: race[0]["day"]):
             daily_races = []
             inserts = []
-            for race in iterator:
+            variants = []
+            intraday = IntradayBiasState(day)
+            # Results only become available to a later race at the same venue.
+            # Race numbers encode scheduled order; historical completion and
+            # publication timestamps are unavailable in the result archive.
+            def order(race):
+                first = race[0]
+                number = race_order(race)
+                return (first["region"], first.get("course") or "", first.get("surface") or "",
+                        number if number is not None else 1000, first["race_id"])
+
+            for race in sorted(iterator, key=order):
                 active = [row for row in race if row.get("finish_status") not in _WITHDRAWN]
                 if not active:
                     skipped += 1
                     continue
-                vectors = race_features(active, histories)
+                vectors = race_features(active, histories, intraday=intraday, priors=priors,
+                                        full_race=race)
+                context = [vector[:len(CONTEXT_FEATURE_NAMES)] for vector in vectors]
+                usable = vectors[0][FEATURE_NAMES.index("day_bias_races")]
+                if usable is not None and usable > 0:
+                    bias_races += 1
+                    bias_rows += len(active)
+                for config in BIAS_CONFIGS:
+                    additions = ([vector[len(CONTEXT_FEATURE_NAMES):] for vector in vectors]
+                                 if config == DEFAULT_BIAS_CONFIG else
+                                 bias_features(active, intraday, priors, form_vectors=context,
+                                               config=config, full_race=race))
+                    variants.extend((row["region"], row["race_id"], row["horse_id"], config.identifier,
+                                     json.dumps(addition, allow_nan=False, separators=(",", ":")))
+                                    for row, addition in zip(active, additions))
                 for row, vector in zip(active, vectors):
                     _, _, target = _outcome(row)
                     inserts.append((row["region"], row["race_id"], day, row["horse_id"],
                                     row.get("horse_number"), row["group_name"], target,
                                     json.dumps(vector, allow_nan=False, separators=(",", ":"))))
                 daily_races.append(active)
+                # This includes the original scratched/excluded slots only to
+                # preserve gate positions. The bias estimator filters outcomes.
+                source_bias_races += int(intraday.add_result(race))
+            for reason, count in intraday.skipped_reasons.items():
+                bias_skips[reason] += count
             with connection:
                 connection.executemany("INSERT INTO features VALUES (?,?,?,?,?,?,?,?)", inserts)
+                connection.executemany("INSERT INTO bias_variants VALUES (?,?,?,?,?)", variants)
                 # No outcome from this date is made available until all its
                 # feature vectors have been computed, including other groups.
                 for race in daily_races:
                     histories.update_race(race)
+                priors.update_day(intraday)
             for row in inserts:
                 group = groups[row[5]]
                 group["rows"] += 1
@@ -601,6 +669,13 @@ def build_features(database: Path, report=None) -> dict:
         return {"rows": rows_count, "races": races_count, "days": days_count,
                 "start_date": start, "end_date": finish, "groups": dict(groups),
                 "skipped_inactive_races": skipped, "feature_names": list(FEATURE_NAMES),
-                "categorical_features": list(CATEGORICAL_FEATURES)}
+                "categorical_features": list(CATEGORICAL_FEATURES),
+                "bias_configs": [dict(identifier=config.identifier, **config.as_dict()) for config in BIAS_CONFIGS],
+                "default_bias_config": dict(identifier=DEFAULT_BIAS_CONFIG.identifier, **DEFAULT_BIAS_CONFIG.as_dict()),
+                "races_with_intraday_bias": bias_races, "rows_with_intraday_bias": bias_rows,
+                "intraday_source_races": source_bias_races, "intraday_skipped_reasons": dict(bias_skips),
+                "intraday_availability_assumption": "Same venue/date/surface and a smaller verified race number; "
+                    "historical completion/publication timestamps are unavailable.",
+                "target_track_condition_used": False}
     finally:
         connection.close()
