@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
 import uuid
@@ -75,6 +76,11 @@ class Store:
                 row_index INTEGER NOT NULL, race_id TEXT, payload_json TEXT NOT NULL,
                 PRIMARY KEY(snapshot_id, row_index)
             );
+            CREATE TABLE IF NOT EXISTS pedigrees (
+                snapshot_id TEXT PRIMARY KEY REFERENCES observations(id),
+                horse_id TEXT NOT NULL, metadata_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pedigrees_identity ON pedigrees(horse_id);
             CREATE TABLE IF NOT EXISTS request_state (
                 host TEXT PRIMARY KEY, next_request REAL NOT NULL DEFAULT 0,
                 blocked_until REAL NOT NULL DEFAULT 0, reason TEXT
@@ -182,6 +188,40 @@ class Store:
                  for i, run in enumerate(runs)],
             )
 
+    def save_pedigree(self, observation: Observation, parsed: dict) -> None:
+        """Keep the complete path-labelled tree with its original observation."""
+        from .urls import horse_id
+        identifier = horse_id(parsed.get("horse_id", ""))
+        if observation.status != 200 or observation.url != f"https://db.netkeiba.com/horse/ped/{identifier}/":
+            raise StorageError("血統原本のURL・馬ID・HTTP状態が一致しません。")
+        ancestors = parsed.get("ancestors")
+        if not isinstance(ancestors, list) or len(ancestors) != 62:
+            raise StorageError("5代血統の62枠を確認できません。")
+        paths = set()
+        for ancestor in ancestors:
+            if not isinstance(ancestor, dict):
+                raise StorageError("血統の祖先情報が不正です。")
+            path = ancestor.get("path")
+            if (not isinstance(path, str) or not re.fullmatch(r"[SD]{1,5}", path)
+                    or path in paths or ancestor.get("generation") != len(path)):
+                raise StorageError("血統の世代・父母の経路が重複または不正です。")
+            paths.add(path)
+            ancestor_id = ancestor.get("horse_id")
+            if ancestor_id is not None and (not isinstance(ancestor_id, str)
+                    or not re.fullmatch(r"[A-Za-z0-9]{10}", ancestor_id)):
+                raise StorageError("血統の祖先IDが不正です。")
+        known = sum(bool(ancestor.get("name") or ancestor.get("horse_id")) for ancestor in ancestors)
+        if not known:
+            raise StorageError("既知の祖先が0件のため血統を保存しません。")
+        metadata = dict(parsed, known_ancestor_count=known,
+                        identified_ancestor_count=sum(ancestor.get("horse_id") is not None for ancestor in ancestors))
+        with self.db:
+            self.db.execute(
+                "INSERT INTO pedigrees VALUES (?,?,?) ON CONFLICT(snapshot_id) "
+                "DO UPDATE SET metadata_json=excluded.metadata_json",
+                (observation.id, identifier, json.dumps(metadata, ensure_ascii=False)),
+            )
+
     def _export_query(self, *, dataset: str, page: str | None = None,
                       region: str | None = None, all_snapshots: bool = False,
                       start_date: str | None = None,
@@ -196,6 +236,21 @@ class Store:
                     raise StorageError("出力期間は YYYY-MM-DD の日付で指定してください。")
         if start_date is not None and end_date is not None and start_date > end_date:
             raise StorageError("出力期間の開始日は終了日以前にしてください。")
+        if dataset == "pedigrees":
+            if page or region or start_date or end_date:
+                raise StorageError("血統は馬単位のため --page/--region/期間フィルターはありません。")
+            selected_where = "" if all_snapshots else "WHERE p.rank=1"
+            return f"""
+                WITH selected AS (
+                    SELECT p.*,o.retrieved_at,o.url,
+                        ROW_NUMBER() OVER (PARTITION BY p.horse_id
+                            ORDER BY o.retrieved_at DESC,o.rowid DESC) AS rank
+                    FROM pedigrees p JOIN observations o ON o.id=p.snapshot_id
+                )
+                SELECT p.snapshot_id,p.metadata_json,p.retrieved_at,p.url,'{{}}' AS payload_json
+                FROM selected p {selected_where}
+                ORDER BY p.retrieved_at,p.snapshot_id
+            """, []
         if dataset == "runners":
             partition, table, children = "p.region,p.race_id,p.page", "races", "runners"
             date_expression = "json_extract(p.metadata_json, '$.race_date')"

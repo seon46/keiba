@@ -179,6 +179,7 @@ IDは文字列、欠損は `null`（CSVでは空欄）です。取消等は順�
 - `data/raw/`: HTML原本を `.html.gz` で保存。SHA-256は展開前の圧縮データではなく、取得した元bytesで計算・照合します。既存の `.html` 原本も引き続き読めます。
 - `data/keiba.sqlite3`: 原文URL、実際の取得時刻、文字コード、チェックサム、解析結果、収集キュー。
 - `observations`: 取得履歴。`races` / `runners`: レース・出走馬。`horses` / `horse_runs`: 別途取得した馬の戦績。
+- `pedigrees`: 馬ごとの5代血統。原本の観測ID・取得時刻と、父系・母系の経路ごとの祖先を保持。
 - `collection_jobs` / `collection_tasks` / `collection_races`: 期間、進捗、失敗原因、発見したレースと期待頭数。
 
 データは `.gitignore` でGitの対象外です。バックアップする場合は収集を停止して `data/` 全体をコピーしてください。DBだけではHTML原本が含まれません。動作中のDBファイルだけを単純コピーせず、SQLiteのbackup API等を使ってください。
@@ -216,6 +217,56 @@ IDは文字列、欠損は `null`（CSVでは空欄）です。取消等は順�
 結果の着順・時計・確定オッズを、そのレースの予想入力に使わないでください。過去戦績は予想対象より前の出走に絞って特徴量にし、学習・評価も時系列で分割します。予想時刻の出馬表・オッズは、その時点で `--refresh fetch` して観測を蓄積してください。
 
 収集するのは公開のレース・出走データセットです。調教、会員向け指数、払戻金の構造化、ログインは未実装です。以下の初版モデルは公開の出走データを使います。
+
+## 保存済みレースに登場する馬の5代血統を取得する
+
+`pedigree` は、公開血統ページから父・母・母父と5代分の祖先62枠を取得します。血統の取得・保存専用で、予測モデルの入力や学習方法は変更しません。追加ライブラリの導入は不要です。
+
+既存の5年間の収集ジョブ `64bca8f8ad301623` を指定すると、そのジョブに属する保存済みレース結果から馬IDを重複除去して対象を決めます。中央・地方をまとめて扱い、同じ馬をレースごとに取得しません。結果の取消・除外欄に掲載されている馬も対象です。祖先の情報は同じ1ページ内から読み、祖先ページを再帰的に収集しません。元のレース収集ジョブは保持して、`ped-` から始まる別の血統ジョブを作ります。
+
+PowerShellでコードを更新し、対象頭数と予定だけ確認します。この段階ではサイトへアクセスしません。
+
+```powershell
+& {
+    $ErrorActionPreference = "Stop"
+    Set-Location -LiteralPath (Join-Path $env:USERPROFILE "keiba")
+    git pull --ff-only
+    if ($LASTEXITCODE -ne 0) { throw "Code update failed." }
+    .\.venv\Scripts\python.exe -X utf8 -m keiba_scraper pedigree --from-job-id 64bca8f8ad301623 --plan-only
+    if ($LASTEXITCODE -ne 0) { throw "Pedigree planning failed." }
+}
+```
+
+表示の `total_horses` が対象頭数、`completed_horses` が取得済み、`remaining_horses` が残りです。取得を開始するコマンドは次です。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper pedigree --from-job-id 64bca8f8ad301623
+```
+
+レース結果を追加していなければ、**中断後もこの同じコマンドで残りから再開できます**。完了済みタスクは再取得しません。既存キャッシュがあれば原本を再利用します。Ctrl+Cでは進捗を保存し、PCの再起動などによる強制終了後は、処理中だった1件の貸出期限が切れるまで通常最大15分待ってから復帰します。取得中はPowerShellを開き、PCをスリープさせないでください。初回は1万頭につき既定10秒の間隔だけで約28時間かかり、通信・再試行の時間も加わります。
+
+今回だけ10頭まで、または2時間まで実行する場合は、それぞれ `--max-tasks 10` / `--max-hours 2` を付けます。特定の1頭なら `pedigree --horse-id 2019102383` を使えます。`--horse-id` は複数回指定できます。
+
+進捗を別のPowerShellから確認する場合は、全ジョブを表示する次のコマンドを使います。血統ジョブは `config.type="pedigree"` と `ped-` で始まる `job_id` で識別できます。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper status
+```
+
+対象一覧は計画時点で固定します。後からレース結果が増えると、同じ `--from-job-id` で新しく計画した際は対象の異なる別の血統ジョブになり、保存済みHTMLは共有します。元の対象一覧を厳密に再開する場合は、血統側のIDを使う `pedigree --resume ped-...` を指定してください。レース側のIDを `--resume` に使うことはできません。
+
+403/429・robots拒否では収集全体を停止し、進捗に `blocked` を残します。タイムアウト・5xx等は既存の制限付き再試行を使います。血統表がない、別馬のページ、壊れた表などは失敗として保持します。失敗は `diagnose --job-id ped-... --output data\pedigree_report.json` で確認でき、原因解消後は `retry --job-id ped-... --kind pedigree` で待機へ戻せます。保存済みページ自体がエラーの場合は `--refresh retry` で再取得を予約します。ここでの `ped-...` は表示された血統ジョブIDへ置き換えます。
+
+保存先は既存の `data\keiba.sqlite3` の `pedigrees` テーブルと、`data\raw\` のHTML原本です。祖先名が不明な枠はnull、名前だけ判明してIDがない祖先は名前を保存します。世代を推測して埋めず、同じ祖先が父系・母系の複数箇所に現れる場合も経路ごとに残します。**血統ジョブの `complete=true` は全対象ページの保存完了を示し、62枠すべて判明したこととは別です。** 不明な祖先名がある頭数は `partial_pedigrees`、各馬の不明箇所は `missing_paths` / `missing_id_paths` に記録します。
+
+取得済み分をCSVまたはJSONLへ出力できます。出力だけなら通信しません。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper export --dataset pedigrees --output data\pedigrees.csv
+.\.venv\Scripts\python.exe -X utf8 -m keiba_scraper export --dataset pedigrees --format jsonl --output data\pedigrees.jsonl
+```
+
+出力は1頭1行で、`horse_id`、馬名、`sire_id/name`、`dam_id/name`、`damsire_id/name`、既知祖先数、原本のURL・snapshot_id・取得時刻などを含みます。`ancestors` に62枠の祖先をJSONで保持し、`path` のSが父、Dが母、DSが母父、SSが父父です。各祖先には名前・ID・参照URL・明示生年・原文を保存します。既存の出力を置き換える場合だけ `--overwrite` を追加してください。血統は馬単位なのでレースの日付・地域・ページによる出力フィルターはありません。
 
 ## 3着以内の確率を学習する
 

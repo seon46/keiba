@@ -129,6 +129,67 @@ class JobQueue:
             )
         return job_id
 
+    def plan_pedigree(self, *, horse_ids=None, from_job_id: str | None = None) -> str:
+        """Freeze one task per observed horse without fetching ancestor pages.
+
+        The target digest is part of the immutable scope. If later race
+        collection adds horses, planning again makes a separate job; resuming
+        an existing job always retains its original list.
+        """
+        if (horse_ids is None) == (from_job_id is None):
+            raise ValueError("血統の対象は --horse-id または --from-job-id の一方で指定してください。")
+        source = self.config(from_job_id) if from_job_id is not None else None
+        if source is not None and source.get("type") == "pedigree":
+            raise ValueError("--from-job-id にはレース収集ジョブを指定してください。")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if source is None:
+                targets = sorted({urls.horse_id(value) for value in horse_ids})
+                # Existing columns are NOT NULL; explicit horse selection has
+                # no race-date scope, represented only in the config below.
+                start = end = "0001-01-01"
+            else:
+                start, end = source["start_date"], source["end_date"]
+                rows = self.db.execute("""
+                    WITH latest AS (
+                        SELECT r.snapshot_id,r.metadata_json,cr.day,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY r.region,r.race_id
+                                   ORDER BY o.retrieved_at DESC,o.rowid DESC
+                               ) AS ordinal
+                        FROM races r
+                        JOIN observations o ON o.id=r.snapshot_id
+                        JOIN collection_races cr ON cr.region=r.region AND cr.race_id=r.race_id
+                        WHERE cr.job_id=? AND r.page='results' AND o.status=200
+                    )
+                    SELECT DISTINCT n.horse_id FROM latest r
+                    JOIN runners n ON n.snapshot_id=r.snapshot_id
+                    WHERE r.ordinal=1 AND json_extract(r.metadata_json,'$.race_date')=r.day
+                          AND r.day BETWEEN ? AND ? AND n.horse_id IS NOT NULL
+                    ORDER BY n.horse_id
+                """, (from_job_id, start, end))
+                targets = [urls.horse_id(row[0]) for row in rows]
+            if not targets:
+                raise ValueError("血統を取得する馬がありません。保存済みのレース結果とジョブを確認してください。")
+            target_digest = hashlib.sha256("\n".join(targets).encode()).hexdigest()
+            config = dict(version=1, type="pedigree", source_job_id=from_job_id,
+                          horse_count=len(targets), target_sha256=target_digest,
+                          generations=5, start_date=start if source is not None else None,
+                          end_date=end if source is not None else None)
+            encoded = json.dumps(config, sort_keys=True, separators=(",", ":"))
+            job_id = "ped-" + hashlib.sha256(encoded.encode()).hexdigest()[:16]
+            now = datetime.now(timezone.utc).isoformat()
+            self.db.execute("INSERT OR IGNORE INTO collection_jobs VALUES (?,?,?,?,?,?,?)",
+                            (job_id, now, now, start, end, encoded, "planned"))
+            self.db.executemany(
+                "INSERT OR IGNORE INTO collection_tasks(job_id,kind,task_key,horse_id) "
+                "VALUES (?,'pedigree',?,?)", ((job_id, target, target) for target in targets))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return job_id
+
     def config(self, job_id: str) -> dict:
         row = self.db.execute("SELECT config_json FROM collection_jobs WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
@@ -215,6 +276,18 @@ class JobQueue:
             self._owned(task)
             self._finish(task, "done", snapshot_id=observation.id, items=len(parsed["runs"]))
 
+    def complete_pedigree(self, task: Task, observation, parsed: dict) -> None:
+        if task.kind != "pedigree" or parsed.get("horse_id") != task.horse_id:
+            raise ValueError("解析した血統の馬IDが収集予定と一致しません。")
+        known = sum(bool(ancestor.get("name") or ancestor.get("horse_id"))
+                    for ancestor in parsed["ancestors"])
+        identified = sum(ancestor.get("horse_id") is not None for ancestor in parsed["ancestors"])
+        with self.db:
+            self._owned(task)
+            self._finish(task, "done", snapshot_id=observation.id, items=known,
+                         result={"known_ancestor_count": known, "identified_ancestor_count": identified,
+                                 "missing_path_count": len(parsed.get("missing_paths", ()))})
+
     def _finish(self, task: Task, state: str, *, snapshot_id=None, items=0, result=None,
                 error: Exception | None = None, available_at: float = 0) -> None:
         self._owned(task)
@@ -296,6 +369,9 @@ class JobQueue:
                 url = urls.race_url(row["race_id"], row["region"], row["page"])
             elif row["kind"] == "horse":
                 url = urls.horse_url(row["horse_id"])
+            elif row["kind"] == "pedigree":
+                from .pedigree import pedigree_url
+                url = pedigree_url(row["horse_id"])
             else:
                 url = None
             observation = self.store.cached(url) if url else None
@@ -339,6 +415,24 @@ class JobQueue:
         for row in self.db.execute(
                 "SELECT kind,state,COUNT(*) AS count FROM collection_tasks WHERE job_id=? GROUP BY kind,state", (job_id,)):
             counts.setdefault(row["kind"], {})[row["state"]] = row["count"]
+        if config.get("type") == "pedigree":
+            states = counts.get("pedigree", {})
+            done = states.get("done", 0)
+            total = config["horse_count"]
+            complete = (done == total and sum(states.values()) == total and
+                        all(kind == "pedigree" for kind in counts))
+            problems = [dict(row) for row in self.db.execute(
+                "SELECT id,kind,horse_id,state,last_error,error_type,attempts "
+                "FROM collection_tasks WHERE job_id=? AND state IN ('failed','blocked') "
+                "ORDER BY id LIMIT 20", (job_id,))]
+            state = self.db.execute("SELECT state FROM collection_jobs WHERE job_id=?", (job_id,)).fetchone()[0]
+            quality = self.db.execute(
+                "SELECT COALESCE(SUM(items),0),COALESCE(SUM(CASE WHEN "
+                "json_extract(result_json,'$.missing_path_count')>0 THEN 1 ELSE 0 END),0) "
+                "FROM collection_tasks WHERE job_id=? AND kind='pedigree' AND state='done'", (job_id,)).fetchone()
+            return dict(job_id=job_id, state=state, complete=complete, config=config, tasks=counts,
+                        total_horses=total, completed_horses=done, remaining_horses=max(0,total-done),
+                        known_ancestor_cells=quality[0], partial_pedigrees=quality[1], problems=problems)
         expected_days = (date.fromisoformat(config["end_date"]) - date.fromisoformat(config["start_date"])).days + 1
         expected_days *= len(config["regions"])
         outstanding = sum(n for states in counts.values() for state, n in states.items() if state != "done")
@@ -438,6 +532,16 @@ class Worker:
             self.store.save_horse(observation, parsed)
             self.queue.complete_horse(task, observation, parsed)
             items = len(parsed["runs"])
+        elif task.kind == "pedigree":
+            from .pedigree import parse_pedigree, pedigree_url
+            observation, html, cached = self.load(pedigree_url(task.horse_id), task.force_refresh)
+            parsed = parse_pedigree(html, horse_id=task.horse_id)
+            if parsed.get("horse_id") != task.horse_id:
+                raise ValueError("解析した血統の馬IDが収集予定と一致しません。")
+            self.store.save_pedigree(observation, parsed)
+            self.queue.complete_pedigree(task, observation, parsed)
+            items = sum(bool(ancestor.get("name") or ancestor.get("horse_id"))
+                        for ancestor in parsed["ancestors"])
         else:
             raise ValueError(f"不明なタスク: {task.kind}")
         incomplete = task.kind == "day" and discovered.get("complete") is False

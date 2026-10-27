@@ -63,6 +63,16 @@ def parser() -> argparse.ArgumentParser:
     horse = commands.add_parser('horse', help='指定した馬の過去戦績を取得')
     horse.add_argument('--horse-id', action='append', required=True,
                        type=lambda v: identifier(v, urls.horse_id), help='馬ID。複数回指定可')
+    pedigree = commands.add_parser('pedigree', help='指定馬・収集済みレースの馬の5代血統を取得（同条件で再開）')
+    pedigree_source = pedigree.add_mutually_exclusive_group(required=True)
+    pedigree_source.add_argument('--horse-id', action='append', type=lambda v: identifier(v, urls.horse_id),
+                                 help='対象の馬ID。複数回指定可')
+    pedigree_source.add_argument('--from-job-id', help='取得済み結果に含まれる馬を抽出する収集ジョブID')
+    pedigree_source.add_argument('--resume', metavar='JOB_ID', help='保存済み血統ジョブを再開')
+    pedigree.add_argument('--plan-only', action='store_true', help='対象馬と収集予定を保存し、通信しない')
+    pedigree.add_argument('--max-tasks', type=nonnegative, default=0, help='今回取得する頭数の上限（0: 制限なし）')
+    pedigree.add_argument('--max-hours', type=positive, help='今回の実行時間の上限')
+    pedigree.add_argument('--min-free-mb', type=nonnegative, default=1024, help='空き容量の下限MB')
     listing = commands.add_parser('list', help='指定日のレースIDを表示')
     listing.add_argument('--date', required=True, type=iso_date)
     listing.add_argument('--region', choices=('central', 'local'), required=True)
@@ -87,13 +97,13 @@ def parser() -> argparse.ArgumentParser:
     retry = commands.add_parser('retry', help='失敗・取得制限のタスクを再実行待ちに戻す（通信なし）')
     retry.add_argument('--job-id', required=True)
     retry.add_argument('--error-type', action='append', help='指定した例外種別だけ戻す（複数指定可）')
-    retry.add_argument('--kind', choices=('day', 'race', 'horse'))
+    retry.add_argument('--kind', choices=('day', 'race', 'horse', 'pedigree'))
     reparse = commands.add_parser('reparse', help='保存済みレース原本を再解析し、取り漏らしを補完（通信なし）')
     reparse.add_argument('--job-id', required=True)
     reparse.add_argument('--max-tasks', type=nonnegative, default=0)
     reparse.add_argument('--min-free-mb', type=nonnegative, default=1024)
     export = commands.add_parser('export', help='保存済みデータをCSV/JSONLへ出力')
-    export.add_argument('--dataset', choices=('runners', 'horse-runs'), default='runners')
+    export.add_argument('--dataset', choices=('runners', 'horse-runs', 'pedigrees'), default='runners')
     export.add_argument('--page', choices=('entries', 'results'))
     export.add_argument('--region', choices=('central', 'local'))
     export.add_argument('--start-date', type=iso_date)
@@ -195,6 +205,9 @@ def main(argv: list[str] | None = None) -> int:
         app.error('--offline と --refresh は同時に指定できません。')
     if args.command == 'export' and args.dataset == 'horse-runs' and (args.page or args.region):
         app.error('horse-runs には --page/--region フィルターはありません。')
+    if args.command == 'export' and args.dataset == 'pedigrees' and (
+            args.page or args.region or args.start_date or args.end_date):
+        app.error('pedigrees には --page/--region/期間フィルターはありません。')
     if args.command == 'reparse' and args.refresh:
         app.error('reparse は保存済み原本のみを使います。--refresh は指定できません。')
     if args.command == 'backfill' and args.resume:
@@ -212,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             count = export_data(store, args)
             report(output=str(args.output), rows=count, dataset=args.dataset)
             return 0
-        if args.command in ('backfill', 'status', 'retry', 'diagnose', 'reparse'):
+        if args.command in ('backfill', 'pedigree', 'status', 'retry', 'diagnose', 'reparse'):
             queue = JobQueue(store)
             if args.command == 'status':
                 for summary in queue.summaries(args.job_id):
@@ -234,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
                     report(**diagnosis)
                 return 0
             if args.command == 'reparse':
+                if queue.config(args.job_id).get('type') == 'pedigree':
+                    raise ValueError('reparseはレース原本専用です。血統ジョブには指定できません。')
                 from .maintenance import Reparser
                 summary = Reparser(queue, report=report).run(args.job_id, max_tasks=args.max_tasks,
                                                             min_free_mb=args.min_free_mb)
@@ -245,7 +260,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.resume:
                 job_id = args.resume
-                queue.config(job_id)
+                config = queue.config(job_id)
+                if (config.get('type') == 'pedigree') != (args.command == 'pedigree'):
+                    raise ValueError('レース収集はbackfill、血統収集はpedigreeで再開してください。')
+            elif args.command == 'pedigree':
+                job_id = queue.plan_pedigree(horse_ids=args.horse_id, from_job_id=args.from_job_id)
             else:
                 start, end = historical_window(args.years, start=args.start_date, end=args.end_date)
                 regions = ('central', 'local') if args.region == 'both' else (args.region,)
