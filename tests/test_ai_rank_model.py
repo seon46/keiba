@@ -23,14 +23,20 @@ class RankModelTests(unittest.TestCase):
             with (root/'source.csv').open(encoding='utf-8',newline='') as file:
                 reader=csv.DictReader(file);fields=reader.fieldnames;rows=list(reader)
             for row in rows:
+                row.update(weight_kg=str(480+int(row['horse_number'])),weight_change_kg='-2',
+                           race_weather='晴',race_track_condition='良',race_name='3歳1勝クラス',
+                           race_conditions_raw='サラ系3歳 1勝クラス 馬齢 10頭 本賞金:1000,400,250万円')
                 if row['horse_number']=='10':
                     row.update(finish_status='did_not_finish',finish_position='',time_seconds='',last_3f_seconds='')
+            fields+=['weight_kg','weight_change_kg','race_weather','race_track_condition','race_name','race_conditions_raw']
             with (root/'source.csv').open('w',encoding='utf-8',newline='') as file:
                 writer=csv.DictWriter(file,fieldnames=fields);writer.writeheader();writer.writerows(rows)
             database=prepare(root/'source.csv',root/'prepared')
-            report=train_rank(database,root/'models',threads=1,iterations=3,feature_set='enhanced',
+            report=train_rank(database,root/'models',threads=1,iterations=3,feature_set='context',
                               validation_samples=16,evaluation_samples=32)
             bundle=joblib.load(root/'models/central_flat.joblib')
+            self.assertEqual(bundle['feature_set'],'context')
+            self.assertEqual(bundle['rank_estimator'].n_features_in_,96)
             self.assertIsNotNone(bundle['finish_estimator'])
             self.assertEqual(report['groups']['central_flat']['test']['nonfinished_rows'],20)
             fixture_csv(root/'entries.csv',years=(2027,),days=1,page='entries')

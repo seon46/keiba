@@ -1,8 +1,8 @@
-"""Offline CSV preparation, top-three training, and entries prediction."""
+"""Offline CSV preparation, probability training, and entries prediction."""
 from __future__ import annotations
 
 import argparse
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import csv
 from datetime import date
 import hashlib
@@ -38,14 +38,18 @@ def fresh_directory(destination):
             shutil.rmtree(temporary)
 
 
-def prepare(source, output):
+def prepare(source, output, *, race_db=None):
     from .dataset import ingest_csv
     from .features import build_features, FEATURE_NAMES
     source = Path(source).resolve()
     original = source.stat()
     with fresh_directory(output) as temporary:
         database = temporary / 'features.sqlite3'
-        quality = ingest_csv(source, database, report=emit)
+        from .metadata import RaceMetadata
+        with RaceMetadata(race_db) if race_db is not None else nullcontext(None) as enrichment:
+            quality = ingest_csv(source, database, report=emit,enrich_race=enrichment)
+            if enrichment is not None:
+                quality['metadata_enrichment']=enrichment.summary()
         quality['database'] = str(Path(output).resolve() / 'features.sqlite3')
         emit(event='quality_checked', report=quality)
         built = build_features(database, report=emit)
@@ -196,6 +200,7 @@ def main(argv=None):
         command = commands.add_parser(name)
         command.add_argument('--input',required=True,type=Path)
         command.add_argument('--output-dir',required=True,type=Path)
+        command.add_argument('--race-db',type=Path,help='保存済みHTMLのクラス条件を補完する収集DB（通信なし）')
     training = commands.add_parser('train')
     training.add_argument('--dataset',required=True,type=Path)
     training.add_argument('--output-dir',required=True,type=Path)
@@ -204,8 +209,8 @@ def main(argv=None):
         command.add_argument('--test-start',default='2026-01-01')
         command.add_argument('--threads',type=int,default=4)
         command.add_argument('--iterations',type=int,default=150)
-        command.add_argument('--feature-set', choices=('auto','baseline','form','enhanced'), default='auto',
-                             help='検証期間で従来特徴と拡張特徴を比較（既定: auto）')
+        command.add_argument('--feature-set', choices=('auto','baseline','form','enhanced','context'), default='auto',
+                             help='特徴量の指定。contextは保存済み条件を含む96項目（既定: auto）')
         command.add_argument('--target',choices=('top3','rank'),default='top3',help='予測する対象（rank: 全順位と未完走）')
         command.add_argument('--validation-samples',type=int,default=128)
         command.add_argument('--evaluation-samples',type=int,default=1024)
@@ -218,10 +223,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == 'prepare':
-            prepare(args.input,args.output_dir)
+            prepare(args.input,args.output_dir,race_db=args.race_db)
         elif args.command in ('fit','train'):
             libraries()  # Report missing dependencies before scanning a large CSV.
-            database = prepare(args.input,args.output_dir) if args.command == 'fit' else args.dataset
+            database = prepare(args.input,args.output_dir,race_db=args.race_db) if args.command == 'fit' else args.dataset
             destination = args.output_dir/'models' if args.command == 'fit' else args.output_dir
             with fresh_directory(destination) as temporary:
                 if args.target=='rank':

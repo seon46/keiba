@@ -124,7 +124,7 @@ def train_rank(database: Path, output: Path, *, validation_start='2025-01-01',te
     profiles = feature_sets()
     if feature_set not in ('auto',*profiles):
         raise ValueError('未対応のfeature_setです。')
-    requested = ['form','enhanced'] if feature_set=='auto' else [feature_set]
+    requested = ['enhanced','context'] if feature_set=='auto' else [feature_set]
     report = report or (lambda **message:None)
     connection = readonly(database)
     try:

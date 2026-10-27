@@ -25,17 +25,19 @@ def readonly(database):
 
 
 def feature_revision():
-    from . import dataset, features
+    from . import dataset, features, metadata
+    from keiba_scraper import conditions
     digest = hashlib.sha256()
-    for module in (dataset, features):
+    for module in (dataset, features, conditions, metadata):
         digest.update(module.__name__.encode() + b'\0')
         digest.update(Path(module.__file__).read_bytes().replace(b'\r\n',b'\n'))
     return digest.hexdigest()
 
 
 def feature_sets():
-    from .features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, FEATURE_NAMES
-    return {'baseline': list(BASE_FEATURE_NAMES), 'form': list(FORM_FEATURE_NAMES), 'enhanced': list(FEATURE_NAMES)}
+    from .features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, RANK_FEATURE_NAMES, FEATURE_NAMES
+    return {'baseline': list(BASE_FEATURE_NAMES), 'form': list(FORM_FEATURE_NAMES),
+            'enhanced': list(RANK_FEATURE_NAMES),'context':list(FEATURE_NAMES)}
 
 
 def select_feature_columns(bundle):
@@ -128,7 +130,7 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
         raise ValueError('threadsとiterationsは1以上にしてください。')
     profiles = feature_sets()
     if feature_set not in ('auto', *profiles):
-        raise ValueError('feature_setはauto/baseline/form/enhancedで指定してください。')
+        raise ValueError('feature_setはauto/baseline/form/enhanced/contextで指定してください。')
     requested = list(profiles) if feature_set == 'auto' else [feature_set]
     report = report or (lambda **message: None)
     connection = readonly(database)

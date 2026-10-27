@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .cancellations import cancellation_evidence
+from .conditions import parse_conditions
 
 
 class ParseError(ValueError):
@@ -389,7 +390,8 @@ def _check_race_identity(soup: BeautifulSoup, race_id: str) -> bool:
 def _race_metadata(soup: BeautifulSoup, race_id: str, region: str, page: str) -> dict:
     title = _text(soup.title)
     result = {"race_id": race_id, "region": region, "page": page, "title": title}
-    name = _text(soup.select_one(".RaceName"))
+    name_tag = soup.select_one(".RaceName")
+    name = _text(name_tag)
     if name:
         result["race_name"] = name
     # A race name can itself contain a valid or invalid date. Only the final
@@ -424,6 +426,12 @@ def _race_metadata(soup: BeautifulSoup, race_id: str, region: str, page: str) ->
         if moisture:
             result["track_moisture"] = float(moisture[1])
     additional = _text(soup.select_one(".RaceData02"))
+    grade_tokens = []
+    for badge in name_tag.select('.Icon_GradeType') if name_tag is not None else ():
+        grade_tokens.extend(badge.get('class', []))
+        grade_tokens.append(_text(badge))
+    result.update(parse_conditions(name=name, title=title, conditions=additional,
+                                   region=region, grade_tokens=grade_tokens))
     count = re.search(r"(\d+)\s*頭", additional)
     if count:
         result["declared_field_size"] = int(count[1])

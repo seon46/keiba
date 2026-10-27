@@ -23,6 +23,14 @@ _NULLS = {"", "null", "none"}
 _NUMBER = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?")
 _HORSE = re.compile(r"(?:[0-9]{10}|B[0-9]{9})")
 _CORNER_FIELDS = {"corner_positions", "corner_sequence", "corner_labels"}
+_CONDITION_COLUMNS = {
+    "race_class": "race_class", "race_grade": "race_grade", "weight_rule": "race_weight_rule",
+    "age_min": "race_age_min", "age_max": "race_age_max", "first_prize_man": "race_first_prize_man",
+    "conditions_raw": "race_conditions_raw",
+}
+_OPTIONAL_RACE_FIELDS = tuple(_CONDITION_COLUMNS) + ("weather", "track_condition", "track_moisture")
+_WEATHER = {"晴", "曇", "雨", "小雨", "雪", "小雪", "霧"}
+_GOING = {"良", "稍重", "重", "不良"}
 
 
 class RowValidationError(ValueError):
@@ -92,6 +100,96 @@ def _identity(raw: Mapping) -> tuple[str, str]:
     if region not in ("central", "local") or not identifier or not re.fullmatch(r"[0-9]{12}", identifier):
         raise ValueError("Cannot identify a domestic race: require region=central/local and a 12-digit race_id")
     return region, identifier
+
+
+def _optional_number(value, name: str, warnings: list[str], *, integer=False, positive=False, nonnegative=False):
+    try:
+        number = _numeric(value, name, integer=integer, positive=positive)
+        if nonnegative and number is not None and Decimal(_text(value)) < 0:
+            raise RowValidationError(f"{name}: expected a nonnegative number")
+        return number
+    except RowValidationError as exc:
+        warnings.append(str(exc))
+        return None
+
+
+def _optional_choice(value, name: str, choices, warnings: list[str], *, aliases=None):
+    text = _text(value)
+    if text is not None:
+        text = (aliases or {}).get(text, text)
+        if text not in choices:
+            warnings.append(f"{name}: unsupported optional value {text!r}; value is unknown")
+            return None
+    return text
+
+
+def _conditions(raw: Mapping, region: str, warnings: list[str]) -> dict:
+    from keiba_scraper.conditions import (
+        RACE_CLASSES_BY_REGION, RACE_GRADES_BY_REGION, WEIGHT_RULES, parse_conditions,
+    )
+    tokens = raw.get("race_grade_tokens")
+    if _text(tokens) is None:
+        tokens = ()
+    elif isinstance(tokens, str):
+        try:
+            tokens = json.loads(tokens)
+        except (ValueError, RecursionError):
+            warnings.append("race_grade_tokens: expected a JSON list of grade tokens; tokens are unknown")
+            tokens = ()
+    if not isinstance(tokens, (list, tuple)) or any(not isinstance(token, str) for token in tokens):
+        warnings.append("race_grade_tokens: expected a list of grade tokens; tokens are unknown")
+        tokens = ()
+    parsed = parse_conditions(
+        name=_text(raw.get("race_name")) or "", title=_text(raw.get("race_title")) or "",
+        conditions=_text(raw.get("race_conditions_raw")) or _text(raw.get("conditions_raw")) or "",
+        region=region, grade_tokens=tokens,
+    )
+    choices = {"race_class": RACE_CLASSES_BY_REGION[region], "race_grade": RACE_GRADES_BY_REGION[region],
+               "weight_rule": WEIGHT_RULES}
+    original = raw.get("_metadata_original_values", {})
+    if not isinstance(original, Mapping):
+        original = {}
+    result = {}
+
+    def normalize_condition(key, value):
+        if key in choices:
+            return _optional_choice(value, key, choices[key], warnings)
+        if key in ("age_min", "age_max"):
+            value = _optional_number(value, key, warnings, integer=True, positive=True)
+            if value is not None and value > 30:
+                warnings.append(f"{key}: unsupported age limit above 30; value is unknown")
+                return None
+            return value
+        if key == "first_prize_man":
+            return _optional_number(value, key, warnings, nonnegative=True)
+        return _text(value)
+
+    for key, column in _CONDITION_COLUMNS.items():
+        values = []
+        for source in dict.fromkeys((column, key)):
+            if _text(raw.get(source)) is not None:
+                values.append(raw[source])
+        if column in original:
+            values.append(original[column])
+        if not values:
+            result[key] = normalize_condition(key, parsed.get(key))
+            continue
+        normalized = [normalize_condition(key, value) for value in values]
+        candidate = normalize_condition(key, parsed.get(key))
+        if key == "conditions_raw":
+            # Preserve the source wording; parse_conditions may normalize its spacing.
+            candidate = None
+        known = {value for value in (*normalized, candidate) if value is not None}
+        if len(known) > 1:
+            warnings.append(f"{key}: explicit, enriched, or parsed race metadata disagree; value is unknown")
+        result[key] = normalized[0] if None not in normalized and len(known) <= 1 else None
+    if result["age_min"] is not None and result["age_max"] is not None and result["age_min"] > result["age_max"]:
+        warnings.append("age_range: age_min exceeds age_max; age limits are unknown")
+        result["age_min"] = result["age_max"] = None
+    if result["race_grade"] is not None and result["race_class"] not in (None, "open"):
+        warnings.append("race_class_grade: a graded race conflicts with a non-open class; class and grade are unknown")
+        result["race_class"] = result["race_grade"] = None
+    return result
 
 
 def _corner_json(value, field: str):
@@ -264,6 +362,20 @@ def normalize_row(raw: Mapping, page: str = "results") -> dict:
         key: _numeric(raw.get(key), key, positive=True) if completed else None
         for key in ("time_seconds", "last_3f_seconds")
     }
+    corners = _corners(raw, completed=completed, region=region)
+    warnings = corners["optional_parse_warnings"]
+    conditions = _conditions(raw, region, warnings)
+    context = {
+        "weather": _optional_choice(raw.get("race_weather"), "weather", _WEATHER, warnings,
+                                     aliases={"晴れ": "晴", "曇り": "曇"}),
+        "track_condition": _optional_choice(raw.get("race_track_condition"), "track_condition", _GOING, warnings,
+                                             aliases={"稍": "稍重", "不": "不良"}),
+        "track_moisture": _optional_number(raw.get("race_track_moisture"), "track_moisture", warnings, nonnegative=True),
+        "weight_kg": _optional_number(raw.get("weight_kg"), "weight_kg", warnings, positive=True),
+        "weight_change_kg": _optional_number(raw.get("weight_change_kg"), "weight_change_kg", warnings),
+        "odds": _optional_number(raw.get("odds"), "odds", warnings, positive=True),
+        "popularity": _optional_number(raw.get("popularity"), "popularity", warnings, integer=True, positive=True),
+    }
     return {
         "race_id": identifier, "region": region, "day": day, "horse_id": horse_id,
         "horse_number": horse_number,
@@ -273,14 +385,11 @@ def normalize_row(raw: Mapping, page: str = "results") -> dict:
         **identifiers,
         "carried_weight_kg": _numeric(raw.get("carried_weight_kg"), "carried_weight_kg", positive=True),
         "finish_position": position, "finish_status": status, "course": course,
-        **times,
-        **_corners(raw, completed=completed, region=region),
+        **times, **corners, **context, **conditions,
         "surface": surface, "distance_m": distance,
         "declared_field_size": _numeric(raw.get("race_declared_field_size"), "race_declared_field_size",
                                          integer=True, positive=True),
         "group_name": group,
-        "odds": _numeric(raw.get("odds"), "odds", positive=True),
-        "popularity": _numeric(raw.get("popularity"), "popularity", integer=True, positive=True),
         "snapshot_id": _text(raw.get("snapshot_id")),
     }
 
@@ -298,6 +407,17 @@ def _sanitize_race_corners(rows: list[dict]) -> list[dict]:
                 f"corner_field_size: passage ranks {invalid} exceed the active race field size {active}; passage ranks are unknown")
             changed.append(row)
     return changed
+
+
+def _sanitize_optional_race_fields(rows: list[dict]) -> None:
+    """A conflicting optional race condition cannot become horse-specific."""
+    for field in _OPTIONAL_RACE_FIELDS:
+        known = {row[field] for row in rows if row[field] is not None}
+        if len(known) > 1:
+            for row in rows:
+                row[field] = None
+                row["optional_parse_warnings"].append(
+                    f"{field}: inconsistent optional values within race; value is unknown")
 
 
 def _race_problems(rows: list[dict]) -> list[str]:
@@ -319,11 +439,14 @@ def _race_problems(rows: list[dict]) -> list[str]:
     return reasons
 
 
-def ingest_csv(source: Path, database: Path, report=None) -> dict:
+def ingest_csv(source: Path, database: Path, report=None, *, enrich_race=None) -> dict:
     """Stream a results CSV into a new SQLite DB, quarantining invalid races.
 
     Duplicate runner keys and unidentifiable races abort the whole import.
     The caller owns publication of the completed staging database.
+    enrich_race receives a disposable row copy and may supply only the seven
+    race-condition metadata columns. It cannot change source identities or
+    mutate the CSV; conflicting nonempty values remain unknown with warnings.
     """
     source, database = Path(source).resolve(), Path(database).resolve()
     if source == database:
@@ -407,6 +530,14 @@ def ingest_csv(source: Path, database: Path, report=None) -> dict:
                 try:
                     if None in raw:
                         raise RowValidationError("CSV row has more cells than its header")
+                    if enrich_race is not None:
+                        addition = enrich_race(dict(raw))
+                        if not isinstance(addition, Mapping) or set(addition) - set(_CONDITION_COLUMNS.values()):
+                            raise ValueError("enrich_race must return only supported race-condition metadata fields")
+                        original = {key: raw[key] for key, value in addition.items()
+                                    if _text(value) is not None and _text(raw.get(key)) is not None}
+                        raw = {**raw, **{key: value for key, value in addition.items() if _text(value) is not None},
+                               "_metadata_original_values": original}
                     normalized = normalize_row(raw)
                 except RowValidationError as exc:
                     issues.append((region, identifier, str(exc)))
@@ -443,14 +574,20 @@ def ingest_csv(source: Path, database: Path, report=None) -> dict:
             if key is not None:
                 db.executemany("INSERT OR IGNORE INTO race_issues VALUES (?,?,?)",
                                ((key[0], key[1], reason) for reason in _race_problems(values)))
-                prior_missing = {
-                    row["horse_id"]: {field for field in _CORNER_FIELDS if not row[field]}
-                    for row in values
-                }
-                for changed in _sanitize_race_corners(values):
-                    for field in _CORNER_FIELDS - prior_missing[changed["horse_id"]]:
+                prior_missing = {row["horse_id"]: {field for field, value in row.items()
+                                                 if value is None or (field in _CORNER_FIELDS and not value)}
+                                 for row in values}
+                prior_warnings = {row["horse_id"]: len(row["optional_parse_warnings"]) for row in values}
+                _sanitize_race_corners(values)
+                _sanitize_optional_race_fields(values)
+                for changed in values:
+                    if len(changed["optional_parse_warnings"]) == prior_warnings[changed["horse_id"]]:
+                        continue
+                    new_missing = {field for field, value in changed.items()
+                                   if value is None or (field in _CORNER_FIELDS and not value)}
+                    for field in new_missing - prior_missing[changed["horse_id"]]:
                         missing[field] += 1
-                    record_optional_warnings(changed, changed["optional_parse_warnings"][-1:])
+                    record_optional_warnings(changed, changed["optional_parse_warnings"][prior_warnings[changed["horse_id"]]:])
                     db.execute("UPDATE input_rows SET payload_json=? WHERE region=? AND race_id=? AND horse_id=?",
                                (json.dumps(changed, ensure_ascii=False, allow_nan=False),
                                 changed["region"], changed["race_id"], changed["horse_id"]))

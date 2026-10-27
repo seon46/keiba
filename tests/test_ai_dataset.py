@@ -126,6 +126,133 @@ class DatasetTests(unittest.TestCase):
                 with_results = normalize_row(dict(source, time_seconds=time, last_3f_seconds=closing), page="entries")
                 self.assertEqual(with_results, baseline)
 
+    def test_optional_context_retains_source_values_and_canonical_categories(self):
+        result = normalize_row(row(race_weather="曇り", race_track_condition="稍", race_track_moisture="0",
+                                   weight_kg="480", weight_change_kg="-2"))
+        self.assertEqual((result["weather"], result["track_condition"]), ("曇", "稍重"))
+        self.assertEqual((result["track_moisture"], result["weight_kg"], result["weight_change_kg"]), (0.0, 480.0, -2.0))
+        self.assertTrue(all(isinstance(result[key], float) for key in ("track_moisture", "weight_kg", "weight_change_kg")))
+        self.assertIsNone(normalize_row(row())["weather"])
+        self.assertEqual(normalize_row(row(race_track_condition="不"))["track_condition"], "不良")
+        for status, page in (("did_not_finish", "results"), ("disqualified", "results"), ("", "entries")):
+            with self.subTest(status=status, page=page):
+                result = normalize_row(row(page=page, finish_status=status, finish_position="", race_weather="雨",
+                                           race_track_condition="重", weight_kg="480", weight_change_kg="0", odds="2.5"), page=page)
+                self.assertEqual((result["weather"], result["track_condition"], result["weight_kg"], result["odds"]),
+                                 ("雨", "重", 480.0, 2.5))
+                self.assertEqual(result["weight_change_kg"], 0.0)
+
+    def test_invalid_optional_context_and_market_values_warn_without_rejecting_the_race(self):
+        invalid = row(race_weather="天候不明", race_track_condition="unsupported", race_track_moisture="-0.1",
+                      weight_kg="NaN", weight_change_kg="Inf", odds="not published", popularity="1.5")
+        self.write([invalid, row(horse_id="2021100002", horse_number="2", finish_position="2",
+                                 race_weather="晴", race_track_condition="良", race_track_moisture="3.7")])
+        report = ingest_csv(self.csv, self.db)
+        self.assertEqual((report["usable_races"], report["usable_rows"]), (1, 2))
+        first = next(iter_races(self.db))[0]
+        for key in ("weather", "track_condition", "track_moisture", "weight_kg", "weight_change_kg", "odds", "popularity"):
+            self.assertIsNone(first[key])
+            self.assertEqual(report["missing_values"][key], 1 if key in ("weather", "track_condition", "track_moisture", "odds", "popularity") else 2)
+        self.assertEqual(report["rows_with_optional_parse_warnings"], 1)
+        self.assertEqual(len(first["optional_parse_warnings"]), 7)
+        for changes in ({"weight_kg": "0"}, {"race_track_moisture": "NaN"},
+                        {"race_track_moisture": "-0." + "0" * 400 + "1"}, {"odds": "0"}, {"popularity": "-1"}):
+            with self.subTest(changes=changes):
+                self.assertTrue(normalize_row(row(**changes))["optional_parse_warnings"])
+
+    def test_explicit_static_conditions_use_known_values_and_optional_numeric_types(self):
+        result = normalize_row(row(race_class="1win", race_weight_rule="馬齢", race_age_min="3", race_age_max="3",
+                                   race_first_prize_man="800"))
+        self.assertEqual((result["race_class"], result["weight_rule"]), ("1win", "馬齢"))
+        self.assertEqual((result["age_min"], result["age_max"], result["first_prize_man"]), (3, 3, 800.0))
+        self.assertFalse(result["optional_parse_warnings"])
+        local = normalize_row(row(region="local", race_class="B4", weight_rule="別定"))
+        self.assertEqual((local["race_class"], local["weight_rule"]), ("B4", "別定"))
+        self.assertEqual(normalize_row(row(region="local", race_grade="Jpn3"))["race_grade"], "Jpn3")
+        bad = normalize_row(row(race_class="A1", race_grade="Jpn3", race_weight_rule="自由", race_age_min="4",
+                                race_age_max="3", race_first_prize_man="NaN"))
+        self.assertTrue(all(bad[key] is None for key in ("race_class", "race_grade", "weight_rule", "age_min", "age_max", "first_prize_man")))
+        self.assertEqual(len(bad["optional_parse_warnings"]), 5)
+
+    def test_static_conditions_fall_back_to_csv_header_text_and_grade_tokens(self):
+        conditions = "サラ系3歳以上 オープン (国際)(指定) 別定 12頭 本賞金:5900,2400,1500,890,590万円"
+        result = normalize_row(row(race_name="テスト杯", race_title="テスト杯 | 2024年1月1日 東京1R",
+                                   race_conditions_raw=conditions, race_grade_tokens='["Icon_GradeType2"]'))
+        self.assertEqual((result["race_class"], result["race_grade"], result["weight_rule"]), ("open", "G2", "別定"))
+        self.assertEqual((result["age_min"], result["age_max"], result["first_prize_man"]), (3, None, 5900.0))
+        self.assertEqual(result["conditions_raw"], conditions)
+        self.assertFalse(result["optional_parse_warnings"])
+        title_only = normalize_row(row(race_title="3歳未勝利 結果・払戻 | 2024年1月1日 東京1R"))
+        self.assertEqual(title_only["race_class"], "maiden")
+        legacy = normalize_row(row())
+        self.assertTrue(all(legacy[key] is None for key in ("race_class", "race_grade", "weight_rule", "age_min",
+                                                           "age_max", "first_prize_man", "conditions_raw")))
+
+    def test_static_metadata_disagreement_and_bad_tokens_are_optional_unknowns(self):
+        result = normalize_row(row(race_name="3歳1勝クラス", race_class="2win", race_weight_rule="ハンデ",
+                                   race_age_min="3", race_conditions_raw="3歳以上 1勝クラス 別定"))
+        self.assertIsNone(result["race_class"])
+        self.assertIsNone(result["weight_rule"])
+        self.assertEqual(result["age_min"], 3)
+        self.assertEqual(len(result["optional_parse_warnings"]), 2)
+        conflict = normalize_row(row(race_class="1win", race_grade="G3"))
+        self.assertIsNone(conflict["race_class"])
+        self.assertIsNone(conflict["race_grade"])
+        self.assertTrue(any("race_class_grade:" in warning for warning in conflict["optional_parse_warnings"]))
+        invalid = normalize_row(row(race_grade_tokens="not JSON", race_age_min="31"))
+        self.assertIsNone(invalid["race_grade"])
+        self.assertIsNone(invalid["age_min"])
+        self.assertEqual(len(invalid["optional_parse_warnings"]), 2)
+
+    def test_inconsistent_optional_race_conditions_are_cleared_without_quarantine(self):
+        self.write([row(race_class="1win", race_weather="晴", race_first_prize_man="800"),
+                    row(horse_id="2021100002", horse_number="2", finish_position="2", race_class="2win",
+                        race_weather="雨", race_first_prize_man="1140")])
+        report = ingest_csv(self.csv, self.db)
+        self.assertEqual((report["usable_rows"], report["excluded_race_count"]), (2, 0))
+        for horse in next(iter_races(self.db)):
+            self.assertTrue(all(horse[key] is None for key in ("race_class", "weather", "first_prize_man")))
+            self.assertEqual(len(horse["optional_parse_warnings"]), 3)
+        self.assertEqual(report["rows_with_optional_parse_warnings"], 2)
+        for field in ("race_class", "weather", "first_prize_man"):
+            self.assertEqual(report["missing_values"][field], 2)
+            self.assertEqual(report["optional_parse_warning_counts"][field], 2)
+
+    def test_metadata_callback_fills_old_csv_without_mutating_source_or_identity(self):
+        self.write(self.pair())
+        digest = hashlib.sha256(self.csv.read_bytes()).hexdigest()
+        calls = []
+        def enrich(raw):
+            calls.append(raw["horse_id"])
+            raw["horse_id"] = "changed-only-in-disposable-copy"
+            return {"race_class": "1win", "race_weight_rule": "定量", "race_age_min": 3,
+                    "race_age_max": None, "race_first_prize_man": 800.0}
+        report = ingest_csv(self.csv, self.db, enrich_race=enrich)
+        self.assertEqual(calls, ["2021100001", "2021100002"])
+        self.assertEqual(report["usable_rows"], 2)
+        race = next(iter_races(self.db))
+        self.assertEqual((race[0]["race_class"], race[0]["weight_rule"], race[0]["age_min"]), ("1win", "定量", 3))
+        self.assertEqual([horse["horse_id"] for horse in race], calls)
+        self.assertEqual(hashlib.sha256(self.csv.read_bytes()).hexdigest(), digest)
+
+    def test_metadata_callback_conflict_is_unknown_and_none_does_not_erase_existing_values(self):
+        self.write(self.pair(race_class="1win", race_weight_rule="馬齢"))
+        report = ingest_csv(self.csv, self.db, enrich_race=lambda raw: {"race_class": "2win", "race_weight_rule": None})
+        self.assertEqual(report["usable_rows"], 2)
+        for horse in next(iter_races(self.db)):
+            self.assertIsNone(horse["race_class"])
+            self.assertEqual(horse["weight_rule"], "馬齢")
+            self.assertTrue(any("metadata disagree" in item for item in horse["optional_parse_warnings"]))
+
+    def test_metadata_callback_cannot_overwrite_ids_or_add_unexpected_columns(self):
+        self.write(self.pair())
+        for index, addition in enumerate(({"race_id": "202405010102"}, {"horse_id": "2021100002"},
+                                           {"race_course": "中山"}, None)):
+            target = self.directory / f"bad-enrichment-{index}.sqlite3"
+            with self.subTest(addition=addition), self.assertRaisesRegex(ValueError, "enrich_race"):
+                ingest_csv(self.csv, target, enrich_race=lambda raw: addition)
+            self.assertFalse(target.exists())
+
     def test_csv_times_roundtrip_and_missing_counts_include_legacy_and_dnf(self):
         first = row(time_seconds="145.0", last_3f_seconds="34.4", race_declared_field_size="3")
         legacy = row(horse_id="2021100002", horse_number="2", finish_position="2", race_declared_field_size="3")
@@ -274,7 +401,7 @@ class DatasetTests(unittest.TestCase):
         self.assertTrue(all(race[0]["optional_parse_warnings"] for race in iter_races(self.db)))
 
     def test_nonfinite_fractional_ranks_invalid_booleans_and_false_identity_are_rejected(self):
-        for changes in ({"odds": "NaN"}, {"carried_weight_kg": "inf"}, {"age": "-1"},
+        for changes in ({"carried_weight_kg": "inf"}, {"age": "-1"},
                         {"finish_position": "1.2"}, {"finish_position": ""},
                         {"race_id_verified": "False"}, {"race_id_verified": "truthy"},
                         {"race_number": "2"}, {"race_date": "2024-02-30"},

@@ -76,6 +76,29 @@ class RaceParserTests(unittest.TestCase):
         self.assertEqual((runner['odds'], runner['popularity']), (8.5, 3))
         self.assertNotIn('finish_position', runner)
 
+    def test_race_conditions_metadata_is_saved_without_affecting_runner_parsing(self):
+        html = document(table(ENTRY_HEADERS, [ENTRY_ROW])).replace(
+            'テスト賞 出馬表 |', 'テスト賞(G2) 出馬表 |').replace(
+                '4回 東京 4日目 2頭',
+                '4回 東京 4日目 サラ系３歳以上 オープン (国際) 別定 2頭 本賞金:5500,2200,1400,830,550万円')
+        result = parse_race(html, race_id=RACE_ID, region='central', page='entries')
+        race = result['race']
+        self.assertEqual((race['race_class'], race['race_grade'], race['weight_rule'], race['age_min']),
+                         ('open', 'G2', '別定', 3))
+        self.assertIsNone(race['age_max'])
+        self.assertEqual(race['first_prize_man'], 5500)
+        self.assertIn('サラ系３歳以上', race['conditions_raw'])
+        self.assertEqual(result['runners'][0]['horse_id'], '2021100001')
+        unknown = self.parse(table(ENTRY_HEADERS, [ENTRY_ROW]))['race']
+        self.assertIsNone(unknown['race_class'])
+        self.assertEqual(unknown['conditions_raw'], '4回 東京 4日目 2頭')
+
+    def test_other_race_grade_badge_does_not_contaminate_current_metadata(self):
+        body = table(ENTRY_HEADERS, [ENTRY_ROW])
+        body += '<aside class="RaceName">別レース<span class="Icon_GradeType Icon_GradeType1"></span></aside>'
+        race = self.parse(body)['race']
+        self.assertIsNone(race['race_grade'])
+
     def test_date_in_race_name_never_replaces_the_title_metadata(self):
         for name, metadata, expected in [
             ('2023年7月7日ゆりさん生誕記念', '2023年7月11日 金沢6R', ('2023-07-11', '金沢', 6)),

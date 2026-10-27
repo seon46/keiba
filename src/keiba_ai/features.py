@@ -41,7 +41,7 @@ FORM_FEATURE_NAMES = BASE_FEATURE_NAMES + (
     "horse_surface_distance_starts", "horse_surface_distance_top3_rate",
     "horse_course_surface_distance_starts", "horse_course_surface_distance_top3_rate",
 )
-FEATURE_NAMES = FORM_FEATURE_NAMES + (
+RANK_FEATURE_NAMES = FORM_FEATURE_NAMES + (
     "horse_group_recent5_first_corner_fraction", "horse_group_previous_first_corner_fraction",
     "horse_group_recent5_last_corner_fraction", "horse_group_previous_last_corner_fraction",
     "horse_group_recent5_observed_corner_gain", "horse_group_previous_observed_corner_gain",
@@ -50,7 +50,27 @@ FEATURE_NAMES = FORM_FEATURE_NAMES + (
     "horse_group_recent5_corner_leading_rate", "horse_group_recent5_corner_front_rate",
     "horse_group_recent5_corner_starts", "opponents_recent5_corner_front_rate",
 )
-CATEGORICAL_FEATURES = ("course_code", "surface_code", "sex_code")
+FEATURE_NAMES = RANK_FEATURE_NAMES + (
+    "race_class_code", "race_grade_code", "race_weight_rule_code",
+    "race_age_min", "race_age_max", "race_first_prize_man",
+    "horse_group_previous_class_code", "horse_group_previous_grade_code",
+    "horse_group_previous_same_class", "horse_group_previous_same_grade",
+    "horse_group_previous_bodyweight_kg", "horse_group_recent5_bodyweight_kg",
+    "horse_group_previous_bodyweight_change_kg", "horse_group_recent5_absolute_weight_change_kg",
+    "horse_group_previous_log_odds", "horse_group_recent5_log_odds",
+    "horse_group_previous_popularity_fraction", "horse_group_recent5_popularity_fraction",
+    "horse_group_previous_market_rank_gain", "horse_group_recent5_market_rank_gain",
+    "horse_group_previous_weather_code", "horse_group_previous_going_code",
+    "horse_group_previous_track_moisture", "horse_group_recent5_track_moisture",
+    "horse_group_wet_starts", "horse_group_wet_top3_rate",
+    "horse_group_dryish_starts", "horse_group_dryish_top3_rate",
+    "horse_group_recent5_bodyweight_starts", "horse_group_recent5_odds_starts",
+)
+CATEGORICAL_FEATURES = (
+    "course_code", "surface_code", "sex_code", "race_class_code", "race_grade_code", "race_weight_rule_code",
+    "horse_group_previous_class_code", "horse_group_previous_grade_code",
+    "horse_group_previous_weather_code", "horse_group_previous_going_code",
+)
 
 # Fixed vocabulary, not fitted to the complete dataset or to future categories.
 _COURSES = {
@@ -62,6 +82,16 @@ _COURSES = {
 }
 _SEX = {"牡": 0, "牝": 1, "セ": 2, "騸": 2}
 _SURFACES = {"芝": 0, "ダ": 1, "ダート": 1, "障": 2, "障芝": 2, "障ダ": 2, "直": 3}
+_CLASSES = {name: index for index, name in enumerate((
+    "newcomer", "maiden", "1win", "2win", "3win", "open",
+    "A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3", "A4", "B4", "C4",
+))}
+_GRADES = {name: index for index, name in enumerate((
+    "G1", "G2", "G3", "Jpn1", "Jpn2", "Jpn3", "JG1", "JG2", "JG3", "L",
+))}
+_WEIGHT_RULES = {name: index for index, name in enumerate(("定量", "別定", "ハンデ", "馬齢"))}
+_WEATHER = {name: index for index, name in enumerate(("晴", "曇", "雨", "小雨", "雪", "小雪", "霧"))}
+_GOING = {name: index for index, name in enumerate(("良", "稍重", "重", "不良"))}
 _GROUPS = {"central_flat", "central_jump", "local_flat", "local_banei"}
 _GROUP_NAMES = {group: group for group in _GROUPS}
 _WITHDRAWN = {"scratched", "excluded"}
@@ -85,6 +115,44 @@ def _identifier(value) -> str | None:
 def _positive(value) -> float | None:
     number = _number(value)
     return number if number is not None and number > 0 else None
+
+
+def _nonnegative(value) -> float | None:
+    number = _number(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _same_known(current, previous) -> float | None:
+    # These codes are categorical, with no shared ordinal class scale across
+    # central, regional and banei racing. Equality is the only comparison.
+    return float(current == previous) if current is not None and previous is not None else None
+
+
+def _historical_context(row: dict, size: int, position: int | None) -> dict:
+    """Read context of an observed earlier start, including its known market.
+
+    A non-finisher may still have an observed pre-race weight, odds and going.
+    Its popularity-to-finish gain is unknown rather than an invented last rank.
+    """
+    odds = _positive(row.get("odds"))
+    popularity = _number(row.get("popularity"))
+    if popularity is None or not popularity.is_integer() or not 1 <= popularity <= size:
+        popularity = None
+    denominator = max(size - 1, 1)
+    moisture = _nonnegative(row.get("track_moisture"))
+    if moisture is not None and moisture > 100:
+        moisture = None
+    going = {"稍": "稍重", "不": "不良"}.get(row.get("track_condition"), row.get("track_condition"))
+    return dict(
+        bodyweight_kg=_positive(row.get("weight_kg")),
+        bodyweight_change_kg=_number(row.get("weight_change_kg")),
+        log_odds=math.log(odds) if odds is not None else None,
+        popularity_fraction=(popularity - 1) / denominator if popularity is not None else None,
+        market_rank_gain=(popularity - position) / denominator if popularity is not None and position is not None else None,
+        weather_code=_WEATHER.get(row.get("weather")), going_code=_GOING.get(going),
+        track_moisture=moisture, class_code=_CLASSES.get(row.get("race_class")),
+        grade_code=_GRADES.get(row.get("race_grade")),
+    )
 
 
 def _mean(values) -> float | None:
@@ -252,6 +320,16 @@ class _Run:
     fourth_to_finish_gain: float | None = None
     corner_leading: float | None = None
     corner_front: float | None = None
+    bodyweight_kg: float | None = None
+    bodyweight_change_kg: float | None = None
+    log_odds: float | None = None
+    popularity_fraction: float | None = None
+    market_rank_gain: float | None = None
+    weather_code: int | None = None
+    going_code: int | None = None
+    track_moisture: float | None = None
+    class_code: int | None = None
+    grade_code: int | None = None
 
 
 def _append_recent(recent: deque, run: _Run) -> deque:
@@ -283,6 +361,7 @@ class HistoryState:
         self.course_surface: dict[tuple, _Aggregate] = {}
         self.surface_distance: dict[tuple, _Aggregate] = {}
         self.course_surface_distance: dict[tuple, _Aggregate] = {}
+        self.going_results: dict[tuple[str, str, bool], _Aggregate] = {}
         self.jockeys: dict[tuple[str, str], _Aggregate] = {}
         self.trainers: dict[tuple[str, str], _Aggregate] = {}
         self._races: set[tuple] = set()
@@ -331,7 +410,7 @@ class HistoryState:
                                              if time_value is not None and mean_time is not None and distance is not None else None),
                        last3f_seconds=section,
                        last3f_vs_mean=section - mean_section if section is not None and mean_section is not None else None,
-                       **_corner_form(row, size, position))
+                       **_corner_form(row, size, position), **_historical_context(row, size, position))
             updates.append((row, run))
         # Validate every outcome before mutating any aggregate.
         for row, run in updates:
@@ -341,6 +420,9 @@ class HistoryState:
             recent_key = (group, horse)
             recent = self.group_recent.get(recent_key)
             self.group_recent[recent_key] = _append_recent(recent if recent is not None else deque(maxlen=5), run)
+            if run.going_code is not None:
+                going_key = (group, horse, run.going_code in (_GOING["重"], _GOING["不良"]))
+                self.going_results.setdefault(going_key, _Aggregate()).add(run.win, run.top3)
             for key, lookup in zip(_aptitude_keys(row, group),
                                    (self.course_surface, self.surface_distance, self.course_surface_distance)):
                 if key is not None:
@@ -417,6 +499,29 @@ def race_features(race: list[dict], histories: HistoryState) -> list[list[float 
         vector.extend((_mean(run.corner_leading for run in timed_recent),
                        _mean(run.corner_front for run in timed_recent),
                        float(sum(run.first_corner_fraction is not None for run in timed_recent)), None))
+        class_code = _CLASSES.get(row.get("race_class"))
+        grade_code = _GRADES.get(row.get("race_grade"))
+        previous_class = group_previous.class_code if group_previous else None
+        previous_grade = group_previous.grade_code if group_previous else None
+        wet = histories.going_results.get((group, identifier, True), empty)
+        dryish = histories.going_results.get((group, identifier, False), empty)
+        vector.extend((
+            class_code, grade_code, _WEIGHT_RULES.get(row.get("weight_rule")),
+            _positive(row.get("age_min")), _positive(row.get("age_max")), _nonnegative(row.get("first_prize_man")),
+            previous_class, previous_grade, _same_known(class_code, previous_class), _same_known(grade_code, previous_grade),
+            group_previous.bodyweight_kg if group_previous else None, _mean(run.bodyweight_kg for run in timed_recent),
+            group_previous.bodyweight_change_kg if group_previous else None,
+            _mean(abs(run.bodyweight_change_kg) if run.bodyweight_change_kg is not None else None for run in timed_recent),
+            group_previous.log_odds if group_previous else None, _mean(run.log_odds for run in timed_recent),
+            group_previous.popularity_fraction if group_previous else None, _mean(run.popularity_fraction for run in timed_recent),
+            group_previous.market_rank_gain if group_previous else None, _mean(run.market_rank_gain for run in timed_recent),
+            group_previous.weather_code if group_previous else None, group_previous.going_code if group_previous else None,
+            group_previous.track_moisture if group_previous else None, _mean(run.track_moisture for run in timed_recent),
+            float(wet.starts), wet.top3 / wet.starts if wet.starts else None,
+            float(dryish.starts), dryish.top3 / dryish.starts if dryish.starts else None,
+            float(sum(run.bodyweight_kg is not None for run in timed_recent)),
+            float(sum(run.log_odds is not None for run in timed_recent)),
+        ))
         vectors.append(vector)
     # Relative form uses only opponents' already-causal histories.
     for source, destination in (("horse_prior_top3_rate", "horse_top3_rate_vs_field"),

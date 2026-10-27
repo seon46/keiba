@@ -7,7 +7,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
-from keiba_ai.features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
+from keiba_ai.features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, RANK_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
 
 
 def race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
@@ -40,6 +40,17 @@ def corner_race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
         row['corner_positions'] = {str(corner): index for corner in (1, 2, 3, 4)}
         row['corner_sequence'] = [index] * 4
         row['corner_labels'] = [1, 2, 3, 4]
+    return result
+
+
+def context_race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
+    result = corner_race(day, number, positions=positions, group=group)
+    for index, row in enumerate(result, 1):
+        row.update(weather='雨', track_condition='重', track_moisture=2.5,
+                   weight_kg=470+index*10, weight_change_kg=index-2,
+                   odds=float(index*2), popularity=index,
+                   race_class='1win', race_grade='G3', weight_rule='定量',
+                   age_min=3, age_max=None, first_prize_man=800)
     return result
 
 
@@ -414,6 +425,164 @@ class HistoricalCornerTests(unittest.TestCase):
         self.assertIsNotNone(result['horse_group_recent5_first_corner_fraction'])
 
 
+class HistoricalContextTests(unittest.TestCase):
+    def test_fixed_category_vocabularies_cover_normalized_condition_enums(self):
+        from keiba_ai import dataset, features
+        from keiba_scraper.conditions import RACE_CLASSES_BY_REGION, RACE_GRADES_BY_REGION, WEIGHT_RULES
+        for labels in RACE_CLASSES_BY_REGION.values():
+            self.assertTrue(labels <= features._CLASSES.keys())
+        for labels in RACE_GRADES_BY_REGION.values():
+            self.assertTrue(labels <= features._GRADES.keys())
+        self.assertTrue(WEIGHT_RULES <= features._WEIGHT_RULES.keys())
+        self.assertTrue(dataset._WEATHER <= features._WEATHER.keys())
+        self.assertTrue(dataset._GOING <= features._GOING.keys())
+        for vocabulary in (features._CLASSES, features._GRADES, features._WEIGHT_RULES,
+                           features._WEATHER, features._GOING):
+            self.assertEqual(len(vocabulary), len(set(vocabulary.values())))
+            self.assertTrue(all(0 <= code < 255 for code in vocabulary.values()))
+
+    def test_observed_context_is_delayed_and_has_market_performance_residual(self):
+        first = context_race('2024-01-01', 1, positions=(3, 1, 2, 4))
+        second = context_race('2024-01-02', 2, positions=(2, 3, 1, 4))
+        for row in second:
+            row.update(track_condition='稍重', weather='曇', track_moisture=0,
+                       weight_kg=row['weight_kg']+4, weight_change_kg=4)
+        state = HistoryState()
+        state.update_race(first)
+        state.update_race(second)
+        result = values(race_features(context_race('2024-01-03', 3), state)[0])
+        self.assertEqual(result['horse_group_previous_bodyweight_kg'], 484)
+        self.assertEqual(result['horse_group_recent5_bodyweight_kg'], 482)
+        self.assertEqual(result['horse_group_previous_bodyweight_change_kg'], 4)
+        self.assertEqual(result['horse_group_recent5_absolute_weight_change_kg'], 2.5)
+        self.assertAlmostEqual(result['horse_group_previous_log_odds'], __import__('math').log(2))
+        self.assertEqual(result['horse_group_previous_popularity_fraction'], 0)
+        self.assertAlmostEqual(result['horse_group_previous_market_rank_gain'], -1/3)
+        self.assertAlmostEqual(result['horse_group_recent5_market_rank_gain'], -.5)
+        self.assertEqual(result['horse_group_previous_track_moisture'], 0)
+        self.assertEqual(result['horse_group_recent5_track_moisture'], 1.25)
+        self.assertEqual(result['horse_group_wet_starts'], 1)
+        self.assertEqual(result['horse_group_wet_top3_rate'], 1)
+        self.assertEqual(result['horse_group_dryish_starts'], 1)
+        self.assertEqual(result['horse_group_dryish_top3_rate'], 1)
+        self.assertEqual(result['horse_group_recent5_bodyweight_starts'], 2)
+        self.assertEqual(result['horse_group_recent5_odds_starts'], 2)
+
+    def test_current_measured_conditions_weights_and_market_are_not_inputs(self):
+        state = HistoryState()
+        state.update_race(context_race('2024-01-01', 1))
+        upcoming = context_race('2024-01-02', 2)
+        changed = deepcopy(upcoming)
+        for row in changed:
+            row.update(weather='雪', track_condition='不良', track_moisture=99,
+                       weight_kg=9999, weight_change_kg=-999, odds=99999, popularity=99)
+        self.assertEqual(race_features(upcoming, state), race_features(changed, state))
+
+    def test_known_static_class_is_categorical_and_no_ordinal_class_change_is_invented(self):
+        state = HistoryState()
+        state.update_race(context_race('2024-01-01', 1))
+        upcoming = context_race('2024-01-02', 2)
+        same = values(race_features(upcoming, state)[0])
+        self.assertEqual(same['horse_group_previous_same_class'], 1)
+        self.assertEqual(same['horse_group_previous_same_grade'], 1)
+        self.assertEqual(same['race_age_min'], 3)
+        self.assertIsNone(same['race_age_max'])
+        self.assertEqual(same['race_first_prize_man'], 800)
+        changed = deepcopy(upcoming)
+        for row in changed:
+            row.update(race_class='A1', race_grade='Jpn1', weight_rule='ハンデ')
+        different = values(race_features(changed, state)[0])
+        self.assertEqual(different['horse_group_previous_same_class'], 0)
+        self.assertEqual(different['horse_group_previous_same_grade'], 0)
+        self.assertNotEqual(same['race_class_code'], different['race_class_code'])
+        self.assertNotEqual(same['race_weight_rule_code'], different['race_weight_rule_code'])
+        self.assertEqual(same['horse_group_previous_class_code'], different['horse_group_previous_class_code'])
+        self.assertEqual([same[name] for name in RANK_FEATURE_NAMES], [different[name] for name in RANK_FEATURE_NAMES])
+        self.assertTrue({'race_class_code','race_grade_code','race_weight_rule_code',
+                         'horse_group_previous_class_code','horse_group_previous_grade_code',
+                         'horse_group_previous_weather_code','horse_group_previous_going_code'} <= set(CATEGORICAL_FEATURES))
+
+    def test_unknown_context_remains_missing_and_banei_weights_are_not_flat_clamped(self):
+        incoming = race('2024-01-02', 2)
+        missing = values(race_features(incoming, HistoryState())[0])
+        for name in FEATURE_NAMES[len(RANK_FEATURE_NAMES):]:
+            if name.endswith('_starts'):
+                self.assertEqual(missing[name], 0)
+            else:
+                self.assertIsNone(missing[name])
+        banei = context_race('2024-01-01', 1, group='local_banei')
+        for row in banei:
+            row.update(course='帯広(ば)', surface=None, distance_m=200,
+                       weight_kg=1150, weight_change_kg=0, odds=1.0, track_condition=None)
+        state = HistoryState()
+        state.update_race(banei)
+        next_race = deepcopy(banei)
+        for row in next_race:
+            row['day'] = '2024-01-02'
+        result = values(race_features(next_race, state)[0])
+        self.assertEqual(result['horse_group_previous_bodyweight_kg'], 1150)
+        self.assertEqual(result['horse_group_previous_bodyweight_change_kg'], 0)
+        self.assertEqual(result['horse_group_previous_log_odds'], 0)
+        self.assertEqual(result['horse_group_wet_starts'], 0)
+        self.assertIsNone(result['horse_group_wet_top3_rate'])
+
+    def test_nonfinisher_keeps_observed_context_but_never_invents_finish_rank_gain(self):
+        old = context_race('2024-01-01', 1)
+        old[1].update(finish_status='did_not_finish', finish_position=None)
+        old[2].update(finish_status='disqualified', finish_position=None)
+        state = HistoryState()
+        state.update_race(old)
+        vectors = [values(vector) for vector in race_features(context_race('2024-01-02', 2), state)]
+        for index in (1, 2):
+            result = vectors[index]
+            self.assertIsNotNone(result['horse_group_previous_bodyweight_kg'])
+            self.assertIsNotNone(result['horse_group_previous_log_odds'])
+            self.assertIsNone(result['horse_group_previous_market_rank_gain'])
+            self.assertEqual(result['horse_group_wet_starts'], 1)
+            self.assertEqual(result['horse_group_wet_top3_rate'], 0)
+
+    def test_context_histories_are_group_specific_and_past_changes_keep_old_66_columns(self):
+        original = context_race('2024-01-01', 1)
+        changed = deepcopy(original)
+        for row in changed:
+            row.update(weather='雪', track_condition='不良', track_moisture=10,
+                       weight_kg=900, weight_change_kg=-20, odds=100, popularity=4)
+        a, b = HistoryState(), HistoryState()
+        a.update_race(original)
+        b.update_race(changed)
+        upcoming = context_race('2024-01-02', 2)
+        first, second = race_features(upcoming, a), race_features(upcoming, b)
+        self.assertEqual(len(RANK_FEATURE_NAMES), 66)
+        self.assertEqual(FEATURE_NAMES[:66], RANK_FEATURE_NAMES)
+        self.assertEqual([row[:66] for row in first], [row[:66] for row in second])
+        self.assertNotEqual([row[66:] for row in first], [row[66:] for row in second])
+        local = context_race('2024-01-02', 3, group='local_flat')
+        result = values(race_features(local, a)[0])
+        self.assertEqual(result['horse_global_prior_starts'], 1)
+        self.assertEqual(result['horse_group_recent5_bodyweight_starts'], 0)
+        self.assertIsNone(result['horse_group_previous_bodyweight_kg'])
+        self.assertEqual(result['horse_group_wet_starts'], 0)
+
+    def test_context_window_is_last_five_starts_and_missing_latest_is_not_backfilled(self):
+        state = HistoryState()
+        for number in range(1, 7):
+            old = context_race(f'2024-01-{number:02d}', number)
+            for row in old:
+                row.update(weight_kg=400+number*10, odds=float(number))
+            state.update_race(old)
+        result = values(race_features(context_race('2024-01-07', 7), state)[0])
+        self.assertEqual(result['horse_group_recent5_bodyweight_kg'], 440)
+        self.assertEqual(result['horse_group_recent5_bodyweight_starts'], 5)
+        last = context_race('2024-01-07', 7)
+        last[0].update(weight_kg=None, odds=None, popularity=None, weight_change_kg=None)
+        state.update_race(last)
+        result = values(race_features(context_race('2024-01-08', 8), state)[0])
+        self.assertIsNone(result['horse_group_previous_bodyweight_kg'])
+        self.assertIsNone(result['horse_group_previous_log_odds'])
+        self.assertIsNotNone(result['horse_group_recent5_bodyweight_kg'])
+        self.assertEqual(result['horse_group_recent5_bodyweight_starts'], 4)
+
+
 class StreamingFeatureBuildTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -508,6 +677,39 @@ class StreamingFeatureBuildTests(unittest.TestCase):
         after = [json.loads(row[4]) for row in alternative if row[0] == '2026-01-04']
         self.assertEqual([row[:52] for row in before], [row[:52] for row in after])
         self.assertNotEqual([row[52:] for row in before], [row[52:] for row in after])
+
+    def test_same_day_context_outcomes_are_not_used_until_the_next_day(self):
+        first, second = context_race('2024-01-01', 1), context_race('2024-01-01', 2)
+        for row in second:
+            row.update(weight_kg=900, odds=100, track_condition='不良')
+        _, rows, _ = self.build('same-day-context.sqlite3', [first, second, context_race('2024-01-02', 3)])
+        for row in rows:
+            vector = values(json.loads(row[4]))
+            if row[0] == '2024-01-01':
+                self.assertIsNone(vector['horse_group_recent5_bodyweight_kg'])
+                self.assertIsNone(vector['horse_group_previous_log_odds'])
+                self.assertEqual(vector['horse_group_wet_starts'], 0)
+                self.assertIsNotNone(vector['race_class_code'])  # Pre-race condition is known.
+            else:
+                self.assertEqual(vector['horse_group_recent5_bodyweight_starts'], 2)
+                self.assertEqual(vector['horse_group_wet_starts'], 2)
+                self.assertIsNone(vector['horse_group_previous_bodyweight_kg'])
+
+    def test_future_measured_context_changes_only_affect_later_dates(self):
+        races = [context_race('2024-01-01', 1), context_race('2024-01-02', 2),
+                 context_race('2026-01-03', 3), context_race('2026-01-04', 4)]
+        changed = deepcopy(races)
+        for row in changed[2]:
+            row.update(weather='雪', track_condition='不良', track_moisture=8,
+                       weight_kg=900, weight_change_kg=-20, odds=100, popularity=4)
+        _, original, _ = self.build('context-original.sqlite3', races)
+        _, alternative, _ = self.build('context-changed.sqlite3', changed)
+        self.assertEqual([row for row in original if row[0] <= '2026-01-03'],
+                         [row for row in alternative if row[0] <= '2026-01-03'])
+        before = [json.loads(row[4]) for row in original if row[0] == '2026-01-04']
+        after = [json.loads(row[4]) for row in alternative if row[0] == '2026-01-04']
+        self.assertEqual([row[:66] for row in before], [row[:66] for row in after])
+        self.assertNotEqual([row[66:] for row in before], [row[66:] for row in after])
 
 
 if __name__ == '__main__':
