@@ -71,7 +71,7 @@ def prepare(source, output):
     return Path(output) / 'features.sqlite3'
 
 
-def predict(database, models, entries, output):
+def predict(database, models, entries, output, *, samples=None):
     from .dataset import normalize_row, iter_races
     from .features import FEATURE_NAMES, HistoryState, race_features
     np, joblib, _, threadpool_limits = libraries()
@@ -97,6 +97,7 @@ def predict(database, models, entries, output):
     if not grouped:
         raise ValueError('出馬表がありません。')
     results, loaded, cached_day, history = [], {}, None, None
+    targets = set()
     history_day = None
     for (day, region, race_id), race in sorted(grouped.items()):
         fields = ('day','group_name','course','surface','distance_m','declared_field_size','snapshot_id')
@@ -123,8 +124,11 @@ def predict(database, models, entries, output):
                 raise ValueError(f'この区分の学習済みモデルがありません: {group}')
             loaded[group] = joblib.load(path)
         bundle = loaded[group]
-        if bundle.get('group') != group or bundle.get('target') != 'top3' or bundle.get('schema_version') != SCHEMA_VERSION:
+        if bundle.get('group') != group or bundle.get('target') not in ('top3','rank') or bundle.get('schema_version') != SCHEMA_VERSION:
             raise ValueError('モデルの区分または予測対象が一致しません。')
+        targets.add(bundle['target'])
+        if len(targets)>1:
+            raise ValueError('同じ予測出力でtop3モデルと順位モデルを混在させることはできません。')
         if bundle['feature_names'] != list(FEATURE_NAMES) or bundle['feature_revision'] != feature_revision():
             raise ValueError('モデルと特徴量の版が一致しません。')
         if day <= bundle['trained_through']:
@@ -133,21 +137,49 @@ def predict(database, models, entries, output):
                         for values in race_features(active,history)],dtype=np.float32)
         x = x[:, select_feature_columns(bundle)]
         with threadpool_limits(limits=bundle.get('threads',4)):
-            probabilities = bundle['estimator'].predict_proba(x)[:,1]
-        for row, probability in sorted(zip(active,probabilities),key=lambda pair:(-pair[1],pair[0]['horse_number'])):
-            results.append(dict(race_date=day,region=region,race_id=race_id,horse_id=row['horse_id'],
+            if bundle['target']=='rank':
+                from .ranking import rank_distribution
+                from .rank_model import estimate_completion,race_seed
+                scores=-bundle['rank_estimator'].predict(x)
+                completion=estimate_completion(bundle['finish_estimator'],bundle['finish_constant'],x)
+                distribution=rank_distribution(scores,completion,temperature=bundle['temperature'],
+                    samples=samples if samples is not None else bundle['samples'],
+                    smoothing=bundle['smoothing'],seed=race_seed(race_id,bundle['seed']))
+                probabilities=np.clip(distribution[:,:min(3,len(active))].sum(axis=1),0,1)
+            else:
+                probabilities = bundle['estimator'].predict_proba(x)[:,1]
+        ordered=sorted(range(len(active)),key=lambda i:(-probabilities[i],active[i]['horse_number']))
+        for index in ordered:
+            row,probability=active[index],probabilities[index]
+            result=dict(race_date=day,region=region,race_id=race_id,horse_id=row['horse_id'],
                 horse_number=row['horse_number'],top3_probability=float(probability),group=group,
                 history_last_date=history_day,
-                days_since_history=(date.fromisoformat(day)-date.fromisoformat(history_day)).days if history_day else None))
+                days_since_history=(date.fromisoformat(day)-date.fromisoformat(history_day)).days if history_day else None)
+            if bundle['target']=='rank':
+                ranks=distribution[index,:len(active)]
+                finish=float(completion[index])
+                result.update(starters=len(active),nonfinish_probability=float(distribution[index,-1]),finish_probability=finish,
+                    expected_rank_given_finish=float((ranks*np.arange(1,len(active)+1)).sum()/finish) if finish>0 else None)
+                result.update({f'rank_{rank}_probability':float(value) for rank,value in enumerate(ranks,1)})
+            results.append(result)
     if not results:
         raise ValueError('予測対象の馬がありません。')
+    if targets=={'rank'}:
+        maximum=max(row['starters'] for row in results)
+        for row in results:
+            for rank in range(1,maximum+1):
+                row.setdefault(f'rank_{rank}_probability',0.0)
+        common=[key for key in results[0] if not key.startswith('rank_')]
+        fields=common+[f'rank_{rank}_probability' for rank in range(1,maximum+1)]
+    else:
+        fields=list(results[0])
     output.parent.mkdir(parents=True,exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile('w',encoding='utf-8',newline='',dir=output.parent,
                                          prefix='.keiba-prediction-',delete=False) as file:
             temporary = Path(file.name)
-            writer = csv.DictWriter(file,fieldnames=list(results[0]))
+            writer = csv.DictWriter(file,fieldnames=fields)
             writer.writeheader()
             writer.writerows(results)
         os.link(temporary,output)
@@ -158,7 +190,7 @@ def predict(database, models, entries, output):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='保存済みCSVから3着以内の確率を学習・評価します。')
+    parser = argparse.ArgumentParser(description='保存済みCSVから3着以内・各順位の確率を学習・評価します。')
     commands = parser.add_subparsers(dest='command',required=True)
     for name in ('prepare','fit'):
         command = commands.add_parser(name)
@@ -172,13 +204,17 @@ def main(argv=None):
         command.add_argument('--test-start',default='2026-01-01')
         command.add_argument('--threads',type=int,default=4)
         command.add_argument('--iterations',type=int,default=150)
-        command.add_argument('--feature-set', choices=('auto','baseline','enhanced'), default='auto',
+        command.add_argument('--feature-set', choices=('auto','baseline','form','enhanced'), default='auto',
                              help='検証期間で従来特徴と拡張特徴を比較（既定: auto）')
+        command.add_argument('--target',choices=('top3','rank'),default='top3',help='予測する対象（rank: 全順位と未完走）')
+        command.add_argument('--validation-samples',type=int,default=128)
+        command.add_argument('--evaluation-samples',type=int,default=1024)
     prediction = commands.add_parser('predict')
     prediction.add_argument('--dataset',required=True,type=Path)
     prediction.add_argument('--model-dir',required=True,type=Path)
     prediction.add_argument('--entries',required=True,type=Path)
     prediction.add_argument('--output',required=True,type=Path)
+    prediction.add_argument('--samples',type=int,help='順位モデルの順序サンプル数（既定4096）')
     args = parser.parse_args(argv)
     try:
         if args.command == 'prepare':
@@ -188,11 +224,17 @@ def main(argv=None):
             database = prepare(args.input,args.output_dir) if args.command == 'fit' else args.dataset
             destination = args.output_dir/'models' if args.command == 'fit' else args.output_dir
             with fresh_directory(destination) as temporary:
-                train(database,temporary,validation_start=args.validation_start,test_start=args.test_start,
-                      threads=args.threads,iterations=args.iterations,feature_set=args.feature_set,report=emit)
+                if args.target=='rank':
+                    from .rank_model import train_rank
+                    train_rank(database,temporary,validation_start=args.validation_start,test_start=args.test_start,
+                        threads=args.threads,iterations=args.iterations,feature_set=args.feature_set,
+                        validation_samples=args.validation_samples,evaluation_samples=args.evaluation_samples,report=emit)
+                else:
+                    train(database,temporary,validation_start=args.validation_start,test_start=args.test_start,
+                          threads=args.threads,iterations=args.iterations,feature_set=args.feature_set,report=emit)
             emit(event='training_complete',report=str(destination/'evaluation.json'))
         else:
-            predict(args.dataset,args.model_dir,args.entries,args.output)
+            predict(args.dataset,args.model_dir,args.entries,args.output,samples=args.samples)
         return 0
     except (ValueError,OSError,sqlite3.Error,KeyError,csv.Error) as exc:
         emit(event='error',message=str(exc))

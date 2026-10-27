@@ -7,7 +7,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
-from keiba_ai.features import BASE_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
+from keiba_ai.features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, FEATURE_NAMES, CATEGORICAL_FEATURES, HistoryState, build_features, race_features
 
 
 def race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
@@ -31,6 +31,15 @@ def timed_race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
     result = race(day, number, positions=positions, group=group)
     for index, row in enumerate(result):
         row.update(time_seconds=100 + index * 2, last_3f_seconds=35 + index)
+    return result
+
+
+def corner_race(day, number, *, positions=(1, 2, 3, 4), group='central_flat'):
+    result = timed_race(day, number, positions=positions, group=group)
+    for index, row in enumerate(result, 1):
+        row['corner_positions'] = {str(corner): index for corner in (1, 2, 3, 4)}
+        row['corner_sequence'] = [index] * 4
+        row['corner_labels'] = [1, 2, 3, 4]
     return result
 
 
@@ -298,6 +307,113 @@ class HistoricalTimingAndAptitudeTests(unittest.TestCase):
         self.assertEqual(result['horse_group_recent5_timed_starts'], 4)
 
 
+class HistoricalCornerTests(unittest.TestCase):
+    def test_positions_and_gains_are_normalized_by_historical_field_size(self):
+        previous = corner_race('2024-01-01', 1)
+        previous[0]['corner_positions'] = {'1': 4, '2': 4, '3': 4, '4': 2}
+        state = HistoryState()
+        state.update_race(previous)
+        result = values(race_features(race('2024-01-02', 2), state)[0])
+        self.assertEqual(result['horse_group_previous_first_corner_fraction'], 1)
+        self.assertAlmostEqual(result['horse_group_previous_last_corner_fraction'], 1/3)
+        self.assertAlmostEqual(result['horse_group_recent5_observed_corner_gain'], 2/3)
+        self.assertAlmostEqual(result['horse_group_previous_third_to_fourth_gain'], 2/3)
+        self.assertAlmostEqual(result['horse_group_previous_fourth_to_finish_gain'], 1/3)
+        self.assertEqual(result['horse_group_recent5_corner_starts'], 1)
+        self.assertEqual(result['horse_group_recent5_corner_leading_rate'], 0)
+        self.assertEqual(result['horse_group_recent5_corner_front_rate'], 0)
+        larger = corner_race('2024-01-01', 1, positions=tuple(range(1, 9)))
+        larger[0]['corner_positions'] = {'1': 4, '4': 2}
+        state = HistoryState()
+        state.update_race(larger)
+        result = values(race_features(race('2024-01-02', 2), state)[0])
+        self.assertAlmostEqual(result['horse_group_previous_first_corner_fraction'], 3/7)
+        self.assertAlmostEqual(result['horse_group_previous_fourth_to_finish_gain'], 1/7)
+
+    def test_two_unlabelled_observations_do_not_claim_third_or_fourth_corner(self):
+        old = corner_race('2024-01-01', 1)
+        old[0].update(corner_positions={}, corner_sequence=[4, 2], corner_labels=None)
+        state = HistoryState()
+        state.update_race(old)
+        result = values(race_features(race('2024-01-02', 2), state)[0])
+        self.assertEqual(result['horse_group_previous_first_corner_fraction'], 1)
+        self.assertAlmostEqual(result['horse_group_previous_observed_corner_gain'], 2/3)
+        self.assertIsNone(result['horse_group_previous_third_to_fourth_gain'])
+        self.assertIsNone(result['horse_group_previous_fourth_to_finish_gain'])
+        explicit = deepcopy(old)
+        explicit[0]['corner_labels'] = [3, 4]
+        state = HistoryState()
+        state.update_race(explicit)
+        result = values(race_features(race('2024-01-02', 2), state)[0])
+        self.assertAlmostEqual(result['horse_group_previous_third_to_fourth_gain'], 2/3)
+        self.assertAlmostEqual(result['horse_group_previous_fourth_to_finish_gain'], 1/3)
+
+    def test_parallel_group_leading_ranks_stay_tied_and_opponents_use_past_form(self):
+        old = corner_race('2024-01-01', 1)
+        old[1]['corner_positions'] = deepcopy(old[0]['corner_positions'])
+        state = HistoryState()
+        state.update_race(old)
+        vectors = [values(vector) for vector in race_features(race('2024-01-02', 2), state)]
+        self.assertEqual(vectors[0]['horse_group_previous_first_corner_fraction'],
+                         vectors[1]['horse_group_previous_first_corner_fraction'])
+        self.assertEqual(vectors[0]['horse_group_recent5_corner_leading_rate'], 1)
+        self.assertEqual(vectors[1]['horse_group_recent5_corner_leading_rate'], 1)
+        self.assertAlmostEqual(vectors[0]['opponents_recent5_corner_front_rate'], 1/3)
+        self.assertAlmostEqual(vectors[2]['opponents_recent5_corner_front_rate'], 2/3)
+
+    def test_missing_invalid_nonfinishing_corners_do_not_become_zero_position(self):
+        old = corner_race('2024-01-01', 1)
+        old[0].update(corner_positions={}, corner_sequence=[], corner_labels=None)
+        old[1].update(finish_status='did_not_finish', finish_position=None)
+        old[2].update(finish_status='disqualified', finish_position=None)
+        old[3]['corner_positions'] = {'3': 100, '4': 1}
+        state = HistoryState()
+        state.update_race(old)
+        vectors = [values(vector) for vector in race_features(race('2024-01-02', 2), state)]
+        for result in vectors:
+            self.assertEqual(result['horse_group_recent5_corner_starts'], 0)
+            self.assertIsNone(result['horse_group_previous_first_corner_fraction'])
+            self.assertIsNone(result['horse_group_recent5_corner_front_rate'])
+            self.assertIsNone(result['opponents_recent5_corner_front_rate'])
+
+    def test_corner_histories_do_not_cross_model_groups(self):
+        state = HistoryState()
+        state.update_race(corner_race('2024-01-01', 1))
+        incoming = race('2024-01-02', 2, group='local_flat')
+        result = values(race_features(incoming, state)[0])
+        self.assertEqual(result['horse_global_prior_starts'], 1)
+        self.assertEqual(result['horse_group_recent5_corner_starts'], 0)
+        self.assertIsNone(result['horse_group_recent5_first_corner_fraction'])
+
+    def test_current_corner_changes_are_unused_and_old_52_values_are_unchanged(self):
+        old = corner_race('2024-01-01', 1)
+        changed = deepcopy(old)
+        for row in changed:
+            row.update(corner_positions={'3': 4, '4': 1}, corner_sequence=[4, 1], corner_labels=[3, 4])
+        a, b = HistoryState(), HistoryState()
+        a.update_race(old)
+        b.update_race(changed)
+        upcoming = corner_race('2024-01-02', 2)
+        first, second = race_features(upcoming, a), race_features(upcoming, b)
+        self.assertEqual(len(FORM_FEATURE_NAMES), 52)
+        self.assertEqual(FEATURE_NAMES[:52], FORM_FEATURE_NAMES)
+        self.assertEqual([row[:52] for row in first], [row[:52] for row in second])
+        self.assertNotEqual([row[52:] for row in first], [row[52:] for row in second])
+        incoming_changed = deepcopy(upcoming)
+        for row in incoming_changed:
+            row.update(corner_positions={'3': 1, '4': 4}, corner_sequence=[1, 4], corner_labels=[3, 4])
+        self.assertEqual(first, race_features(incoming_changed, a))
+
+    def test_same_day_multiple_starts_do_not_claim_a_specific_previous_position(self):
+        state = HistoryState()
+        state.update_race(corner_race('2024-01-01', 1))
+        state.update_race(corner_race('2024-01-01', 2))
+        result = values(race_features(race('2024-01-02', 3), state)[0])
+        self.assertEqual(result['horse_group_recent5_corner_starts'], 2)
+        self.assertIsNone(result['horse_group_previous_first_corner_fraction'])
+        self.assertIsNotNone(result['horse_group_recent5_first_corner_fraction'])
+
+
 class StreamingFeatureBuildTests(unittest.TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -363,6 +479,35 @@ class StreamingFeatureBuildTests(unittest.TestCase):
             else:
                 self.assertEqual(vector['horse_group_recent5_timed_starts'], 2)
                 self.assertIsNone(vector['horse_group_previous_speed_mps'])
+
+    def test_same_day_corner_outcomes_are_frozen_until_the_next_day(self):
+        first, second = corner_race('2024-01-01', 1), corner_race('2024-01-01', 2)
+        second[0]['corner_positions'] = {'1': 4, '4': 2}
+        _, rows, _ = self.build('same-day-corners.sqlite3', [first, second, race('2024-01-02', 3)])
+        for row in rows:
+            vector = values(json.loads(row[4]))
+            if row[0] == '2024-01-01':
+                self.assertEqual(vector['horse_group_recent5_corner_starts'], 0)
+                self.assertIsNone(vector['horse_group_recent5_first_corner_fraction'])
+                self.assertIsNone(vector['opponents_recent5_corner_front_rate'])
+            else:
+                self.assertEqual(vector['horse_group_recent5_corner_starts'], 2)
+                self.assertIsNone(vector['horse_group_previous_first_corner_fraction'])
+
+    def test_future_corner_changes_only_affect_subsequent_dates(self):
+        races = [corner_race('2024-01-01', 1), corner_race('2024-01-02', 2),
+                 corner_race('2026-01-03', 3), corner_race('2026-01-04', 4)]
+        changed = deepcopy(races)
+        for row in changed[2]:
+            row.update(corner_positions={'3': 4, '4': 1}, corner_sequence=[4, 1], corner_labels=[3, 4])
+        _, original, _ = self.build('corner-original.sqlite3', races)
+        _, alternative, _ = self.build('corner-changed.sqlite3', changed)
+        self.assertEqual([row for row in original if row[0] <= '2026-01-03'],
+                         [row for row in alternative if row[0] <= '2026-01-03'])
+        before = [json.loads(row[4]) for row in original if row[0] == '2026-01-04']
+        after = [json.loads(row[4]) for row in alternative if row[0] == '2026-01-04']
+        self.assertEqual([row[:52] for row in before], [row[:52] for row in after])
+        self.assertNotEqual([row[52:] for row in before], [row[52:] for row in after])
 
 
 if __name__ == '__main__':

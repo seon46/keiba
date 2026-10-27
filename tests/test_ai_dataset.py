@@ -141,6 +141,138 @@ class DatasetTests(unittest.TestCase):
         self.assertIsNone(runners[1]["time_seconds"])
         self.assertIsNone(runners[2]["time_seconds"])
 
+    def test_explicit_corner_positions_preserve_parallel_group_ranks_and_sort_labels(self):
+        for positions in ({"4": 1, "1": 1, "3": 2}, '{"4": 1, "1": 1, "3": 2}'):
+            with self.subTest(positions=positions):
+                result = normalize_row(row(region="local", corner_positions=positions))
+                self.assertEqual(result["corner_positions"], {"1": 1, "3": 2, "4": 1})
+                self.assertEqual(result["corner_labels"], [1, 3, 4])
+                self.assertEqual(result["corner_sequence"], [1, 2, 1])
+                self.assertEqual(result["optional_parse_warnings"], [])
+        # Unlabelled observations cannot override an explicit corner mapping.
+        result = normalize_row(row(region="local", corner_positions={"3": 2, "4": 1}, corner_order="2-2"))
+        self.assertEqual(result["corner_sequence"], [2, 1])
+        self.assertEqual(result["corner_labels"], [3, 4])
+
+    def test_raw_corner_sequences_only_infer_labels_for_four_central_observations(self):
+        result = normalize_row(row(corner_order="3-3-2-1"))
+        self.assertEqual(result["corner_positions"], {})
+        self.assertEqual(result["corner_sequence"], [3, 3, 2, 1])
+        self.assertEqual(result["corner_labels"], [1, 2, 3, 4])
+        for region, order, expected in (("central", "3-1", [3, 1]),
+                                        ("central", "3-2-1", [3, 2, 1]),
+                                        ("local", "3-3-2-1", [3, 3, 2, 1])):
+            with self.subTest(region=region, order=order):
+                result = normalize_row(row(region=region, corner_order=order))
+                self.assertEqual(result["corner_sequence"], expected)
+                self.assertIsNone(result["corner_labels"])
+
+    def test_explicit_corner_labels_are_validated_and_order_passages_by_corner_number(self):
+        for labels in ([4, 3], "[4, 3]"):
+            result = normalize_row(row(corner_order="1-2", corner_order_corners=labels))
+            self.assertEqual(result["corner_labels"], [3, 4])
+            self.assertEqual(result["corner_sequence"], [2, 1])
+        result = normalize_row(row(corner_positions='{"3": 2, "4": 1}', corner_order="1-2",
+                                   corner_order_corners="[4, 3]"))
+        self.assertEqual(result["corner_sequence"], [2, 1])
+        self.assertFalse(result["optional_parse_warnings"])
+
+    def test_conflicting_labelled_corner_representations_become_optional_missing_values(self):
+        for changes in (
+            {"corner_positions": '{"3": 1, "4": 1}', "corner_order": "2-1", "corner_order_corners": "[3, 4]"},
+            {"corner_positions": {"1": 1}, "corner_order": "2-2-2-1"},
+        ):
+            with self.subTest(changes=changes):
+                result = normalize_row(row(**changes))
+                self.assertEqual(result["corner_positions"], {})
+                self.assertEqual(result["corner_sequence"], [])
+                self.assertIsNone(result["corner_labels"])
+                self.assertTrue(any("corner_conflict:" in message for message in result["optional_parse_warnings"]))
+
+    def test_malformed_optional_corners_warn_instead_of_rejecting_result_rows(self):
+        invalid_positions = ('[1, 8, 2]', '{"5": 1}', '{"3": 0}', '{"3": true}',
+                             '{"3": "1"}', '{"3": 1.0}', '{"3": 1, "3": 2}',
+                             {1: 1, "1": 2}, {True: 1}, "not-json")
+        for value in invalid_positions:
+            with self.subTest(positions=value):
+                result = normalize_row(row(corner_positions=value))
+                self.assertEqual(result["corner_positions"], {})
+                self.assertEqual(result["corner_sequence"], [])
+                self.assertTrue(result["optional_parse_warnings"])
+        for value in ("(1,8)-2", "0-1", "1,2", "1-2-3-4-5", "1.0-2", True):
+            with self.subTest(order=value):
+                result = normalize_row(row(corner_order=value))
+                self.assertEqual(result["corner_sequence"], [])
+                self.assertTrue(result["optional_parse_warnings"])
+        for value in ("[3]", "[3, 3]", "[3, 5]", '["3", "4"]', "[true, 4]", '{"3": 1}', "broken"):
+            with self.subTest(labels=value):
+                result = normalize_row(row(corner_order="2-1", corner_order_corners=value))
+                self.assertEqual(result["corner_sequence"], [])
+                self.assertIsNone(result["corner_labels"])
+                self.assertTrue(result["optional_parse_warnings"])
+        # Independent explicit positions remain usable if the optional raw text is malformed.
+        result = normalize_row(row(corner_positions={"4": 1}, corner_order="not a passage"))
+        self.assertEqual(result["corner_sequence"], [1])
+        self.assertEqual(result["corner_labels"], [4])
+        self.assertTrue(result["optional_parse_warnings"])
+
+    def test_entries_and_noncompletions_ignore_all_current_corner_values(self):
+        corners = {"corner_positions": "not-json", "corner_order": "(1,8)-2", "corner_order_corners": "broken"}
+        for status in ("did_not_finish", "disqualified", "scratched", "excluded"):
+            baseline = normalize_row(row(finish_status=status, finish_position=""))
+            self.assertEqual(normalize_row(row(finish_status=status, finish_position="", **corners)), baseline)
+        source = row(page="entries", finish_status="", finish_position="")
+        self.assertEqual(normalize_row(dict(source, **corners), page="entries"), normalize_row(source, page="entries"))
+
+    def test_corner_rank_bounds_use_active_field_without_excluding_the_race(self):
+        rows = [row(race_declared_field_size="3", corner_positions='{"3": 3, "4": 1}',
+                    corner_order="3-1", corner_order_corners="[3, 4]"),
+                row(horse_id="2021100002", horse_number="2", finish_position="2", race_declared_field_size="3",
+                    corner_order="2-2"),
+                row(horse_id="2021100003", horse_number="3", finish_status="scratched", finish_position="",
+                    race_declared_field_size="3", corner_positions='{"3": 3}')]
+        self.write(rows)
+        report = ingest_csv(self.csv, self.db)
+        self.assertEqual((report["usable_races"], report["usable_rows"]), (1, 3))
+        runners = next(iter_races(self.db))
+        self.assertEqual(runners[0]["corner_positions"], {})
+        self.assertEqual(runners[0]["corner_sequence"], [])
+        self.assertIsNone(runners[0]["corner_labels"])
+        self.assertIn("active race field size 2", runners[0]["optional_parse_warnings"][0])
+        self.assertEqual(runners[1]["corner_sequence"], [2, 2])
+        self.assertEqual(runners[2]["optional_parse_warnings"], [])
+        self.assertEqual(report["rows_with_optional_parse_warnings"], 1)
+        self.assertEqual(report["optional_parse_warning_counts"], {"corner_field_size": 1})
+        self.assertEqual(report["missing_values"]["corner_positions"], 3)
+        self.assertEqual(report["missing_values"]["corner_sequence"], 2)
+        self.assertEqual(report["missing_values"]["corner_labels"], 3)
+        self.assertFalse(report["optional_parse_warnings_truncated"])
+        self.assertEqual(report["optional_parse_warnings"][0]["horse_id"], "2021100001")
+        json.dumps(report, allow_nan=False)
+
+    def test_dnf_counts_as_starter_and_parallel_corner_ranks_need_not_be_unique(self):
+        rows = [row(race_declared_field_size="3", corner_positions='{"3": 3, "4": 1}'),
+                row(horse_id="2021100002", horse_number="2", finish_position="2", race_declared_field_size="3",
+                    corner_positions='{"3": 3, "4": 1}'),
+                row(horse_id="2021100003", horse_number="3", finish_status="did_not_finish", finish_position="",
+                    race_declared_field_size="3")]
+        self.write(rows)
+        report = ingest_csv(self.csv, self.db)
+        self.assertEqual(report["usable_rows"], 3)
+        self.assertEqual(report["rows_with_optional_parse_warnings"], 0)
+        self.assertEqual(next(iter_races(self.db))[0]["corner_sequence"], [3, 1])
+
+    def test_corner_warning_preview_is_bounded_and_all_warnings_remain_in_payloads(self):
+        self.write([row(race_id=f"{2024000000+index:010d}01", race_declared_field_size="1",
+                        corner_order="not a passage") for index in range(31)])
+        report = ingest_csv(self.csv, self.db)
+        self.assertEqual(report["usable_races"], 31)
+        self.assertEqual(report["rows_with_optional_parse_warnings"], 31)
+        self.assertEqual(report["optional_parse_warning_counts"], {"corner_order": 31})
+        self.assertEqual(len(report["optional_parse_warnings"]), 30)
+        self.assertTrue(report["optional_parse_warnings_truncated"])
+        self.assertTrue(all(race[0]["optional_parse_warnings"] for race in iter_races(self.db)))
+
     def test_nonfinite_fractional_ranks_invalid_booleans_and_false_identity_are_rejected(self):
         for changes in ({"odds": "NaN"}, {"carried_weight_kg": "inf"}, {"age": "-1"},
                         {"finish_position": "1.2"}, {"finish_position": ""},

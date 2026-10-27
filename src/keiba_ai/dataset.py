@@ -22,6 +22,7 @@ GROUPS = {"central_flat", "central_jump", "local_flat", "local_banei"}
 _NULLS = {"", "null", "none"}
 _NUMBER = re.compile(r"[+-]?[0-9]+(?:\.[0-9]+)?")
 _HORSE = re.compile(r"(?:[0-9]{10}|B[0-9]{9})")
+_CORNER_FIELDS = {"corner_positions", "corner_sequence", "corner_labels"}
 
 
 class RowValidationError(ValueError):
@@ -91,6 +92,99 @@ def _identity(raw: Mapping) -> tuple[str, str]:
     if region not in ("central", "local") or not identifier or not re.fullmatch(r"[0-9]{12}", identifier):
         raise ValueError("Cannot identify a domestic race: require region=central/local and a 12-digit race_id")
     return region, identifier
+
+
+def _corner_json(value, field: str):
+    if isinstance(value, str):
+        def object_pairs(pairs):
+            result = {}
+            for key, item in pairs:
+                if key in result:
+                    raise ValueError("duplicate object key")
+                result[key] = item
+            return result
+        try:
+            return json.loads(value, object_pairs_hook=object_pairs)
+        except (ValueError, RecursionError) as exc:
+            raise ValueError(f"{field}: invalid JSON ({exc})") from exc
+    return value
+
+
+def _corners(raw: Mapping, *, completed: bool, region: str) -> dict:
+    """Keep optional passage ranks separate from malformed or unknown labels.
+
+    The scraper's explicit positions are ranks, including a shared leading rank
+    for parallel groups. A corner-table horse-number list is never accepted as
+    this mapping. Two unlabelled observations do not establish corners 3 and 4.
+    """
+    empty = {"corner_positions": {}, "corner_sequence": [], "corner_labels": None,
+             "optional_parse_warnings": []}
+    if not completed:
+        return empty
+    warnings = empty["optional_parse_warnings"]
+    positions, sequence, labels = {}, [], None
+    value = raw.get("corner_positions")
+    if _text(value) is not None:
+        try:
+            value = _corner_json(value, "corner_positions")
+            if not isinstance(value, Mapping):
+                raise ValueError("corner_positions: expected an object of corner-number/rank pairs")
+            for key, rank in value.items():
+                if type(key) not in (str, int) or str(key) not in {"1", "2", "3", "4"}:
+                    raise ValueError("corner_positions: corner numbers must be 1 through 4")
+                key = str(key)
+                if key in positions:
+                    raise ValueError("corner_positions: duplicate corner number")
+                if type(rank) is not int or rank <= 0:
+                    raise ValueError("corner_positions: ranks must be positive integers")
+                positions[key] = rank
+        except (ValueError, TypeError) as exc:
+            positions = {}
+            warnings.append(str(exc))
+    order = _text(raw.get("corner_order"))
+    if order is not None:
+        if isinstance(raw.get("corner_order"), bool) or not re.fullmatch(r"[1-9][0-9]*(?:\s*-\s*[1-9][0-9]*){0,3}", order):
+            warnings.append("corner_order: expected one through four positive integer ranks separated by hyphens")
+        else:
+            try:
+                sequence = [int(part.strip()) for part in order.split("-")]
+            except ValueError:
+                warnings.append("corner_order: rank is outside the supported integer range")
+    explicit_labels = _text(raw.get("corner_order_corners")) is not None
+    labels_invalid = False
+    if explicit_labels:
+        try:
+            value = _corner_json(raw.get("corner_order_corners"), "corner_order_corners")
+            if (not isinstance(value, list) or not 1 <= len(value) <= 4
+                    or any(type(corner) is not int or corner not in (1, 2, 3, 4) for corner in value)
+                    or len(value) != len(set(value))):
+                raise ValueError("corner_order_corners: expected unique integer corner numbers from 1 through 4")
+            if len(value) != len(sequence):
+                raise ValueError("corner_order_corners: label count does not match the passage ranks")
+            labels = value
+        except (ValueError, TypeError) as exc:
+            labels_invalid = True
+            warnings.append(str(exc))
+            # Bad explicit labels must not silently become inferred labels.
+            sequence = []
+    elif region == "central" and len(sequence) == 4:
+        labels = [1, 2, 3, 4]
+    if positions:
+        if labels is not None and any(str(corner) in positions and positions[str(corner)] != rank
+                                      for corner, rank in zip(labels, sequence)):
+            warnings.append("corner_conflict: explicit corner_positions and labelled corner_order disagree; passage ranks are unknown")
+            return empty
+        labels = sorted(int(corner) for corner in positions)
+        sequence = [positions[str(corner)] for corner in labels]
+        positions = {str(corner): positions[str(corner)] for corner in labels}
+    elif labels is not None:
+        ordered = sorted(zip(labels, sequence))
+        labels = [corner for corner, _ in ordered]
+        sequence = [rank for _, rank in ordered]
+    elif labels_invalid:
+        labels = None
+    return {"corner_positions": positions, "corner_sequence": sequence, "corner_labels": labels,
+            "optional_parse_warnings": warnings}
 
 
 def normalize_row(raw: Mapping, page: str = "results") -> dict:
@@ -180,6 +274,7 @@ def normalize_row(raw: Mapping, page: str = "results") -> dict:
         "carried_weight_kg": _numeric(raw.get("carried_weight_kg"), "carried_weight_kg", positive=True),
         "finish_position": position, "finish_status": status, "course": course,
         **times,
+        **_corners(raw, completed=completed, region=region),
         "surface": surface, "distance_m": distance,
         "declared_field_size": _numeric(raw.get("race_declared_field_size"), "race_declared_field_size",
                                          integer=True, positive=True),
@@ -188,6 +283,21 @@ def normalize_row(raw: Mapping, page: str = "results") -> dict:
         "popularity": _numeric(raw.get("popularity"), "popularity", integer=True, positive=True),
         "snapshot_id": _text(raw.get("snapshot_id")),
     }
+
+
+def _sanitize_race_corners(rows: list[dict]) -> list[dict]:
+    """Discard only optional passage data when its rank exceeds known starters."""
+    active = sum(row["finish_status"] not in ("scratched", "excluded") for row in rows)
+    changed = []
+    for row in rows:
+        ranks = list(row["corner_positions"].values()) + row["corner_sequence"]
+        invalid = sorted({rank for rank in ranks if rank > active})
+        if invalid:
+            row.update(corner_positions={}, corner_sequence=[], corner_labels=None)
+            row["optional_parse_warnings"].append(
+                f"corner_field_size: passage ranks {invalid} exceed the active race field size {active}; passage ranks are unknown")
+            changed.append(row)
+    return changed
 
 
 def _race_problems(rows: list[dict]) -> list[str]:
@@ -245,7 +355,25 @@ def ingest_csv(source: Path, database: Path, report=None) -> dict:
         """)
         total, imported = 0, 0
         regions, groups, statuses, missing = Counter(), Counter(), Counter(), Counter()
+        optional_warning_counts, optional_warning_examples = Counter(), {}
+        optional_warning_rows = 0
         batch, issues, seen, races = [], [], [], set()
+
+        def record_optional_warnings(row, added=None):
+            nonlocal optional_warning_rows
+            messages = row["optional_parse_warnings"] if added is None else added
+            if not messages:
+                return
+            if len(messages) == len(row["optional_parse_warnings"]):
+                optional_warning_rows += 1
+            for message in messages:
+                optional_warning_counts[message.split(":", 1)[0]] += 1
+            key = row["region"], row["race_id"], row["horse_id"]
+            if key in optional_warning_examples or len(optional_warning_examples) < 30:
+                optional_warning_examples[key] = {
+                    "region": row["region"], "race_id": row["race_id"], "horse_id": row["horse_id"],
+                    "warnings": row["optional_parse_warnings"].copy(),
+                }
 
         def flush():
             try:
@@ -286,8 +414,9 @@ def ingest_csv(source: Path, database: Path, report=None) -> dict:
                     imported += 1
                     groups[normalized["group_name"]] += 1
                     for key, value in normalized.items():
-                        if value is None:
+                        if value is None or (key in _CORNER_FIELDS and not value):
                             missing[key] += 1
+                    record_optional_warnings(normalized)
                     batch.append((region, identifier, normalized["day"], normalized["horse_id"],
                                   normalized["horse_number"], normalized["group_name"],
                                   json.dumps(normalized, ensure_ascii=False, allow_nan=False)))
@@ -314,6 +443,17 @@ def ingest_csv(source: Path, database: Path, report=None) -> dict:
             if key is not None:
                 db.executemany("INSERT OR IGNORE INTO race_issues VALUES (?,?,?)",
                                ((key[0], key[1], reason) for reason in _race_problems(values)))
+                prior_missing = {
+                    row["horse_id"]: {field for field in _CORNER_FIELDS if not row[field]}
+                    for row in values
+                }
+                for changed in _sanitize_race_corners(values):
+                    for field in _CORNER_FIELDS - prior_missing[changed["horse_id"]]:
+                        missing[field] += 1
+                    record_optional_warnings(changed, changed["optional_parse_warnings"][-1:])
+                    db.execute("UPDATE input_rows SET payload_json=? WHERE region=? AND race_id=? AND horse_id=?",
+                               (json.dumps(changed, ensure_ascii=False, allow_nan=False),
+                                changed["region"], changed["race_id"], changed["horse_id"]))
 
         for row in cursor:
             key = row["region"], row["race_id"]
@@ -353,6 +493,10 @@ def ingest_csv(source: Path, database: Path, report=None) -> dict:
             "period": {"start_date": period[0], "end_date": period[1], "days": period[2]},
             "regions": dict(regions), "groups": dict(groups), "finish_status": dict(statuses),
             "missing_values": dict(missing), "month_group_counts": month_group_counts,
+            "rows_with_optional_parse_warnings": optional_warning_rows,
+            "optional_parse_warning_counts": dict(optional_warning_counts),
+            "optional_parse_warnings": list(optional_warning_examples.values()),
+            "optional_parse_warnings_truncated": optional_warning_rows > len(optional_warning_examples),
         }
         db.commit()
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")

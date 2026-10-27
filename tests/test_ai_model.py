@@ -87,7 +87,7 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(group['test']['rows'],400)
             self.assertEqual(group['test']['races'],40)
             comparison=group['validation_comparison']
-            self.assertEqual(set(comparison),{'baseline','enhanced'})
+            self.assertEqual(set(comparison),{'baseline','form','enhanced'})
             self.assertLessEqual(group['validation']['race_log_loss'],comparison['baseline']['metrics']['race_log_loss'])
             self.assertEqual(group['validation']['race_log_loss'],min(item['metrics']['race_log_loss'] for item in comparison.values()))
             original=joblib.load(root/'model/central_flat.joblib')

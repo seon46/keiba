@@ -34,8 +34,8 @@ def feature_revision():
 
 
 def feature_sets():
-    from .features import BASE_FEATURE_NAMES, FEATURE_NAMES
-    return {'baseline': list(BASE_FEATURE_NAMES), 'enhanced': list(FEATURE_NAMES)}
+    from .features import BASE_FEATURE_NAMES, FORM_FEATURE_NAMES, FEATURE_NAMES
+    return {'baseline': list(BASE_FEATURE_NAMES), 'form': list(FORM_FEATURE_NAMES), 'enhanced': list(FEATURE_NAMES)}
 
 
 def select_feature_columns(bundle):
@@ -128,7 +128,7 @@ def train(database: Path, output: Path, *, validation_start='2025-01-01', test_s
         raise ValueError('threadsとiterationsは1以上にしてください。')
     profiles = feature_sets()
     if feature_set not in ('auto', *profiles):
-        raise ValueError('feature_setはauto/baseline/enhancedで指定してください。')
+        raise ValueError('feature_setはauto/baseline/form/enhancedで指定してください。')
     requested = list(profiles) if feature_set == 'auto' else [feature_set]
     report = report or (lambda **message: None)
     connection = readonly(database)

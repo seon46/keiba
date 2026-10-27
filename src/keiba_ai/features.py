@@ -30,7 +30,7 @@ BASE_FEATURE_NAMES = (
     "trainer_prior_starts", "trainer_prior_win_rate", "trainer_prior_top3_rate", "trainer_id_missing",
     "horse_top3_rate_vs_field", "horse_recent5_rank_vs_field",
 )
-FEATURE_NAMES = BASE_FEATURE_NAMES + (
+FORM_FEATURE_NAMES = BASE_FEATURE_NAMES + (
     "horse_group_recent5_speed_mps", "horse_group_previous_speed_mps",
     "horse_group_recent5_winner_gap_per_km", "horse_group_previous_winner_gap_per_km",
     "horse_group_recent5_mean_time_gap_per_km", "horse_group_previous_mean_time_gap_per_km",
@@ -40,6 +40,15 @@ FEATURE_NAMES = BASE_FEATURE_NAMES + (
     "horse_course_surface_starts", "horse_course_surface_top3_rate",
     "horse_surface_distance_starts", "horse_surface_distance_top3_rate",
     "horse_course_surface_distance_starts", "horse_course_surface_distance_top3_rate",
+)
+FEATURE_NAMES = FORM_FEATURE_NAMES + (
+    "horse_group_recent5_first_corner_fraction", "horse_group_previous_first_corner_fraction",
+    "horse_group_recent5_last_corner_fraction", "horse_group_previous_last_corner_fraction",
+    "horse_group_recent5_observed_corner_gain", "horse_group_previous_observed_corner_gain",
+    "horse_group_recent5_third_to_fourth_gain", "horse_group_previous_third_to_fourth_gain",
+    "horse_group_recent5_fourth_to_finish_gain", "horse_group_previous_fourth_to_finish_gain",
+    "horse_group_recent5_corner_leading_rate", "horse_group_recent5_corner_front_rate",
+    "horse_group_recent5_corner_starts", "opponents_recent5_corner_front_rate",
 )
 CATEGORICAL_FEATURES = ("course_code", "surface_code", "sex_code")
 
@@ -105,6 +114,66 @@ def _aptitude_keys(row: dict, group: str) -> tuple[tuple | None, tuple | None, t
     combined_key = ((group, horse, course, surface, band)
                     if course_key is not None and band is not None else None)
     return course_key, distance_key, combined_key
+
+
+def _corner_form(row: dict, size: int, finish_position: int | None) -> dict:
+    """Summarize one completed historical run without inventing corner labels.
+
+    NAR parallel groups use their supplied leading rank. It is a position in
+    the field, not a claim that horses within the group have a known order.
+    Unlabelled observations support first/last summaries only.
+    """
+    names = ("first_corner_fraction", "last_corner_fraction", "observed_corner_gain",
+             "third_to_fourth_gain", "fourth_to_finish_gain", "corner_leading", "corner_front")
+    missing = dict.fromkeys(names)
+    if finish_position is None:
+        return missing
+
+    def valid_rank(value):
+        rank = _number(value)
+        return int(rank) if rank is not None and rank.is_integer() and 1 <= rank <= size else None
+
+    positions = row.get("corner_positions")
+    labelled = {}
+    if isinstance(positions, dict) and positions:
+        for label, value in positions.items():
+            number = _number(label)
+            rank = valid_rank(value)
+            if number is None or not number.is_integer() or not 1 <= number <= 4 or rank is None:
+                return missing
+            if int(number) in labelled:
+                return missing
+            labelled[int(number)] = rank
+        sequence = [labelled[label] for label in sorted(labelled)]
+    else:
+        observations = row.get("corner_sequence")
+        if not isinstance(observations, list) or not observations:
+            return missing
+        sequence = [valid_rank(value) for value in observations]
+        if any(value is None for value in sequence):
+            return missing
+        labels = row.get("corner_labels")
+        if labels is not None:
+            if not isinstance(labels, list) or len(labels) != len(sequence):
+                return missing
+            for label, value in zip(labels, sequence):
+                number = _number(label)
+                if number is None or not number.is_integer() or not 1 <= number <= 4 or int(number) in labelled:
+                    return missing
+                labelled[int(number)] = value
+            # Explicit corner labels establish order; the input need not have
+            # been serialized in corner-number order.
+            sequence = [labelled[label] for label in sorted(labelled)]
+    denominator = max(size - 1, 1)
+    first = (sequence[0] - 1) / denominator
+    return dict(
+        first_corner_fraction=first,
+        last_corner_fraction=(sequence[-1] - 1) / denominator,
+        observed_corner_gain=(sequence[0] - sequence[-1]) / denominator if len(sequence) >= 2 else None,
+        third_to_fourth_gain=(labelled[3] - labelled[4]) / denominator if 3 in labelled and 4 in labelled else None,
+        fourth_to_finish_gain=(labelled[4] - finish_position) / denominator if 4 in labelled else None,
+        corner_leading=float(sequence[0] == 1), corner_front=float(first <= .25),
+    )
 
 
 def _day(value) -> date:
@@ -176,6 +245,13 @@ class _Run:
     mean_time_gap_per_km: float | None = None
     last3f_seconds: float | None = None
     last3f_vs_mean: float | None = None
+    first_corner_fraction: float | None = None
+    last_corner_fraction: float | None = None
+    observed_corner_gain: float | None = None
+    third_to_fourth_gain: float | None = None
+    fourth_to_finish_gain: float | None = None
+    corner_leading: float | None = None
+    corner_front: float | None = None
 
 
 def _append_recent(recent: deque, run: _Run) -> deque:
@@ -254,7 +330,8 @@ class HistoryState:
                        mean_time_gap_per_km=((time_value - mean_time) * 1000 / distance
                                              if time_value is not None and mean_time is not None and distance is not None else None),
                        last3f_seconds=section,
-                       last3f_vs_mean=section - mean_section if section is not None and mean_section is not None else None)
+                       last3f_vs_mean=section - mean_section if section is not None and mean_section is not None else None,
+                       **_corner_form(row, size, position))
             updates.append((row, run))
         # Validate every outcome before mutating any aggregate.
         for row, run in updates:
@@ -333,6 +410,13 @@ def race_features(race: list[dict], histories: HistoryState) -> list[list[float 
                                (histories.course_surface, histories.surface_distance, histories.course_surface_distance)):
             aggregate = lookup.get(key, empty) if key is not None else empty
             vector.extend((float(aggregate.starts), aggregate.top3 / aggregate.starts if aggregate.starts else None))
+        for name in ("first_corner_fraction", "last_corner_fraction", "observed_corner_gain",
+                     "third_to_fourth_gain", "fourth_to_finish_gain"):
+            vector.extend((_mean(getattr(run, name) for run in timed_recent),
+                           getattr(group_previous, name) if group_previous else None))
+        vector.extend((_mean(run.corner_leading for run in timed_recent),
+                       _mean(run.corner_front for run in timed_recent),
+                       float(sum(run.first_corner_fraction is not None for run in timed_recent)), None))
         vectors.append(vector)
     # Relative form uses only opponents' already-causal histories.
     for source, destination in (("horse_prior_top3_rate", "horse_top3_rate_vs_field"),
@@ -343,6 +427,10 @@ def race_features(race: list[dict], histories: HistoryState) -> list[list[float 
         for vector in vectors:
             if mean is not None and vector[source_index] is not None:
                 vector[destination_index] = vector[source_index] - mean
+    front_index = FEATURE_NAMES.index("horse_group_recent5_corner_front_rate")
+    opponent_index = FEATURE_NAMES.index("opponents_recent5_corner_front_rate")
+    for index, vector in enumerate(vectors):
+        vector[opponent_index] = _mean(other[front_index] for number, other in enumerate(vectors) if number != index)
     return vectors
 
 
