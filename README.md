@@ -468,6 +468,22 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 
 予測CSVにも `day_bias_races`、前・内の傾向値、採用特徴量、`intraday_bias_used`、`bias_prior_only`、設定ID、当日入力CSVのSHA-256を記録します。区分ごとに `auto` が旧特徴量を採用した場合、当日結果は順位予測へ影響しません。
 
+## v3実験：現行の順位モデル（M0）とLightGBM＋Plackett–Luce（M1）の比較
+
+`keiba_ai.experiment_v3` は、prepare済みの `features.sqlite3` をそのまま使い、2つの順位モデルを同じ条件で比較します。既存の学習・予測コマンドは変更しません。
+
+- 特徴量：`context` の96項目から、過去走のオッズ・人気由来の7項目を除いた89項目。当日バイアス（人気基準のv1）も使いません。
+- M0：現行の `train_rank` と同じ方式（順位比の回帰＋温度0.1/0.2/0.4）。
+- M1：LightGBMで、レース内の着順のPlackett–Luce尤度を直接最適化します。木の本数は学習期間の最後の2か月で早期終了して決め、検証年は使いません。完走確率もLightGBMで学習します。段の重みは `all`（全着順）と `top5`（上位5着まで）を比較します。
+- 検証：2022年4月以降で学習し、2023・2024・2025年をそれぞれ検証年にする3つのfoldで評価します（2021年10月〜2022年3月は履歴の構築だけに使います）。2026年以降の最終評価期間は読みません。
+- 指標：各foldの `race_outcome_log_loss`（小さいほど良い）。`summary` にfold平均と、M1がM0より全foldで良いかを記録します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3 --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3_m0_m1 --threads 2
+```
+
+結果は `data\exp_v3_m0_m1\experiment.json` に保存されます。`lightgbm` が必要なので、初回は `scripts\setup-ml.ps1` を実行してください。
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
