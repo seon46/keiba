@@ -484,6 +484,22 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 
 結果は `data\exp_v3_m0_m1\experiment.json` に保存されます。`lightgbm` が必要なので、初回は `scripts\setup-ml.ps1` を実行してください。
 
+## v3実験B：段ごとの温度・中央地方の統合モデル・LightGBMの調整
+
+`keiba_ai.experiment_v3b` は、v3実験のM1（LightGBM＋PL、全着順）を起点に、次の3点を同じ3つの検証foldで比較します。
+
+- 構造：区分ごとのモデル（`separate`）と、中央平地・地方平地をまとめた1つのモデル（`pooled`、`is_central` を特徴量に追加）。
+- ハイパーパラメータ：既定値と、Optunaによる探索（構造も探索の対象）。探索の目的関数は、検証年の着順のPL負の対数尤度の平均です（サンプリング不要で速い）。最初の2試行は既定値です。
+- 温度：1つの温度と、1着・2着・3着・4着以降で別々の温度。どちらも学習期間末尾の早期終了用2か月で最尤推定し、検証年は使いません。
+
+各設定をレース単位で採点し、`separate_default/single_t`（前回のM1に相当）との差を、レース単位の対応のあるブートストラップで95%区間付きで出します。レース単位の損失は `race_losses.csv` に保存します。2026年以降は読みません。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3b --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3b --threads 2 --tuning-trials 20 --tuning-hours 4
+```
+
+`lightgbm` と `optuna` が必要なので、初回は `scripts\setup-ml.ps1` を実行してください。`--tuning-trials 0` にすると調整を省いて温度と構造だけを比較します。
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
