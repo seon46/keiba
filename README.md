@@ -514,6 +514,21 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3c --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3c --threads 2
 ```
 
+## v3実験D：馬の強さから騎手の腕を分離する
+
+`keiba_ai.experiment_v3d` は、これまでで最も良い設定（区分ごとのLightGBM＋PL、調整済みパラメータ、4段の温度、地方は今回の馬体重も使用）を基準に、騎手の扱い方を比べます。
+
+1. 騎手の特徴量を使わない馬の強さモデル `f0` を学習します。
+2. 検証年より前のレースは、四半期ごとに3つに分けたクロスフィッティングで強さを予測し、自分を学習に使ったモデルで自分の強さを予測しないようにします。
+3. その強さをオフセットにしたPL尤度で、騎手ごとの上乗せ θ を日ごとに逐次推定します（半減期365日の長期版と90日の短期版）。各行には、その日より前の状態だけを使います。
+4. 比較する4つの設定：`base`（今の騎手の通算率）、`nojockey`（騎手情報なし）、`theta_feature`（通算率の代わりに θ 由来の特徴量）、`theta_offset`（θ をオフセットとして馬の強さを学習し、予測は f＋γθ）。
+
+温度と γ は早期終了用の期間で推定し、検証年は使いません。基準との差を、レース単位の対応のあるブートストラップで95%区間付きで出します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3d --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3d --threads 2
+```
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
