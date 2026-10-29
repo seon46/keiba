@@ -500,6 +500,20 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 
 `lightgbm` と `optuna` が必要なので、初回は `scripts\setup-ml.ps1` を実行してください。`--tuning-trials 0` にすると調整を省いて温度と構造だけを比較します。
 
+## v3実験C：発走前に公表される今回の馬体重・馬場状態
+
+`keiba_ai.experiment_v3c` は、v3実験Bで最も良かった設定（区分ごとのLightGBM＋PL、調整済みパラメータ、4段の温度）を基準に、発走前に公表される値から作る特徴量の効果を測ります。
+
+- `weight`：今回の馬体重と増減、直近5走の平均との差、普段の増減幅との差、斤量÷馬体重、休み明けでの増減、レース内での馬体重・増減の比較（8項目）。
+- `going`：今回の馬場状態と天候、重・不良かどうか、今回と同じ馬場区分（良・稍重／重・不良）での本人の出走数と3着内率、前走からの馬場の変化（6項目）。
+- `both`：両方。
+
+今回レースの着順・時計・通過順・オッズ・人気・水分量は読みません。発表値が取れない場合に備え、学習期間ではレースごとに5%の確率でこれらの値を欠損にして学習します（`--announce-dropout`）。基準（`base`）との差を、レース単位の対応のあるブートストラップで95%区間付きで出します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3c --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3c --threads 2
+```
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
