@@ -1,0 +1,200 @@
+"""Causal speed figures: track-variant and class-aware standard times (design 6.2 A).
+
+Times are handled as pace p = seconds per 1000 m.  For each race the
+reference pace is the mean pace of its first three finishers.
+
+* Standard pace S[course, surface, distance]          (class-free; used for figures)
+* Standard pace S[course, surface, distance, class]   (used only to measure the day)
+* Day variant V[day, course, surface] = shrunken median over that day's races
+  of (race pace - class standard).  A fast or slow track moves every race of
+  the day; a day of weak classes does not, because classes have own standards.
+
+The figure of a finisher is ``-(p_i - S - V) + weight_coef * (carried - ref)``
+in seconds per km (positive = faster than standard).  Everything for day d is
+computed only after all of day d's feature rows were emitted, so a row only
+sees figures from earlier days.  Standards use exponential averaging that
+starts as a running mean.
+"""
+from __future__ import annotations
+
+from collections import defaultdict, deque
+import math
+
+SPEED_FEATURES = (
+    'speed_fig_previous', 'speed_fig_recent5_mean', 'speed_fig_recent5_best', 'speed_fig_same_surface_band_best',
+    'speed_fig_trend', 'speed_fig_count', 'speed_fig_wet_best',
+    'speed_fig_mean_race_z', 'speed_fig_best_race_z', 'speed_fig_best_minus_field_max', 'speed_fig_field_top3_mean',
+)
+_WET = {'重', '不良'}
+
+
+class _Average:
+    __slots__ = ('value', 'count')
+
+    def __init__(self):
+        self.value, self.count = None, 0
+
+    def update(self, observation, alpha):
+        self.count += 1
+        if self.value is None:
+            self.value = observation
+        else:
+            self.value += max(alpha, 1.0 / self.count) * (observation - self.value)
+
+
+def _number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _z(values):
+    known = [value for value in values if value is not None]
+    if len(known) < 2:
+        return [None] * len(values)
+    mean = sum(known) / len(known)
+    spread = math.sqrt(sum((value - mean) ** 2 for value in known) / len(known))
+    return [None if value is None else (0.0 if spread == 0 else (value - mean) / spread) for value in values]
+
+
+def speed_feature_rows(races, *, alpha=.03, class_min_races=5, weight_coef=.12, reference_weight=55.0,
+                       history_length=10):
+    """``races``: iterable of race row lists in day order (one list per race).
+
+    Each row dict needs: day, race_id, horse_id, course, surface, distance_m,
+    finish_status, finish_position, time_seconds, race_class, track_condition,
+    carried_weight_kg.  Returns {(race_id, horse_id): tuple(SPEED_FEATURES order)}
+    and diagnostics.
+    """
+    standard = defaultdict(_Average)        # (course, surface, distance)
+    class_standard = defaultdict(_Average)  # (course, surface, distance, class)
+    history = defaultdict(lambda: deque(maxlen=history_length))  # horse -> (figure, surface, band, wet)
+    counts = defaultdict(int)
+    output = {}
+    variants = []
+    pending_day, pending = None, []
+
+    def flush(day_races):
+        by_track = defaultdict(list)
+        measured = []
+        for race in day_races:
+            first = race[0]
+            distance = _number(first.get('distance_m'))
+            if not distance:
+                continue
+            finishers = []
+            for row in race:
+                time, position = _number(row.get('time_seconds')), _number(row.get('finish_position'))
+                if row.get('finish_status') == 'finished' and time and position:
+                    finishers.append((position, time / distance * 1000, row))
+            if len(finishers) < 3:
+                continue
+            finishers.sort(key=lambda item: item[0])
+            pace = sum(item[1] for item in finishers[:3]) / 3
+            track = (first.get('course'), first.get('surface'))
+            key = (*track, distance)
+            class_key = (*key, first.get('race_class') or '?')
+            reference = class_standard[class_key] if class_standard[class_key].count >= class_min_races else standard[key]
+            if reference.value is not None:
+                by_track[track].append(pace - reference.value)
+            measured.append((track, key, class_key, pace, finishers, first))
+        variant = {}
+        for track, residuals in by_track.items():
+            residuals = sorted(residuals)
+            middle = len(residuals) // 2
+            median = residuals[middle] if len(residuals) % 2 else (residuals[middle - 1] + residuals[middle]) / 2
+            variant[track] = median * len(residuals) / (len(residuals) + 1)
+            variants.append(variant[track])
+        for track, key, class_key, pace, finishers, first in measured:
+            shift = variant.get(track, 0.0)
+            baseline = standard[key].value
+            wet = first.get('track_condition') in _WET
+            band = int(_number(first.get('distance_m')) // 400)
+            if baseline is not None:
+                for _, horse_pace, row in finishers:
+                    carried = _number(row.get('carried_weight_kg'))
+                    figure = -(horse_pace - baseline - shift)
+                    if carried is not None:
+                        figure += weight_coef * (carried - reference_weight)
+                    horse = row['horse_id']
+                    history[horse].append((figure, first.get('surface'), band, wet))
+                    counts[horse] += 1
+            standard[key].update(pace - shift, alpha)
+            class_standard[class_key].update(pace - shift, alpha)
+
+    for race in races:
+        day = race[0]['day']
+        if pending_day is not None and day != pending_day:
+            flush(pending)
+            pending = []
+        pending_day = day
+        first = race[0]
+        distance = _number(first.get('distance_m'))
+        band = int(distance // 400) if distance else None
+        surface = first.get('surface')
+        vectors = []
+        for row in race:
+            past = history.get(row['horse_id'])
+            figures = [item[0] for item in past] if past else []
+            recent = figures[-5:]
+            same = [item[0] for item in past or () if item[1] == surface and item[2] == band]
+            wet = [item[0] for item in past or () if item[3]]
+            vectors.append([
+                recent[-1] if recent else None,
+                sum(recent) / len(recent) if recent else None,
+                max(recent) if recent else None,
+                max(same) if same else None,
+                recent[-1] - sum(recent[:-1]) / len(recent[:-1]) if len(recent) >= 2 else None,
+                float(counts.get(row['horse_id'], 0)),
+                max(wet) if wet else None,
+            ])
+        means, bests = [vector[1] for vector in vectors], [vector[2] for vector in vectors]
+        mean_z, best_z = _z(means), _z(bests)
+        known_best = sorted((value for value in bests if value is not None), reverse=True)
+        top3 = sum(known_best[:3]) / len(known_best[:3]) if known_best else None
+        for index, (row, vector) in enumerate(zip(race, vectors)):
+            others = [value for other, value in enumerate(bests) if other != index and value is not None]
+            output[(row['race_id'], row['horse_id'])] = tuple(vector + [
+                mean_z[index], best_z[index],
+                bests[index] - max(others) if bests[index] is not None and others else None, top3])
+        pending.append(race)
+    if pending:
+        flush(pending)
+    diagnostics = dict(standards=len(standard), class_standards=len(class_standard),
+                       variant_days=len(variants),
+                       variant_abs_mean=sum(abs(value) for value in variants) / len(variants) if variants else None)
+    return output, diagnostics
+
+
+def load_speed_block(database, group, identities):
+    """Speed features aligned to ``identities`` (race_id, horse_id, horse_number)."""
+    import json
+    import numpy as np
+    from itertools import groupby
+    from .model import readonly
+    fields = ('course', 'surface', 'distance_m', 'finish_status', 'finish_position', 'time_seconds', 'race_class',
+              'track_condition', 'carried_weight_kg')
+    connection = readonly(database)
+    try:
+        cursor = connection.execute(
+            'SELECT f.day,f.race_id,f.horse_id,p.payload_json FROM features f JOIN input_rows p '
+            'ON p.region=f.region AND p.race_id=f.race_id AND p.horse_id=f.horse_id WHERE f.group_name=? '
+            'ORDER BY f.day,f.region,f.race_id,f.horse_number', (group,))
+
+        def rows():
+            for day, race, horse, payload in cursor:
+                values = json.loads(payload)
+                yield dict({key: values.get(key) for key in fields}, day=day, race_id=race, horse_id=horse)
+
+        races = (list(race) for _, race in groupby(rows(), key=lambda row: (row['day'], row['race_id'])))
+        table, diagnostics = speed_feature_rows(races)
+    finally:
+        connection.close()
+    block = np.full((len(identities), len(SPEED_FEATURES)), np.nan, dtype=np.float32)
+    for index, (race, horse, _) in enumerate(identities):
+        values = table.get((race, horse))
+        if values is not None:
+            block[index] = [np.nan if value is None else value for value in values]
+    return block, diagnostics
