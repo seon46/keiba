@@ -19,7 +19,9 @@ features of experiment C).  For each validation year Y:
    ``theta_feature`` theta-based jockey features instead of the rates (plan B),
    ``theta_offset``  f0 features, theta as a fixed offset while fitting; the
                      prediction is f + gamma * theta, gamma fitted on the
-                     early-stopping period (plan A).
+                     early-stopping period (plan A),
+   ``rates_theta``   the current jockey rates *and* the theta features (the
+                     rates also carry the stable's choice of jockey).
 
 Temperatures and gamma are fitted on the early-stopping period, never on the
 validation year.  The final-test period is never read.
@@ -45,7 +47,7 @@ STAGE_COUNT = 4
 JOCKEY_RATE_FEATURES = ('jockey_prior_starts', 'jockey_prior_win_rate', 'jockey_prior_top3_rate', 'jockey_id_missing')
 THETA_FEATURES = ('jockey_theta', 'jockey_theta_sd', 'jockey_theta_recent', 'jockey_theta_vs_previous',
                   'jockey_theta_race_z', 'jockey_rides_with_horse', 'jockey_prior_starts')
-VARIANTS = ('base', 'nojockey', 'theta_feature', 'theta_offset')
+VARIANTS = ('base', 'nojockey', 'theta_feature', 'theta_offset', 'rates_theta')
 WEIGHT_GROUPS = ('local_flat',)
 
 
@@ -234,7 +236,7 @@ def _quarter_block(days, blocks=3):
 # Experiment
 # --------------------------------------------------------------------------
 
-def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEARS, train_start='2022-04-01',
+def run_experiment(database, output, *, variants=VARIANTS, validation_years=DEFAULT_VALIDATION_YEARS, train_start='2022-04-01',
                    test_start='2026-01-01', stop_months=2, threads=2, rounds=8000, patience=150,
                    half_life=365.0, short_half_life=90.0, prior_sd=.3, crossfit_blocks=3,
                    announce_dropout=.05, evaluation_samples=1024, seed=42, report=None):
@@ -254,6 +256,8 @@ def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEAR
     for value in (train_start, test_start):
         if date.fromisoformat(value).isoformat() != value:
             raise ValueError('日付はYYYY-MM-DDで指定してください。')
+    if 'base' not in variants or any(name not in VARIANTS for name in variants):
+        raise ValueError(f'variantsには base を含め、{list(VARIANTS)} から指定してください。')
     connection = readonly(database)
     try:
         metadata = dict(connection.execute('SELECT key,value_json FROM ai_metadata'))
@@ -283,7 +287,7 @@ def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEAR
                                 short_half_life_days=short_half_life, prior_sd=prior_sd,
                                 crossfit_blocks=crossfit_blocks, weight_feature_groups=list(WEIGHT_GROUPS),
                                 announce_dropout=announce_dropout, evaluation_samples=evaluation_samples, seed=seed,
-                                variants=list(VARIANTS), theta_features=list(THETA_FEATURES),
+                                variants=list(variants), theta_features=list(THETA_FEATURES),
                                 baseline='base (current jockey rates)'),
                   groups={})
     output.mkdir(parents=True)
@@ -381,8 +385,11 @@ def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEAR
                         'nojockey': (no_jockey_names, [], None),
                         'theta_feature': (no_jockey_names, [(theta_block, None)], None),
                         'theta_offset': (no_jockey_names, [], theta_offset),
+                        'rates_theta': (base_names, [(theta_block, None)], None),
                     }
                     for name, (names, extra_blocks, offset) in specs.items():
+                        if name not in variants:
+                            continue
                         report(event='variant', group=group, validation_year=year, variant=name)
                         columns, categorical = columns_for(names), categorical_for(names)
                         if name == 'nojockey':
@@ -407,7 +414,7 @@ def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEAR
                                      metrics=scored['metrics'])
                         if gamma is not None:
                             entry['gamma'] = gamma
-                        if name == 'theta_feature':
+                        if name in ('theta_feature', 'rates_theta'):
                             importance = model.feature_importance(importance_type='gain', iteration=best)
                             all_names = names + weight_names + list(THETA_FEATURES)
                             order = np.argsort(-importance)
@@ -451,6 +458,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='v3実験D: 馬の強さから騎手の腕（θ）を分離して効果を測ります。')
     parser.add_argument('--dataset', required=True, type=Path, help='prepare済みのfeatures.sqlite3')
     parser.add_argument('--output-dir', required=True, type=Path, help='新しい出力先（既存は不可）')
+    parser.add_argument('--variants', nargs='+', default=list(VARIANTS), choices=list(VARIANTS))
     parser.add_argument('--validation-years', nargs='+', type=int, default=list(DEFAULT_VALIDATION_YEARS))
     parser.add_argument('--train-start', default='2022-04-01')
     parser.add_argument('--test-start', default='2026-01-01')
@@ -469,7 +477,7 @@ def main(argv=None):
         emit(event='error', message='lightgbmがありません。scripts\\setup-ml.ps1 を実行してください。')
         return 2
     try:
-        result = run_experiment(args.dataset, args.output_dir, validation_years=args.validation_years,
+        result = run_experiment(args.dataset, args.output_dir, variants=args.variants, validation_years=args.validation_years,
                                 train_start=args.train_start, test_start=args.test_start, threads=args.threads,
                                 rounds=args.rounds, patience=args.patience, half_life=args.half_life,
                                 short_half_life=args.short_half_life, prior_sd=args.prior_sd,

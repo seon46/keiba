@@ -132,12 +132,13 @@ class ExperimentDTests(unittest.TestCase):
             self.assertFalse(report['test_period_used'])
             for group in ('central_flat', 'local_flat'):
                 summary = report['groups'][group]['summary']
-                self.assertEqual(set(summary), {'base', 'nojockey', 'theta_feature', 'theta_offset'})
+                self.assertEqual(set(summary), {'base', 'nojockey', 'theta_feature', 'theta_offset', 'rates_theta'})
                 self.assertLess(summary['theta_offset']['race_outcome_log_loss'],
                                 summary['nojockey']['race_outcome_log_loss'])
                 fold = report['groups'][group]['folds'][0]
                 self.assertGreater(fold['variants']['theta_offset']['gamma'], .3)
                 self.assertGreater(fold['theta_summary']['theta_sd_across_validation_rows'], .1)
+                self.assertIn('theta_feature_gain_rank', fold['variants']['rates_theta'])
 
 
 if __name__ == '__main__':
