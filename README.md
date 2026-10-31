@@ -546,6 +546,18 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3e --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3e --threads 2
 ```
 
+## v3実験F：指数＋騎手θの組み合わせと、レース内の相対化
+
+`keiba_ai.experiment_v3f` は、実験Eの `speed`（指数あり）を基準に比べます。
+
+- `speed_rel`（両区分）：主要な能力の列（時計差、上がり、4角位置、コース・距離適性、騎手・調教師の3着内率、斤量、年齢、間隔、指数）について、同じレース内でのz値と順位を追加します（32項目）。同じレースの、すでに因果的な列だけを使います。
+- `speed_theta`（地方のみ）：騎手の通算率に加えて、騎手θの特徴量を追加します。θ用の馬の強さは、騎手特徴量なし・指数ありのモデルを四半期ブロックでクロスフィッティングして求めます。
+- `speed_theta_rel`（地方のみ）：両方。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3f --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3f --threads 2
+```
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
