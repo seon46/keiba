@@ -558,6 +558,20 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3f --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3f --threads 2
 ```
 
+## v3実験G：馬のレーティングと、相手の強さを考慮した成績
+
+`keiba_ai.ratings` は、馬ごとの多人数レーティングを着順から日ごとに更新します（騎手θと同じPLのオンライン推定を、馬に当てはめたもの。半減期240日）。各行には、その日より前のレーティングだけを使います。
+
+- レース前のレーティング、その不確かさ、短期版、レース内のz値、相手の最高との差、上位3頭の平均。
+- 過去走の相手の強さ：その過去走の相手のレーティング平均（直近5走平均・前走）と、今回の相手との差（相手関係の上がり下がり）。
+- 期待以上の走り（surprise）：相手のレーティングから求めた期待着順と実際の着順の差（直近5走平均・前走）。
+
+`keiba_ai.experiment_v3g` は、これまでの最良設定（中央は指数あり、地方は指数＋騎手θ）にこれらを加えて比べます。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3g --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3g --threads 2
+```
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
