@@ -572,6 +572,20 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3g --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3g --threads 2
 ```
 
+## v3実験H：段ごとの温度の推定方法
+
+`keiba_ai.experiment_v3h` は、各区分の現在の最良設定（中央：指数＋レーティング、地方：馬体重＋指数＋騎手θ＋レーティング）を1回だけ学習し、温度の推定方法だけを変えて比べます。
+
+- `stop_single` / `stop_4`（現行）/ `stop_4_shrunk`：学習期間の最後の2か月で、温度1つ・4段・4段（共通の値に強く寄せる）。
+- `stop_power`：同じ2か月で、T_j = T_1 × j^β の2パラメータ。
+- `oof_4` / `oof_6`：学習期間全体を四半期ブロックでクロスフィッティングした予測で、4段・6段。
+
+どれも検証年より前のレースだけを使い、同じ検証予測を同じ乱数で採点します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3h --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3h --threads 2
+```
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
