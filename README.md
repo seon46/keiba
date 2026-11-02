@@ -600,6 +600,31 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3i --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3i --threads 2
 ```
 
+## v3パイプライン：最良設定での学習と出馬表の予測（オッズ・トラックバイアス不使用）
+
+`keiba_ai.pipeline_v3` は、v3実験で最良だった設定で、中央平地・地方平地ごとのモデルを学習し、出馬表から各馬の順位分布を出します。
+
+- 中央平地：89項目＋スピード指数＋馬のレーティング（騎手は従来の成績率）。
+- 地方平地：上に加えて、今回の馬体重（学習時は5%のレースで隠す）と騎手θ（騎手特徴量なしの強さを四半期の交差推定で求め、それを基準に算出）。
+- 強さはLightGBM＋Plackett–Luce（調整済みパラメータ）。`train-end` の直前2か月で早期終了し、温度（1着だけ自由、2着以降は a·j^b）も同じ2か月で推定します。
+- 障害・ばんえいは対象外です（出馬表に含まれていれば飛ばします）。
+
+学習（`--train-end` を省くと、データ最終日の翌日まで全部で学習します）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 fit --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\v3_model --threads 2
+```
+
+`--train-end 2025-07-01 --evaluate-until 2026-01-01` のように指定すると、学習期間の後を評価して `model.json` と `evaluation_<区分>.csv` に保存します。2026-01-01以降（最終評価期間）の評価には `--allow-test-period` が必要です。
+
+予測（`train-end` 以降の日付のみ。履歴は予測日より前だけから作り直します）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 predict --dataset data\ml_rank_bias_v2\features.sqlite3 --model-dir data\v3_model --entries data\entries.csv --output data\v3_predictions.csv
+```
+
+出力には `rank_k_probability`（k着の確率）、`nonfinish_probability`、`win_probability`、`top3_probability`、`expected_rank_given_finish`、`strength_score` が入ります。地方で馬体重が出馬表にあれば使い、なければ空欄扱いで予測します（`bodyweight_used`）。
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。

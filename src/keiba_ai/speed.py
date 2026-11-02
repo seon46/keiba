@@ -168,11 +168,15 @@ def speed_feature_rows(races, *, alpha=.03, class_min_races=5, weight_coef=.12, 
     return output, diagnostics
 
 
-def load_speed_block(database, group, identities):
-    """Speed features aligned to ``identities`` (race_id, horse_id, horse_number)."""
+def load_speed_block(database, group, identities, *, before_day=None, extra_races=()):
+    """Speed features aligned to ``identities`` (race_id, horse_id, horse_number).
+
+    ``before_day`` keeps only stored rows of earlier days; ``extra_races`` (race
+    row lists of later days, e.g. today's entries) are appended after them.
+    """
     import json
     import numpy as np
-    from itertools import groupby
+    from itertools import chain, groupby
     from .model import readonly
     fields = ('course', 'surface', 'distance_m', 'finish_status', 'finish_position', 'time_seconds', 'race_class',
               'track_condition', 'carried_weight_kg')
@@ -181,7 +185,8 @@ def load_speed_block(database, group, identities):
         cursor = connection.execute(
             'SELECT f.day,f.race_id,f.horse_id,p.payload_json FROM features f JOIN input_rows p '
             'ON p.region=f.region AND p.race_id=f.race_id AND p.horse_id=f.horse_id WHERE f.group_name=? '
-            'ORDER BY f.day,f.region,f.race_id,f.horse_number', (group,))
+            + ('AND f.day<? ' if before_day is not None else '')
+            + 'ORDER BY f.day,f.region,f.race_id,f.horse_number', (group,) + ((before_day,) if before_day is not None else ()))
 
         def rows():
             for day, race, horse, payload in cursor:
@@ -189,7 +194,9 @@ def load_speed_block(database, group, identities):
                 yield dict({key: values.get(key) for key in fields}, day=day, race_id=race, horse_id=horse)
 
         races = (list(race) for _, race in groupby(rows(), key=lambda row: (row['day'], row['race_id'])))
-        table, diagnostics = speed_feature_rows(races)
+        extra = [[dict({key: row.get(key) for key in fields}, day=row['day'], race_id=row['race_id'],
+                       horse_id=row['horse_id']) for row in race] for race in extra_races]
+        table, diagnostics = speed_feature_rows(chain(races, extra))
     finally:
         connection.close()
     block = np.full((len(identities), len(SPEED_FEATURES)), np.nan, dtype=np.float32)
