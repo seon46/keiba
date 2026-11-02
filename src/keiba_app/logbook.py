@@ -219,6 +219,17 @@ class Logbook:
             if status is not None:
                 connection.execute('UPDATE runs SET status=?, finished_at=? WHERE id=?', (status, finished_at, identifier))
 
+    def change_token(self):
+        """Cheap fingerprint of everything the pages show from the log (changes when anything is added)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT (SELECT COALESCE(MAX(id),0) FROM predictions),(SELECT COUNT(*) FROM outcomes),"
+                "(SELECT COALESCE(MAX(scored_at),'') FROM outcomes),(SELECT COUNT(*) FROM day_races),"
+                "(SELECT COALESCE(MAX(discovered_at),'') FROM day_races),"
+                "(SELECT COALESCE(MAX(id),0)||':'||COALESCE((SELECT status||COALESCE(steps_json,'') FROM runs "
+                "ORDER BY id DESC LIMIT 1),'') FROM runs)").fetchone()
+        return '|'.join(str(value) for value in row)
+
     def runs(self, limit=20):
         with self._connect() as connection:
             rows = connection.execute('SELECT * FROM runs ORDER BY id DESC LIMIT ?', (limit,)).fetchall()

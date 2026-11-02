@@ -212,7 +212,20 @@ class Api:
         self.nightly_process = subprocess.Popen(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return dict(started=True)
 
-    GET = dict(status=status, day=day, race=race, job=job, records=records, log=log)
+    def changes(self, _query):
+        """A token that changes whenever predictions, results, day lists, runs, the state or jobs change."""
+        import hashlib
+        parts = [self.engine.logbook.change_token()]
+        for path in (self.app.state_path, self.app.home / 'nightly.lock'):
+            try:
+                parts.append(f'{path.name}:{path.stat().st_mtime_ns}')
+            except OSError:
+                parts.append(f'{path.name}:-')
+        with self.jobs.lock:
+            parts.extend(f'{job["id"]}:{job["status"]}' for job in self.jobs.jobs.values())
+        return dict(token=hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16])
+
+    GET = dict(status=status, day=day, race=race, job=job, records=records, log=log, changes=changes)
     POST = {'race/predict': predict_race, 'day/discover': discover, 'day/predict': predict_day, 'nightly': nightly}
 
 

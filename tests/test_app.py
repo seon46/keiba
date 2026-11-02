@@ -102,6 +102,7 @@ class AppTests(unittest.TestCase):
             self.assertIsNotNone(detail['results'])
             self.assertIn('summary', get('/api/records?days=all&after=1'))
             self.assertIn('state', get('/api/status'))
+            before = get('/api/changes')['token']
             page = urllib.request.urlopen(base + '/').read().decode('utf-8')
             self.assertIn('順位分布', page)
             self.assertEqual(urllib.request.urlopen(base + '/static/app.js').status, 200)
@@ -115,6 +116,7 @@ class AppTests(unittest.TestCase):
                     break
                 threading.Event().wait(.1)
             self.assertEqual(state['status'], 'done', state)
+            self.assertNotEqual(get('/api/changes')['token'], before)
         finally:
             server.shutdown()
             server.server_close()

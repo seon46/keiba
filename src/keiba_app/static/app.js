@@ -92,6 +92,29 @@ async function route() {
 }
 window.addEventListener('hashchange', route);
 
+// ---------------------------------------------------------------- live refresh
+// The page polls a small change token; when predictions, results, day lists, runs or jobs change
+// (from this device, another device or the nightly task) the current page is redrawn in place.
+let changeToken = null;
+let refreshing = false;
+async function checkChanges() {
+  if (document.visibilityState !== 'visible' || refreshing) return;
+  try {
+    const {token} = await api('changes');
+    if (changeToken !== null && token !== changeToken && !document.querySelector('select:focus, input:focus')) {
+      refreshing = true;
+      const y = window.scrollY;
+      await route();
+      window.scrollTo(0, y);
+      refreshing = false;
+    }
+    changeToken = token;
+  } catch (e) { refreshing = false; /* server restarting; try again next time */ }
+}
+checkChanges();
+setInterval(checkChanges, 5000);
+document.addEventListener('visibilitychange', checkChanges);
+
 // ---------------------------------------------------------------- day
 async function dayView(day) {
   store.set('day', day);
@@ -161,14 +184,14 @@ function alertJob(error) {
 }
 
 // ---------------------------------------------------------------- race
-const raceState = {sort: 'number', open: new Set(), selected: 0};
+const raceState = {sort: 'number', open: new Set(), selectedId: null};
 
 async function raceView(region, raceId) {
   const data = await api(`race?region=${region}&race_id=${raceId}`);
   const race = data.race;
-  if (raceState.raceId !== raceId) { raceState.raceId = raceId; raceState.open = new Set(); raceState.selected = 0; }
+  if (raceState.raceId !== raceId) { raceState.raceId = raceId; raceState.open = new Set(); raceState.selectedId = null; }
   const predictions = data.predictions;
-  const prediction = predictions[raceState.selected] || predictions[0] || null;
+  const prediction = predictions.find((p) => p.id === raceState.selectedId) || predictions[0] || null;
   const surface = race.race_surface || prediction?.surface || '';
   const course = race.race_course || prediction?.course || '';
   const number = race.race_number || prediction?.race_number || Number(raceId.slice(-2));
@@ -204,7 +227,7 @@ async function raceView(region, raceId) {
       <button type="button" id="saved">保存済みの出馬表で予想</button>
       <span class="spacer"></span>
       ${predictions.length ? `<label class="small muted">予想
-        <select id="history">${predictions.map((p, i) => `<option value="${i}" ${i === raceState.selected ? 'selected' : ''}>
+        <select id="history">${predictions.map((p) => `<option value="${p.id}" ${p === prediction ? 'selected' : ''}>
           ${timeLabel(p.created_at)}${p.timing === 'after' ? '（発走後）' : ''}${p.origin === 'nightly' ? '（自動）' : ''}</option>`).join('')}</select></label>` : ''}
     </div>
     ${notices.map((text) => `<div class="notice">${esc(text)}</div>`).join('')}
@@ -225,7 +248,7 @@ async function raceView(region, raceId) {
     : ''}`;
   view.querySelector('#refresh').addEventListener('click', () => predict(region, raceId, true));
   view.querySelector('#saved').addEventListener('click', () => predict(region, raceId, false));
-  view.querySelector('#history')?.addEventListener('change', (e) => { raceState.selected = Number(e.target.value); raceView(region, raceId); });
+  view.querySelector('#history')?.addEventListener('change', (e) => { const id = Number(e.target.value); raceState.selectedId = id === predictions[0].id ? null : id; raceView(region, raceId); });
   view.querySelectorAll('[data-sort]').forEach((th) => th.addEventListener('click', () => { raceState.sort = th.dataset.sort; raceView(region, raceId); }));
   view.querySelectorAll('tr.runner').forEach((tr) => tr.addEventListener('click', () => {
     const id = tr.dataset.horse;
@@ -239,7 +262,7 @@ async function predict(region, raceId, refresh) {
   try {
     const job = await api('race/predict', {region, race_id: raceId, refresh});
     watch(job, (done) => {
-      if (done.status === 'done') raceState.selected = 0;
+      if (done.status === 'done') raceState.selectedId = null;
       if (location.hash.includes(raceId)) raceView(region, raceId);
     });
   } catch (error) {
