@@ -316,19 +316,17 @@ def _load_bundle(model_dir, group):
     return bundle
 
 
-def _read_entries(entries):
+def entry_races(raw_rows):
+    """Validate raw entries rows (CSV/export dicts) into [(day, region, race_id, rows)] sorted by race."""
     from .dataset import normalize_row
     grouped, seen = {}, set()
-    with Path(entries).open(encoding='utf-8-sig', newline='') as file:
-        for raw in csv.DictReader(file):
-            row = normalize_row(raw, page='entries')
-            key = (row['region'], row['race_id'], row['horse_id'])
-            if key in seen:
-                raise ValueError('出馬表に同じ馬・レースの重複があります。')
-            seen.add(key)
-            grouped.setdefault((row['day'], row['region'], row['race_id']), []).append(row)
-    if not grouped:
-        raise ValueError('出馬表がありません。')
+    for raw in raw_rows:
+        row = normalize_row(raw, page='entries')
+        key = (row['region'], row['race_id'], row['horse_id'])
+        if key in seen:
+            raise ValueError('出馬表に同じ馬・レースの重複があります。')
+        seen.add(key)
+        grouped.setdefault((row['day'], row['region'], row['race_id']), []).append(row)
     races = []
     for (day, region, race_id), race in sorted(grouped.items()):
         fields = ('day', 'group_name', 'course', 'surface', 'distance_m', 'declared_field_size', 'snapshot_id')
@@ -341,6 +339,14 @@ def _read_entries(entries):
             raise ValueError(f'出馬表の頭数が不足しています: {race_id}')
         race.sort(key=lambda row: row['horse_number'])
         races.append((day, region, race_id, race))
+    return races
+
+
+def _read_entries(entries):
+    with Path(entries).open(encoding='utf-8-sig', newline='') as file:
+        races = entry_races(csv.DictReader(file))
+    if not races:
+        raise ValueError('出馬表がありません。')
     return races
 
 
@@ -551,57 +557,97 @@ def evaluate(database, model_dir, output, *, start=None, end=None, groups=GROUPS
     return summary
 
 
+class Predictor:
+    """Cached v3 predictor: bundles, group data and per-day histories stay in memory.
+
+    ``predict_races`` takes validated races (``entry_races`` output) and returns
+    one result dict per active runner.  Thread-safe (one prediction at a time).
+    """
+
+    def __init__(self, database, model_dir, *, threads=2, report=None, cached_days=2):
+        import threading
+        self.database, self.model_dir = Path(database), Path(model_dir)
+        self.threads, self.cached_days = threads, cached_days
+        self.report = report or (lambda **message: None)
+        self.last_day = _check_dataset(self.database)
+        self.bundles, self.loaded, self.histories = {}, {}, {}
+        self.lock = threading.Lock()
+
+    def bundle(self, group):
+        if group not in self.bundles:
+            self.bundles[group] = _load_bundle(self.model_dir, group)
+        return self.bundles[group]
+
+    def train_end(self, group):
+        return self.bundle(group)['train_end']
+
+    def _group(self, group):
+        import numpy as np
+        from .experiment_v3c import load_announced
+        from .experiment_v3d import load_jockeys
+        from .rank_model import load_rank_group
+        if group not in self.loaded:
+            self.report(event='loading_group', group=group)
+            data = load_rank_group(self.database, group)
+            data['race_ids'] = np.asarray([identity[0] for identity in data['identities']])
+            horses = np.asarray([identity[1] for identity in data['identities']], dtype=object)
+            stored = {}
+            if self.bundle(group)['config']['weight']:
+                stored['announced'] = load_announced(self.database, group, data['identities'])
+            if self.bundle(group)['config']['theta']:
+                stored['jockeys'] = load_jockeys(self.database, group, data['identities'])
+            self.loaded[group] = (data, horses, stored)
+        return self.loaded[group]
+
+    def _history(self, day):
+        from .same_day import rebuild_prediction_states
+        if day not in self.histories:
+            self.report(event='history', day=day)
+            while len(self.histories) >= self.cached_days:
+                self.histories.pop(next(iter(self.histories)))
+            self.histories[day] = rebuild_prediction_states(self.database, day)[:2]
+        return self.histories[day]
+
+    @staticmethod
+    def supported(race):
+        active = [row for row in race if row.get('finish_status') not in ('scratched', 'excluded')]
+        return bool(active) and active[0]['group_name'] in CONFIG
+
+    def predict_races(self, races, *, samples=4096):
+        from threadpoolctl import threadpool_limits
+        by_day = {}
+        for day, region, race_id, race in races:
+            active = [row for row in race if row.get('finish_status') not in ('scratched', 'excluded')]
+            if not active:
+                continue
+            group = active[0]['group_name']
+            if group not in CONFIG:
+                self.report(event='skipped_race', race_id=race_id, group=group, reason='v3パイプラインの対象外の区分')
+                continue
+            by_day.setdefault(day, {}).setdefault(group, []).append((race, active))
+        results = []
+        with self.lock, threadpool_limits(limits=self.threads):
+            for day in sorted(by_day):
+                for group in by_day[day]:
+                    if day < self.train_end(group):
+                        raise ValueError(f'学習期間内の日付には予測できません: {day}（モデルは{self.train_end(group)}より前で学習）')
+                history, priors = self._history(day)
+                for group, group_races in sorted(by_day[day].items()):
+                    data, horses, stored = self._group(group)
+                    self.report(event='predicting', day=day, group=group, races=len(group_races))
+                    results.extend(_group_day(self.database, group, data, horses, stored, self.bundle(group), day,
+                                              group_races, history, priors, samples=samples))
+        return results
+
+
 def predict(database, model_dir, entries, output, *, samples=4096, threads=2, report=None):
-    import numpy as np
-    from threadpoolctl import threadpool_limits
-    from .experiment_v3c import load_announced
-    from .experiment_v3d import load_jockeys
-    from .rank_model import load_rank_group
-    from .same_day import rebuild_prediction_states
-    report = report or (lambda **message: None)
     output = Path(output).resolve()
     if output.exists():
         raise ValueError(f'出力先は既にあります: {output}')
-    _check_dataset(database)
-    races = _read_entries(entries)
-    by_day = {}
-    for day, region, race_id, race in races:
-        active = [row for row in race if row.get('finish_status') not in ('scratched', 'excluded')]
-        if not active:
-            continue
-        group = active[0]['group_name']
-        if group not in CONFIG:
-            report(event='skipped_race', race_id=race_id, group=group, reason='v3パイプラインの対象外の区分')
-            continue
-        by_day.setdefault(day, {}).setdefault(group, []).append((race, active))
-    if not by_day:
+    predictor = Predictor(database, model_dir, threads=threads, report=report)
+    results = predictor.predict_races(_read_entries(entries), samples=samples)
+    if not results:
         raise ValueError('予測対象の馬がありません。')
-    bundles, loaded, results = {}, {}, []
-    for group in sorted({group for groups in by_day.values() for group in groups}):
-        bundles[group] = _load_bundle(model_dir, group)
-    early = [day for day, groups in by_day.items() for group in groups if day < bundles[group]['train_end']]
-    if early:
-        raise ValueError(f'学習期間内の日付には予測できません: {min(early)}')
-    with threadpool_limits(limits=threads):
-        for day in sorted(by_day):
-            report(event='history', day=day)
-            history, priors, _ = rebuild_prediction_states(Path(database), day)
-            for group, group_races in sorted(by_day[day].items()):
-                if group not in loaded:
-                    report(event='loading_group', group=group)
-                    data = load_rank_group(database, group)
-                    data['race_ids'] = np.asarray([identity[0] for identity in data['identities']])
-                    horses = np.asarray([identity[1] for identity in data['identities']], dtype=object)
-                    stored = {}
-                    if bundles[group]['config']['weight']:
-                        stored['announced'] = load_announced(database, group, data['identities'])
-                    if bundles[group]['config']['theta']:
-                        stored['jockeys'] = load_jockeys(database, group, data['identities'])
-                    loaded[group] = (data, horses, stored)
-                data, horses, stored = loaded[group]
-                report(event='predicting', day=day, group=group, races=len(group_races))
-                results.extend(_group_day(database, group, data, horses, stored, bundles[group], day, group_races,
-                                          history, priors, samples=samples))
     maximum = max(row['starters'] for row in results)
     for row in results:
         for rank in range(1, maximum + 1):

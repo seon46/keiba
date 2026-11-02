@@ -633,6 +633,35 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 
 出力には `rank_k_probability`（k着の確率）、`nonfinish_probability`、`win_probability`、`top3_probability`、`expected_rank_given_finish`、`strength_score` が入ります。地方で馬体重が出馬表にあれば使い、なければ空欄扱いで予測します（`bodyweight_used`）。
 
+## 競馬AIアプリ（ブラウザで予想・記録・自動更新）
+
+設計は `docs/app_design.md`。開催日 → 競馬場 → R でレースを選び、出馬表の並びで各馬の着順ごとの確率（小さな棒グラフ・クリックで拡大・ヒートマップ）を表示します。予想はすべて記録し、結果が出たら自動で照合します。外部サーバーは使わず、自分のPCで動きます。
+
+初回（既存のDBと本番モデルを登録します。コピーはしません）:
+
+```powershell
+git pull
+.\.venv\Scripts\python.exe -X utf8 -m pip install --no-deps --no-build-isolation -e .
+.\.venv\Scripts\python.exe -X utf8 -m keiba_app init --dataset data\ml_rank_bias_v2\features.sqlite3 --model-dir data\v3_model
+.\.venv\Scripts\python.exe -X utf8 -m keiba_app serve
+```
+
+ブラウザで http://127.0.0.1:8765 を開きます。毎晩の自動処理（2:30、スリープ解除あり）と、ログオン時の画面の起動を登録するには:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.ps1
+```
+
+毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
+
+外出先の端末から見るには、PCとスマホなどにTailscaleを入れて同じアカウントでログインし、PCで一度だけ次を実行します。表示されたHTTPSのアドレスを、自分の端末から開けます（自分のアカウントの端末以外からは見えません）。
+
+```powershell
+tailscale serve --bg 8765
+```
+
+コマンドだけで使う場合: `keiba_app predict --region central --race-id 202505050811 --refresh`（1レースを予想して記録）、`keiba_app score`（照合）、`keiba_app nightly --only collect prepare`（段階を指定）。
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。

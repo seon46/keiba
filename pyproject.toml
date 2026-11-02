@@ -12,9 +12,13 @@ dependencies = ["beautifulsoup4==4.14.3", "requests==2.32.5"]
 [project.scripts]
 keiba-scraper = "keiba_scraper.cli:main"
 keiba-ai = "keiba_ai.cli:main"
+keiba-app = "keiba_app.__main__:main"
 
 [project.optional-dependencies]
 ml = ["numpy==2.3.5", "scipy==1.16.3", "scikit-learn==1.7.2", "joblib==1.5.2", "threadpoolctl==3.6.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+keiba_app = ["static/*"]
