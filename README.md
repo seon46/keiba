@@ -600,6 +600,22 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3i --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3i --threads 2
 ```
 
+## v3実験J：血統の特徴量とニューラルネット
+
+`keiba_ai.experiment_v3j` は、収集した5代血統（`data\keiba.sqlite3`）を使い、同じ検証（2023〜2025年、早期終了は直前2か月）で次を比べます。
+
+- `A_lgbm`：現在の最良設定（LightGBM＋Plackett–Luce）。
+- `B_lgbm_ped`：Aに血統の特徴量（父・母父・母の能力値。馬の強さを差し引いたうえで日ごとに更新。父は芝ダ別・距離帯別も）を追加。
+- `C_nn`：ニューラルネット（PyTorch）。Aと同じ特徴量に、5代62頭の祖先・騎手・調教師の埋め込みと、同じレースの馬どうしの注意機構（Transformer）を加え、同じPlackett–Luceの損失で学習。
+- `D_blend`：BとCの加重平均（重みは早期終了用の期間で推定）。`E_blend`：AとCの加重平均。
+
+GPU版のPyTorchを入れてから実行します（`nvidia-smi` で確認できるNVIDIAのGPUが必要です）。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-nn.ps1
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3j --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\exp_v3j --threads 2
+```
+
 ## v3パイプライン：最良設定での学習と出馬表の予測（オッズ・トラックバイアス不使用）
 
 `keiba_ai.pipeline_v3` は、v3実験で最良だった設定で、中央平地・地方平地ごとのモデルを学習し、出馬表から各馬の順位分布を出します。
