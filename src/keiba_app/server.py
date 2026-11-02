@@ -187,7 +187,9 @@ class Api:
 
         def work(progress):
             progress(message='レース一覧を取得中')
-            return dict(races=len(self.engine.discover(day)))
+            races = self.engine.discover(day)
+            counts = {region: sum(race['region'] == region for race in races) for region in ('central', 'local')}
+            return dict(races=len(races), counts=counts, errors=self.engine.discover_errors)
         return self.jobs.submit('discover', f'{day}のレース一覧', work, date=day)
 
     def predict_day(self, body):

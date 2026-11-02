@@ -70,6 +70,13 @@ class AppTests(unittest.TestCase):
         self.assertEqual(records['summary']['races'], len(races))
         self.assertEqual(engine.logbook.records()['summary']['races'], 0)  # only after-race predictions
 
+        # A weekday-like day: the central list cannot be read, the local one still is
+        weekday = FakeScraper({('2025-09-03', 'local'): ['202544090301']})
+        engine_weekday = Engine(app, scraper=weekday, samples=64)
+        listed_local = engine_weekday.discover('2025-09-03')
+        self.assertEqual([race['region'] for race in listed_local], ['local'])
+        self.assertIn('central', engine_weekday.discover_errors)
+
         # A day inside the training period is refused
         early_day = '2025-01-03'
         early = races_on(self.fixture['rows'], early_day)

@@ -42,6 +42,7 @@ class Engine:
         self.report = report or (lambda **message: None)
         self._predictor, self._key = None, None
         self._lock = threading.Lock()
+        self.discover_errors = {}
 
     # -- predictor -----------------------------------------------------
     def predictor(self):
@@ -141,13 +142,22 @@ class Engine:
         return self._record(races[0], rows, source, results, origin=origin, predictor=predictor)
 
     def discover(self, day):
-        races = []
+        """Races of the day in both regions.  A region whose list cannot be read (e.g. no central
+        meeting on a weekday) is skipped and noted in ``discover_errors``; both failing is an error."""
+        races, errors = [], {}
         for region in ('central', 'local'):
-            identifiers = self.scraper.discover(day, region, refresh=day >= today())
+            try:
+                identifiers = self.scraper.discover(day, region, refresh=day >= today())
+            except ValueError as exc:
+                errors[region] = str(exc)
+                continue
             listed = [dict(race_id=race_id, course=course_of(region, race_id), race_number=race_number_of(race_id))
                       for race_id in identifiers]
             self.logbook.set_day_races(day, region, listed, now().isoformat(timespec='seconds'))
             races.extend(dict(listed_race, region=region) for listed_race in listed)
+        self.discover_errors = errors
+        if len(errors) == 2:
+            raise ValueError(' / '.join(errors.values()))
         return races
 
     def predict_day(self, day, *, refresh=True, origin='manual', progress=None):

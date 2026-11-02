@@ -138,7 +138,15 @@ async function dayView(day) {
     }));
     view.querySelector('#discover').addEventListener('click', async (event) => {
       event.target.disabled = true;
-      try { watch(await api('day/discover', {date: day}), () => route()); } catch (e) { alertJob(e); event.target.disabled = false; }
+      try {
+        watch(await api('day/discover', {date: day}), (job) => {
+          route();
+          if (job.status === 'done') {
+            const c = job.result.counts;
+            showJob({status: 'done', label: 'レース一覧', message: `中央${c.central}レース・地方${c.local}レースを取得しました`});
+          }
+        });
+      } catch (e) { alertJob(e); event.target.disabled = false; }
     });
     view.querySelector('#all').addEventListener('click', async (event) => {
       event.target.disabled = true;

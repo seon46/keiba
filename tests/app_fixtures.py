@@ -49,6 +49,8 @@ class FakeScraper:
         self.fetched = []
 
     def discover(self, day, region, *, refresh=True):
+        if (day, region) not in self.listing and region == 'central' and self.listing:
+            raise ValueError('中央の一覧を読めませんでした（開催がない日の可能性があります）。')
         return self.listing.get((day, region), [])
 
     def fetch(self, region, race_ids, page, *, refresh=True):

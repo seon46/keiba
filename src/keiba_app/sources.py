@@ -119,10 +119,20 @@ class Scraper:
         return base + [str(argument) for argument in arguments]
 
     def run(self, *arguments, refresh=False, log=None, timeout=None):
-        """Run and return (exit code, parsed JSON lines)."""
+        """Run and return (exit code, parsed JSON lines); a process silent past ``timeout`` seconds is stopped."""
+        import threading
         process = subprocess.Popen(self.command(*arguments, refresh=refresh), stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
         messages = []
+        expired = threading.Event()
+
+        def stop():
+            expired.set()
+            process.kill()
+        watchdog = threading.Timer(timeout, stop) if timeout else None
+        if watchdog:
+            watchdog.daemon = True
+            watchdog.start()
         try:
             for line in process.stdout:
                 if log is not None:
@@ -131,18 +141,23 @@ class Scraper:
                     messages.append(json.loads(line))
                 except ValueError:
                     messages.append(dict(text=line.rstrip('\n')))
-            code = process.wait(timeout=timeout)
+            code = process.wait()
         except BaseException:
             process.kill()
             raise
+        finally:
+            if watchdog:
+                watchdog.cancel()
+        if expired.is_set():
+            raise ValueError(f'netkeibaへの取得が{timeout}秒以内に終わらなかったため中止しました（他の収集と取得間隔を共有しているため、収集中は遅くなります）。')
         return code, messages
 
     def discover(self, day, region, *, refresh=True):
-        code, messages = self.run('list', '--date', day, '--region', region, refresh=refresh)
+        code, messages = self.run('list', '--date', day, '--region', region, refresh=refresh, timeout=300)
         listed = [message for message in messages if 'race_ids' in message]
         if code != 0 or not listed:
-            detail = ' '.join(message.get('text', '') for message in messages)[-300:]
-            raise ValueError(f'{day}の{"中央" if region == "central" else "地方"}のレース一覧を取得できません。{detail}')
+            detail = ' '.join(message.get('text', '') for message in messages).replace('ERROR: ', '')[-300:]
+            raise ValueError(f'{"中央" if region == "central" else "地方"}の一覧を読めませんでした（開催がない日の可能性があります）。{detail}')
         return listed[-1]['race_ids']
 
     def fetch(self, region, race_ids, page, *, refresh=True):
@@ -152,7 +167,7 @@ class Scraper:
         arguments = ['fetch', '--region', region, '--page', page]
         for race_id in race_ids:
             arguments += ['--race-id', race_id]
-        code, messages = self.run(*arguments, refresh=refresh)
+        code, messages = self.run(*arguments, refresh=refresh, timeout=120 + 60 * len(race_ids))
         if code != 0:
             detail = ' '.join(message.get('text', '') for message in messages)[-300:]
             raise ValueError(f'出馬表を取得できません: {detail}')
