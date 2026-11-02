@@ -80,6 +80,24 @@ class PipelineTests(unittest.TestCase):
                     column = sum(float(row[f'rank_{rank}_probability']) for row in rows)
                     self.assertLessEqual(column, 1.0 + 1e-6)
 
+            # evaluate on the saved bundle reproduces the fit-time evaluation.
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(['evaluate', '--dataset', str(database), '--model-dir', str(root / 'model'),
+                             '--output-dir', str(root / 'evaluation'), '--end', '2025-12-31', '--samples', '64',
+                             '--threads', '1'])
+            self.assertEqual(code, 0, output.getvalue())
+            evaluation = json.loads((root / 'evaluation' / 'evaluation.json').read_text(encoding='utf-8'))
+            for group in ('central_flat', 'local_flat'):
+                self.assertAlmostEqual(evaluation['groups'][group]['model']['race_outcome_log_loss'],
+                                       summary['groups'][group]['evaluation']['model']['race_outcome_log_loss'], places=5)
+                self.assertTrue(evaluation['groups'][group]['by_week'])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(['evaluate', '--dataset', str(database), '--model-dir', str(root / 'model'),
+                             '--output-dir', str(root / 'evaluation_early'), '--start', '2025-01-01'])
+            self.assertEqual(code, 2)
+
             # Days inside the training period are refused.
             entries_from_results(root / 'source.csv', root / 'early.csv', '2025-01-03')
             output = io.StringIO()

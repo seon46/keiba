@@ -439,6 +439,118 @@ def _group_day(database, group, data, horses, stored, bundle, day, races, histor
     return output
 
 
+def evaluate(database, model_dir, output, *, start=None, end=None, groups=GROUPS, samples=1024, threads=2,
+             report=None):
+    """Score a saved model on results after its train_end (a newer prepared database).
+
+    Every block is rebuilt causally over the whole database, exactly as predict
+    does with an up-to-date history: a race only sees results of earlier days.
+    """
+    import numpy as np
+    from threadpoolctl import threadpool_limits
+    from .cli import fresh_directory
+    from .experiment_v3c import WEIGHT_FEATURES, announced_features, load_announced
+    from .experiment_v3d import Blocks, load_jockeys
+    from .rank_model import load_rank_group
+    from .ranking_v3 import paired_bootstrap, score_races
+    from .ratings import rating_block
+    from .speed import load_speed_block
+    report = report or (lambda **message: None)
+    database = Path(database)
+    last_day = _check_dataset(database)
+    if end is None:
+        end = (date.fromisoformat(last_day) + timedelta(days=1)).isoformat()
+    end = _iso(end, 'end')
+    names, no_jockey = _names()
+    columns, _ = _columns(names)
+    f0_columns, _ = _columns(no_jockey)
+    started = time.time()
+    summary = dict(pipeline=BUNDLE_VERSION, created_at=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                   dataset=str(database.resolve()), model_dir=str(Path(model_dir).resolve()), end=end, groups={})
+    with fresh_directory(output) as temporary, threadpool_limits(limits=threads):
+        races_file = (temporary / 'race_losses.csv').open('w', encoding='utf-8', newline='')
+        races_writer = csv.writer(races_file)
+        races_writer.writerow(['group', 'race_date', 'race_id', 'outcome_log_loss', 'uniform_outcome_log_loss',
+                               'top3_log_loss', 'win_log_loss'])
+        try:
+            for group in groups:
+                bundle = _load_bundle(model_dir, group)
+                first = _iso(start, 'start') if start is not None else bundle['train_end']
+                if first < bundle['train_end']:
+                    raise ValueError(f'{group}: 評価の開始日がモデルの学習期間（{bundle["train_end"]}より前）に入っています。')
+                report(event='loading_group', group=group)
+                data = load_rank_group(database, group)
+                race_ids = data['race_ids'] = np.asarray([identity[0] for identity in data['identities']])
+                horses = np.asarray([identity[1] for identity in data['identities']], dtype=object)
+                days = data['days']
+                rows = np.flatnonzero((days >= first) & (days < end))
+                if not len(rows):
+                    summary['groups'][group] = dict(start=first, races=0)
+                    continue
+                config = bundle['config']
+                speed, _ = load_speed_block(database, group, data['identities'])
+                rating = rating_block(days, race_ids, horses, data['finished'], data['positions'])
+                weight = theta = None
+                if config['weight']:
+                    weight = announced_features(data, load_announced(database, group, data['identities']))[:, :len(WEIGHT_FEATURES)]
+                if config['theta']:
+                    strength0 = np.full(len(days), np.nan)
+                    missing = []
+                    for index, key in enumerate(zip(race_ids.tolist(), horses.tolist())):
+                        value = bundle['oof'].get(key)
+                        if value is None:
+                            missing.append(index)
+                        else:
+                            strength0[index] = value
+                    missing = np.asarray(missing, dtype=int)
+                    missing = missing[data['finished'][missing]] if len(missing) else missing
+                    if len(missing):
+                        plain = Blocks(data, f0_columns, [(block, None) for block in _f0_blocks(group, weight, speed)])
+                        strength0[missing] = bundle['f0_model'].predict(plain(missing), raw_score=True)
+                    theta = _theta(data, horses, load_jockeys(database, group, data['identities']), strength0,
+                                   bundle['settings'])
+                matrix = Blocks(data, columns, [(block, None) for block in _main_blocks(group, weight, speed, theta, rating)])
+                report(event='evaluate', group=group, rows=int(len(rows)))
+                scores = bundle['strength_model'].predict(matrix(rows), raw_score=True)
+                completion = (np.full(len(rows), bundle['finisher_constant']) if bundle['finisher_model'] is None else
+                              bundle['finisher_model'].predict(data['x'][np.ix_(rows, columns)]))
+                args = (race_ids[rows], data['positions'][rows], data['finished'][rows], data['race_numbers'][rows])
+                seed = bundle['settings']['seed']
+                model_scored = score_races(*args, scores, completion, bundle['temperatures'], samples=samples, seed=seed)
+                uniform = score_races(*args, np.zeros(len(rows)), completion, [1.0], samples=samples, seed=seed)
+                first_rows = {}
+                for row in rows.tolist():
+                    first_rows.setdefault(race_ids[row], row)
+                for race, a, u, b, c in zip(model_scored['race_ids'], model_scored['outcome'], uniform['outcome'],
+                                            model_scored['top3'], model_scored['win']):
+                    races_writer.writerow([group, days[first_rows[race]], race, f'{a:.6f}', f'{u:.6f}', f'{b:.6f}',
+                                           '' if np.isnan(c) else f'{c:.6f}'])
+                by_week = {}
+                race_days = np.asarray([days[first_rows[race]] for race in model_scored['race_ids']])
+                for week_start in sorted({(date.fromisoformat(day) - timedelta(days=date.fromisoformat(day).weekday())).isoformat()
+                                          for day in race_days.tolist()}):
+                    week_end = (date.fromisoformat(week_start) + timedelta(days=7)).isoformat()
+                    mask = (race_days >= week_start) & (race_days < week_end)
+                    by_week[week_start] = dict(races=int(mask.sum()),
+                                               model=float(np.mean(model_scored['outcome'][mask])),
+                                               uniform=float(np.mean(uniform['outcome'][mask])))
+                summary['groups'][group] = dict(
+                    start=first, train_end=bundle['train_end'], last_day=max(days[rows].tolist()),
+                    model=model_scored['metrics'], uniform=uniform['metrics'],
+                    vs_uniform=paired_bootstrap(model_scored['outcome'] - uniform['outcome'], seed=seed),
+                    by_week=by_week)
+                report(event='group_done', group=group, races=model_scored['metrics']['races'],
+                       race_outcome_log_loss=model_scored['metrics']['race_outcome_log_loss'],
+                       uniform=uniform['metrics']['race_outcome_log_loss'])
+                del data, speed, rating, weight, theta
+        finally:
+            races_file.close()
+        summary['seconds'] = round(time.time() - started, 1)
+        (temporary / 'evaluation.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str) + '\n',
+                                                   encoding='utf-8')
+    return summary
+
+
 def predict(database, model_dir, entries, output, *, samples=4096, threads=2, report=None):
     import numpy as np
     from threadpoolctl import threadpool_limits
@@ -537,6 +649,15 @@ def main(argv=None):
     predicting.add_argument('--output', required=True, type=Path)
     predicting.add_argument('--samples', type=int, default=4096)
     predicting.add_argument('--threads', type=int, default=2)
+    evaluating = commands.add_parser('evaluate', help='保存済みモデルを、学習期間より後の確定結果で採点します')
+    evaluating.add_argument('--dataset', required=True, type=Path, help='新しい成績を含めてprepareしたfeatures.sqlite3')
+    evaluating.add_argument('--model-dir', required=True, type=Path)
+    evaluating.add_argument('--output-dir', required=True, type=Path, help='新しい出力先（既存は不可）')
+    evaluating.add_argument('--start', help='評価の開始日（既定: モデルのtrain-end）')
+    evaluating.add_argument('--end', help='この日より前まで評価（既定: データ最終日の翌日）')
+    evaluating.add_argument('--groups', nargs='+', default=list(GROUPS), choices=list(GROUPS))
+    evaluating.add_argument('--samples', type=int, default=1024)
+    evaluating.add_argument('--threads', type=int, default=2)
     args = parser.parse_args(argv)
     from .cli import emit
     try:
@@ -552,6 +673,12 @@ def main(argv=None):
                           report=emit)
             emit(event='fit_complete', model=str(args.output_dir / 'model.json'), train_end=summary['train_end'],
                  seconds=summary['seconds'])
+        elif args.command == 'evaluate':
+            summary = evaluate(args.dataset, args.model_dir, args.output_dir, start=args.start, end=args.end,
+                               groups=args.groups, samples=args.samples, threads=args.threads, report=emit)
+            emit(event='evaluation_complete', report=str(args.output_dir / 'evaluation.json'),
+                 result={group: (value.get('model') or {}).get('race_outcome_log_loss')
+                         for group, value in summary['groups'].items()})
         else:
             rows = predict(args.dataset, args.model_dir, args.entries, args.output, samples=args.samples,
                            threads=args.threads, report=emit)

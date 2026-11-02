@@ -623,6 +623,14 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 predict --dataset data\ml_rank_bias_v2\features.sqlite3 --model-dir data\v3_model --entries data\entries.csv --output data\v3_predictions.csv
 ```
 
+学習期間より後の確定結果での採点（新しい成績を含めてprepareし直したfeatures.sqlite3を使います。特徴量の版が同じなら、モデルは学習し直さずに使えます）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 evaluate --dataset data\ml_rank_v3_new\features.sqlite3 --model-dir data\v3_model --output-dir data\v3_eval
+```
+
+各レースは前日までの成績だけで予測し（predictと同じ）、`evaluation.json` に全体・週ごとの指標と一様予測との差、`race_losses.csv` にレースごとの損失を保存します。
+
 出力には `rank_k_probability`（k着の確率）、`nonfinish_probability`、`win_probability`、`top3_probability`、`expected_rank_given_finish`、`strength_score` が入ります。地方で馬体重が出馬表にあれば使い、なければ空欄扱いで予測します（`bodyweight_used`）。
 
 ## 学習済みモデルで出馬表を予測する
