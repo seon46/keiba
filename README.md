@@ -586,6 +586,20 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3h --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3h --threads 2
 ```
 
+## v3実験I：馬の強さを基準にしたトラックバイアス（v3）
+
+`keiba_ai.bias_v3` は、レースごとに、馬の強さ（学習に使っていないクロスフィット予測）をオフセットに固定し、4角の位置と馬番の効果 β をPL尤度で推定します。競馬場×芝ダ×距離帯の事前値は前日までだけで更新し、当日の偏差は同じ日・同じ場・同じ馬場の先行レースから精度重み付きで縮小推定します。人気・オッズは使いません。
+
+`keiba_ai.experiment_v3i` は、各区分の最良設定を基準に次を比べます。
+
+- `bias_feature`：当日の偏差、事前値、予想位置・馬番との積（9項目）を特徴量に追加（案B）。
+- `bias_offset`：学習データでは、自レース以外の当日のレースから求めた偏差×実際の位置を init_score にして強さを学び直し、予測は「強さ＋γ×バイアス項」（案A、γは早期終了用の期間で推定）。
+- 温度は `stop_power` と、1着だけ自由で2着以降を関数形にした `stop_hybrid` の両方で採点します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3i --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3i --threads 2
+```
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。
