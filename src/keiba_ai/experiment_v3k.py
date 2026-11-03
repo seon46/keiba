@@ -36,7 +36,10 @@ from .neural import NeuralConfig
 BASELINE = 'A_lgbm'
 REFERENCE = 'D_nn_j'
 SEEDS = (42, 7, 1234, 2024, 99)
-VARIANT_NAMES = ('nn_j', 'nn_sched', 'nn_reg', 'nn_reg_x5', 'nn_search_x5', 'tabm', 'tabm_noattn', 'tabm_noemb')
+VARIANT_NAMES = ('nn_j', 'nn_sched', 'nn_reg', 'nn_reg_x5', 'nn_search_x5', 'tabm', 'tabm_noattn', 'tabm_noemb',
+                 'tabm_search', 'tabm_search_x3')
+# D_multi blends B with every one of these that was trained in the run
+MULTI_PARTS = ('tabm_search_x3', 'tabm_search', 'tabm', 'tabm_noattn', 'nn_search_x5', 'nn_reg_x5')
 
 
 def variant_configs(seed=42):
@@ -60,6 +63,32 @@ def sample_config(rng, seed=42):
         learning_rate=float(10 ** rng.uniform(-3.5, -2.5)), weight_decay=float(10 ** rng.uniform(-4, -1)),
         batch_races=int(rng.choice([128, 256, 512])), max_epochs=epochs, patience=epochs,
         entity_min_count=int(rng.choice([20, 50, 100])), ancestor_min_count=int(rng.choice([2, 5])), seed=seed)
+
+
+def sample_tabm_config(rng, seed=42):
+    """Random TabM setting (experiment M search space)."""
+    epochs = int(rng.choice([8, 12, 16]))
+    return NeuralConfig(
+        width=int(rng.choice([128, 192, 256, 384])), layers=int(rng.choice([1, 2])), heads=4,
+        attention=bool(rng.random() < .5), ensemble=int(rng.choice([16, 32])),
+        numeric_embedding=bool(rng.random() < .8), numeric_dim=int(rng.choice([8, 16, 24])),
+        n_frequencies=int(rng.choice([16, 32, 48])), frequency_scale=float(10 ** rng.uniform(-2.5, -.5)),
+        embedding=int(rng.choice([8, 16])), pedigree_dim=int(rng.choice([16, 32])),
+        dropout=float(rng.uniform(0, .3)), ancestor_dropout=float(rng.uniform(0, .3)),
+        learning_rate=float(10 ** rng.uniform(-3.3, -2.5)), weight_decay=float(10 ** rng.uniform(-4, -1.5)),
+        batch_races=int(rng.choice([64, 128])), max_epochs=epochs, patience=epochs,
+        entity_min_count=int(rng.choice([20, 50])), ancestor_min_count=int(rng.choice([2, 5])), beta2=.95, seed=seed)
+
+
+def _blend_many(structure, parts):
+    """Non-negative weights of several score vectors minimising the stop-period PL loss."""
+    import numpy as np
+    from scipy.optimize import minimize
+    stacked = np.column_stack(parts)
+    start = np.full(stacked.shape[1], 1.0 / stacked.shape[1])
+    result = minimize(lambda weights: structure.mean_loss(stacked @ weights), start, method='L-BFGS-B',
+                      bounds=[(0, 3)] * stacked.shape[1])
+    return [float(value) for value in result.x]
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +251,32 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                             dict(seeds=list(seeds), best_epochs=[part[2]['best_epoch'] for part in parts],
                                  stop_losses=[part[2]['stop_loss'] for part in parts], config=asdict(config)))
 
+                searched = {}
+
+                def search(sampler, label):
+                    """Random search on the stop-period PL loss (a setting that runs out of GPU memory is skipped)."""
+                    if label in searched:
+                        return searched[label]
+                    import torch
+                    generator = np.random.default_rng(seed + year + (1000 if label == 'tabm' else 0))
+                    trials = []
+                    for trial in range(search_trials):
+                        config = sampler(generator, seed)
+                        try:
+                            _, _, info = run(config, f'{label}_search{trial}')
+                            loss = info['stop_loss']
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            loss = float('inf')
+                        trials.append((loss, config))
+                        report(event='search_trial', group=group, validation_year=year, search=label, trial=trial,
+                               stop_loss=None if loss == float('inf') else round(loss, 5))
+                    finite = [item for item in trials if item[0] != float('inf')]
+                    if not finite:
+                        raise ValueError('設定探索がすべてGPUのメモリ不足で失敗しました。')
+                    searched[label] = (min(finite, key=lambda item: item[0]), trials)
+                    return searched[label]
+
                 for name in wanted:
                     report(event='variant', group=group, validation_year=year, variant=name)
                     if name in fixed:
@@ -241,6 +296,20 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                         values, stop_values, info = ensemble(best_config, name)
                         info.update(search_best_stop_loss=best_loss,
                                     search=[dict(stop_loss=loss, config=asdict(config)) for loss, config in trials])
+                    elif name in ('tabm_search', 'tabm_search_x3'):
+                        (best_loss, best_config), trials = search(sample_tabm_config, 'tabm')
+                        if name == 'tabm_search':
+                            values, stop_values, info = run(best_config, name)
+                        else:
+                            members = seeds[:3]
+                            parts = [run(replace(best_config, seed=member), f'{name}/seed{member}') for member in members]
+                            values = np.mean([part[0] for part in parts], axis=0)
+                            stop_values = np.mean([part[1] for part in parts], axis=0)
+                            info = dict(seeds=list(members), best_epochs=[part[2]['best_epoch'] for part in parts],
+                                        stop_losses=[part[2]['stop_loss'] for part in parts], config=asdict(best_config))
+                        info.update(search_best_stop_loss=best_loss,
+                                    search=[dict(stop_loss=None if loss == float('inf') else loss, config=asdict(config))
+                                            for loss, config in trials])
                     else:
                         raise ValueError(f'未対応の設定です: {name}')
                     scores[name], stop_scores[name] = values, stop_values
@@ -249,7 +318,14 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                     scores[f'D_{name}'] = weights[0] * scores['B_lgbm_ped'] + weights[1] * values
                     stop_scores[f'D_{name}'] = weights[0] * stop_scores['B_lgbm_ped'] + weights[1] * stop_values
                     fold_result['variants'][f'D_{name}'] = dict(weights=weights)
-                for name in scores:
+                members = [name for name in MULTI_PARTS if name in scores]
+                if len(members) >= 2:
+                    parts = ['B_lgbm_ped'] + members
+                    weights = _blend_many(stop_structure, [stop_scores[part] for part in parts])
+                    scores['D_multi'] = sum(weight * scores[part] for weight, part in zip(weights, parts))
+                    stop_scores['D_multi'] = sum(weight * stop_scores[part] for weight, part in zip(weights, parts))
+                    fold_result['variants']['D_multi'] = dict(weights=dict(zip(parts, weights)))
+                for name in list(scores):
                     temperatures, stop_loss, _ = fit_hybrid_temperatures(stop_structure, stop_scores[name])
                     scored = score_races(race_ids[validation_rows], positions[validation_rows], finished[validation_rows],
                                          arrays['race_numbers'][validation_rows], scores[name], arrays['completion'],

@@ -636,6 +636,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-nn.ps1
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3l --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3l --threads 2
 ```
 
+## v3実験M：TabMの設定探索と複数モデルの混ぜ合わせ
+
+`keiba_ai.experiment_v3m` は、実験Kの保存分を使い、年ごとにTabMの設定（注意機構の有無、幅・層、正則化、数値の埋め込みの周波数、内部のモデル数など）を `--search-trials` 通り試し、早期終了用の期間で一番良い設定を1回（`tabm_search`）と3本平均（`tabm_search_x3`）で学習します。あわせて、B（LightGBM＋血統）と学習したすべてのネットワークを一度に混ぜる `D_multi` も採点します。GPUのメモリ不足になった設定は飛ばします。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3m --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3m --threads 2
+```
+
 ## v3パイプライン：最良設定での学習と出馬表の予測（オッズ・トラックバイアス不使用）
 
 `keiba_ai.pipeline_v3` は、v3実験で最良だった設定で、中央平地・地方平地ごとのモデルを学習し、出馬表から各馬の順位分布を出します。

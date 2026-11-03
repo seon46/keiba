@@ -85,3 +85,38 @@ class ExperimentLTests(unittest.TestCase):
                     self.assertTrue(np.isfinite(summary[variant]['race_outcome_log_loss']), variant)
                     self.assertIn(f'D_{variant}', summary)
                 self.assertEqual(report['groups'][group]['folds'][0]['variants']['tabm']['config']['ensemble'], 32)
+
+
+@unittest.skipUnless(all(importlib.util.find_spec(name) for name in ('lightgbm', 'sklearn', 'scipy', 'torch')),
+                     'Install requirements-ml.txt and PyTorch for the v3m experiment tests')
+class ExperimentMTests(unittest.TestCase):
+    def test_tabm_search_and_multi_blend(self):
+        from keiba_ai.cli import prepare
+        from keiba_ai.experiment_v3m import main
+        from test_ai_experiment_v3d import jockey_csv
+        from test_ai_experiment_v3j import pedigree_store
+        with TemporaryDirectory() as name:
+            root = Path(name)
+            jockey_csv(root / 'source.csv', years=(2021, 2022, 2023, 2024, 2025, 2026))
+            with (root / 'source.csv').open(encoding='utf-8') as file:
+                horses = sorted({row['horse_id'] for row in csv.DictReader(file)})
+            pedigree_store(root / 'data', horses)
+            with redirect_stdout(io.StringIO()):
+                database = prepare(root / 'source.csv', root / 'prepared')
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(['--dataset', str(database), '--race-db', str(root / 'data' / 'keiba.sqlite3'),
+                             '--cache-dir', str(root / 'cache'), '--output-dir', str(root / 'm'),
+                             '--validation-years', '2025', '--threads', '1', '--rounds', '200', '--patience', '20',
+                             '--evaluation-samples', '64', '--device', 'cpu', '--search-trials', '2',
+                             '--variants', 'tabm_noattn', 'tabm_search', 'tabm_search_x3'])
+            self.assertEqual(code, 0, output.getvalue()[-3000:])
+            report = json.loads((root / 'm' / 'experiment.json').read_text(encoding='utf-8'))
+            for group in ('central_flat', 'local_flat'):
+                summary = report['groups'][group]['summary']
+                for key in ('tabm_search', 'tabm_search_x3', 'D_tabm_search_x3', 'D_multi'):
+                    self.assertTrue(np.isfinite(summary[key]['race_outcome_log_loss']), key)
+                fold = report['groups'][group]['folds'][0]['variants']
+                self.assertEqual(len(fold['tabm_search']['search']), 2)
+                self.assertEqual(fold['tabm_search']['config'], fold['tabm_search_x3']['config'] | {'seed': 42})
+                self.assertEqual(set(fold['D_multi']['weights']), {'B_lgbm_ped', 'tabm_search_x3', 'tabm_search', 'tabm_noattn'})
