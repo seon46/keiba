@@ -68,6 +68,124 @@ def _blend(structure, first, second):
     return [float(value) for value in result.x]
 
 
+def group_context(database, group, pedigrees, *, announce_dropout=.05, crossfit_blocks=3, seed=42, report=None):
+    """Everything per group that does not depend on the fold."""
+    import numpy as np
+    from .features import FEATURE_NAMES
+    from .rank_model import load_rank_group
+    report = report or (lambda **message: None)
+    report(event='loading_group', group=group)
+    data = load_rank_group(database, group)
+    race_ids = data['race_ids'] = np.asarray([identity[0] for identity in data['identities']])
+    days = data['days']
+    horses = np.asarray([identity[1] for identity in data['identities']], dtype=object)
+    speed, _ = load_speed_block(database, group, data['identities'])
+    common = []
+    if group in WEIGHT_GROUPS:
+        weight = announced_features(data, load_announced(database, group, data['identities']))[:, :len(WEIGHT_FEATURES)]
+        common.append((weight, _race_dropout(race_ids, announce_dropout, seed)))
+    common.append((speed, None))
+    return dict(group=group, data=data, race_ids=race_ids, days=days, horses=horses, common=common,
+                rating=rating_block(days, race_ids, horses, data['finished'], data['positions']),
+                jockeys=load_jockeys(database, group, data['identities']),
+                trainers=load_field(database, group, data['identities'], 'trainer_id'),
+                surfaces=data['x'][:, FEATURE_NAMES.index('surface_code')],
+                distances=data['x'][:, FEATURE_NAMES.index('distance_m')],
+                quarter=_quarter_block(days, crossfit_blocks),
+                coverage=float(np.mean([horse in pedigrees for horse in horses.tolist()])))
+
+
+def lgbm_fold(ctx, fold, pedigrees, *, params, threads, rounds, patience, crossfit_blocks, seed, report=None):
+    """Finisher model, A (base LightGBM-PL) and B (+ pedigree features) for one fold."""
+    import numpy as np
+    from .features import FEATURE_NAMES, CATEGORICAL_FEATURES
+    report = report or (lambda **message: None)
+    names = experiment_feature_names()
+    no_jockey = [name for name in names if name not in JOCKEY_RATE_FEATURES]
+    columns_for = lambda selected: [FEATURE_NAMES.index(name) for name in selected]
+    categorical_for = lambda selected: [index for index, name in enumerate(selected) if name in CATEGORICAL_FEATURES]
+    columns, categorical = columns_for(names), categorical_for(names)
+    group, data, race_ids, days, horses = ctx['group'], ctx['data'], ctx['race_ids'], ctx['days'], ctx['horses']
+    common, rating, jockeys, quarter = ctx['common'], ctx['rating'], ctx['jockeys'], ctx['quarter']
+    surfaces, distances = ctx['surfaces'], ctx['distances']
+    year = fold['validation_year']
+    fit = (days >= fold['train_start']) & (days < fold['stop_start'])
+    stop = (days >= fold['stop_start']) & (days < fold['validation_start'])
+    validation = (days >= fold['validation_start']) & (days < fold['validation_end'])
+    training = (days >= fold['train_start']) & (days < fold['validation_start'])
+    before = days < fold['validation_start']
+    upto = days < fold['validation_end']
+    fit_rows, stop_rows = _finisher_rows(data, fit), _finisher_rows(data, stop)
+    validation_rows = np.flatnonzero(validation)
+    finisher, constant, finisher_best = _m1_finisher(
+        data, fit, stop, columns, categorical, threads=threads, rounds=rounds, patience=patience, seed=seed)
+    completion = (np.full(len(validation_rows), constant) if finisher is None else
+                  finisher.predict(data['x'][np.ix_(validation_rows, columns)], num_iteration=finisher_best))
+    blocks = list(common)
+    if group in THETA_GROUPS:
+        report(event='strength_for_theta', group=group, validation_year=year)
+        strength0 = _crossfit_strength(
+            data, columns_for(no_jockey), categorical_for(no_jockey), common, fold, quarter, params,
+            rounds=rounds, patience=patience, crossfit_blocks=crossfit_blocks, fit_mask=fit,
+            stop_mask=stop, report=report, group=group)
+        span = np.flatnonzero(upto)
+        part = jockey_timeline(days[span], race_ids[span], jockeys[span], horses[span],
+                               data['finished'][span], data['positions'][span], strength0[span])
+        timeline = {key: np.full(len(days), np.nan) for key in part}
+        for key, values in part.items():
+            timeline[key][span] = values
+        blocks.append((theta_feature_block(timeline, race_ids), None))
+    blocks.append((rating, None))
+    train_blocks = [(a, (m & fit) if m is not None else None) for a, m in blocks]
+    plain_blocks = [(a, None) for a, _ in blocks]
+    base_matrix = Blocks(data, columns, plain_blocks)
+    variants = {}
+    scores, stop_scores = {}, {}
+    # A ----------------------------------------------------------------
+    report(event='variant', group=group, validation_year=year, variant='A_lgbm')
+    model_a, best_a = fit_pl(data, Blocks(data, columns, train_blocks), categorical, fit_rows, stop_rows,
+                             params, rounds=rounds, patience=patience)
+    scores['A_lgbm'] = model_a.predict(base_matrix(validation_rows), num_iteration=best_a, raw_score=True)
+    stop_scores['A_lgbm'] = model_a.predict(base_matrix(stop_rows), num_iteration=best_a, raw_score=True)
+    variants['A_lgbm'] = dict(best_iteration=best_a)
+    # strength offsets for the pedigree effects: out-of-fold before, A inside the year
+    strength = np.full(len(days), np.nan)
+    for block in range(crossfit_blocks):
+        report(event='oof_model', group=group, validation_year=year, block=block)
+        rows = _finisher_rows(data, training & (quarter != block))
+        model, _ = fit_pl(data, Blocks(data, columns, train_blocks), categorical, rows, None, params,
+                          rounds=rounds, patience=patience, fixed_rounds=best_a)
+        target = np.flatnonzero(before & (quarter == block))
+        if len(target):
+            strength[target] = model.predict(base_matrix(target), raw_score=True)
+    strength[validation_rows] = scores['A_lgbm']
+    # B ----------------------------------------------------------------
+    report(event='pedigree_features', group=group, validation_year=year)
+    span = np.flatnonzero(upto)
+    ped = np.full((len(days), len(PEDIGREE_FEATURES)), np.nan, dtype=np.float32)
+    ped[span] = pedigree_block(days[span], race_ids[span], horses[span], data['finished'][span],
+                               data['positions'][span], strength[span], surfaces[span],
+                               distances[span], pedigrees)
+    report(event='variant', group=group, validation_year=year, variant='B_lgbm_ped')
+    model_b, best_b = fit_pl(data, Blocks(data, columns, train_blocks + [(ped, None)]), categorical,
+                             fit_rows, stop_rows, params, rounds=rounds, patience=patience)
+    ped_matrix = Blocks(data, columns, plain_blocks + [(ped, None)])
+    scores['B_lgbm_ped'] = model_b.predict(ped_matrix(validation_rows), num_iteration=best_b, raw_score=True)
+    stop_scores['B_lgbm_ped'] = model_b.predict(ped_matrix(stop_rows), num_iteration=best_b, raw_score=True)
+    importance = model_b.feature_importance(importance_type='gain', iteration=best_b)
+    order = np.argsort(-importance)
+    ranks = {int(index): position + 1 for position, index in enumerate(order)}
+    offset = len(importance) - len(PEDIGREE_FEATURES)
+    variants['B_lgbm_ped'] = dict(
+        best_iteration=best_b, features=len(importance),
+        pedigree_gain_rank={name: ranks[offset + i] for i, name in enumerate(PEDIGREE_FEATURES)})
+    all_rows = np.arange(len(days))
+    return dict(fit_mask=fit, stop_mask=stop, validation_mask=validation, stop_rows=stop_rows,
+                validation_rows=validation_rows, completion=completion, train_blocks=train_blocks,
+                nn_matrix=Blocks(data, columns, train_blocks)(all_rows), categorical=categorical,
+                scores=scores, stop_scores=stop_scores, variants=variants)
+
+
 def run_experiment(database, race_db, output, *, validation_years=DEFAULT_VALIDATION_YEARS, groups=GROUPS,
                    train_start='2022-04-01', test_start='2026-01-01', stop_months=2, threads=2, rounds=8000,
                    patience=150, announce_dropout=.05, crossfit_blocks=3, evaluation_samples=1024, seed=42,
@@ -125,106 +243,26 @@ def run_experiment(database, race_db, output, *, validation_years=DEFAULT_VALIDA
     columns, categorical = columns_for(names), categorical_for(names)
     try:
         for group in groups:
-            report(event='loading_group', group=group)
-            data = load_rank_group(database, group)
-            race_ids = data['race_ids'] = np.asarray([identity[0] for identity in data['identities']])
-            days = data['days']
-            horses = np.asarray([identity[1] for identity in data['identities']], dtype=object)
-            speed, _ = load_speed_block(database, group, data['identities'])
-            common = []
-            dropout = None
-            if group in WEIGHT_GROUPS:
-                weight = announced_features(data, load_announced(database, group, data['identities']))[:, :len(WEIGHT_FEATURES)]
-                dropout = _race_dropout(race_ids, announce_dropout, seed)
-                common.append((weight, dropout))
-            common.append((speed, None))
-            rating = rating_block(days, race_ids, horses, data['finished'], data['positions'])
-            jockeys = load_jockeys(database, group, data['identities'])
-            trainers = load_field(database, group, data['identities'], 'trainer_id')
-            surfaces = data['x'][:, FEATURE_NAMES.index('surface_code')]
-            distances = data['x'][:, FEATURE_NAMES.index('distance_m')]
-            quarter = _quarter_block(days, crossfit_blocks)
-            coverage = float(np.mean([horse in pedigrees for horse in horses.tolist()]))
-            group_result = dict(excluded_races=data['excluded_races'], pedigree_coverage=coverage, folds=[])
+            ctx = group_context(database, group, pedigrees, announce_dropout=announce_dropout,
+                                crossfit_blocks=crossfit_blocks, seed=seed, report=report)
+            data, race_ids, days = ctx['data'], ctx['race_ids'], ctx['days']
+            group_result = dict(excluded_races=data['excluded_races'], pedigree_coverage=ctx['coverage'], folds=[])
             per_race = {}
             with threadpool_limits(limits=threads):
                 for fold in folds:
                     year = fold['validation_year']
-                    fit = (days >= fold['train_start']) & (days < fold['stop_start'])
-                    stop = (days >= fold['stop_start']) & (days < fold['validation_start'])
-                    validation = (days >= fold['validation_start']) & (days < fold['validation_end'])
-                    training = (days >= fold['train_start']) & (days < fold['validation_start'])
-                    before = days < fold['validation_start']
-                    upto = days < fold['validation_end']
-                    fit_rows, stop_rows = _finisher_rows(data, fit), _finisher_rows(data, stop)
-                    validation_rows = np.flatnonzero(validation)
-                    finisher, constant, finisher_best = _m1_finisher(
-                        data, fit, stop, columns, categorical, threads=threads, rounds=rounds, patience=patience, seed=seed)
-                    completion = (np.full(len(validation_rows), constant) if finisher is None else
-                                  finisher.predict(data['x'][np.ix_(validation_rows, columns)], num_iteration=finisher_best))
-                    blocks = list(common)
-                    if group in THETA_GROUPS:
-                        report(event='strength_for_theta', group=group, validation_year=year)
-                        strength0 = _crossfit_strength(
-                            data, columns_for(no_jockey), categorical_for(no_jockey), common, fold, quarter, params,
-                            rounds=rounds, patience=patience, crossfit_blocks=crossfit_blocks, fit_mask=fit,
-                            stop_mask=stop, report=report, group=group)
-                        span = np.flatnonzero(upto)
-                        part = jockey_timeline(days[span], race_ids[span], jockeys[span], horses[span],
-                                               data['finished'][span], data['positions'][span], strength0[span])
-                        timeline = {key: np.full(len(days), np.nan) for key in part}
-                        for key, values in part.items():
-                            timeline[key][span] = values
-                        blocks.append((theta_feature_block(timeline, race_ids), None))
-                    blocks.append((rating, None))
-                    train_blocks = [(a, (m & fit) if m is not None else None) for a, m in blocks]
-                    plain_blocks = [(a, None) for a, _ in blocks]
-                    base_matrix = Blocks(data, columns, plain_blocks)
-                    fold_result = dict(validation_year=year, variants={})
-                    scores, stop_scores = {}, {}
-                    # A ----------------------------------------------------------------
-                    report(event='variant', group=group, validation_year=year, variant='A_lgbm')
-                    model_a, best_a = fit_pl(data, Blocks(data, columns, train_blocks), categorical, fit_rows, stop_rows,
-                                             params, rounds=rounds, patience=patience)
-                    scores['A_lgbm'] = model_a.predict(base_matrix(validation_rows), num_iteration=best_a, raw_score=True)
-                    stop_scores['A_lgbm'] = model_a.predict(base_matrix(stop_rows), num_iteration=best_a, raw_score=True)
-                    fold_result['variants']['A_lgbm'] = dict(best_iteration=best_a)
-                    # strength offsets for the pedigree effects: out-of-fold before, A inside the year
-                    strength = np.full(len(days), np.nan)
-                    for block in range(crossfit_blocks):
-                        report(event='oof_model', group=group, validation_year=year, block=block)
-                        rows = _finisher_rows(data, training & (quarter != block))
-                        model, _ = fit_pl(data, Blocks(data, columns, train_blocks), categorical, rows, None, params,
-                                          rounds=rounds, patience=patience, fixed_rounds=best_a)
-                        target = np.flatnonzero(before & (quarter == block))
-                        if len(target):
-                            strength[target] = model.predict(base_matrix(target), raw_score=True)
-                    strength[validation_rows] = scores['A_lgbm']
-                    # B ----------------------------------------------------------------
-                    report(event='pedigree_features', group=group, validation_year=year)
-                    span = np.flatnonzero(upto)
-                    ped = np.full((len(days), len(PEDIGREE_FEATURES)), np.nan, dtype=np.float32)
-                    ped[span] = pedigree_block(days[span], race_ids[span], horses[span], data['finished'][span],
-                                               data['positions'][span], strength[span], surfaces[span],
-                                               distances[span], pedigrees)
-                    report(event='variant', group=group, validation_year=year, variant='B_lgbm_ped')
-                    model_b, best_b = fit_pl(data, Blocks(data, columns, train_blocks + [(ped, None)]), categorical,
-                                             fit_rows, stop_rows, params, rounds=rounds, patience=patience)
-                    ped_matrix = Blocks(data, columns, plain_blocks + [(ped, None)])
-                    scores['B_lgbm_ped'] = model_b.predict(ped_matrix(validation_rows), num_iteration=best_b, raw_score=True)
-                    stop_scores['B_lgbm_ped'] = model_b.predict(ped_matrix(stop_rows), num_iteration=best_b, raw_score=True)
-                    importance = model_b.feature_importance(importance_type='gain', iteration=best_b)
-                    order = np.argsort(-importance)
-                    ranks = {int(index): position + 1 for position, index in enumerate(order)}
-                    offset = len(importance) - len(PEDIGREE_FEATURES)
-                    fold_result['variants']['B_lgbm_ped'] = dict(
-                        best_iteration=best_b, features=len(importance),
-                        pedigree_gain_rank={name: ranks[offset + i] for i, name in enumerate(PEDIGREE_FEATURES)})
+                    prepared = lgbm_fold(ctx, fold, pedigrees, params=params, threads=threads, rounds=rounds,
+                                         patience=patience, crossfit_blocks=crossfit_blocks, seed=seed, report=report)
+                    fit, stop = prepared['fit_mask'], prepared['stop_mask']
+                    stop_rows, validation_rows = prepared['stop_rows'], prepared['validation_rows']
+                    completion, train_blocks = prepared['completion'], prepared['train_blocks']
+                    scores, stop_scores = dict(prepared['scores']), dict(prepared['stop_scores'])
+                    fold_result = dict(validation_year=year, variants=prepared['variants'])
+                    jockeys, trainers, horses = ctx['jockeys'], ctx['trainers'], ctx['horses']
                     # C ----------------------------------------------------------------
                     report(event='variant', group=group, validation_year=year, variant='C_nn', device=device)
-                    all_rows = np.arange(len(days))
-                    nn_matrix = Blocks(data, columns, train_blocks)(all_rows)
-                    inputs = Inputs(nn_matrix, categorical, race_ids, data['finished'], data['positions'], jockeys,
+                    nn_matrix = prepared['nn_matrix']
+                    inputs = Inputs(nn_matrix, prepared['categorical'], race_ids, data['finished'], data['positions'], jockeys,
                                     trainers, pedigrees, horses, np.flatnonzero(fit), neural)
                     network, info = nn_train(inputs, np.flatnonzero(fit), np.flatnonzero(stop), neural, device=device,
                                              report=lambda **message: report(group=group, validation_year=year, **message))
@@ -255,7 +293,7 @@ def run_experiment(database, race_db, output, *, validation_years=DEFAULT_VALIDA
                                race_outcome_log_loss=scored['metrics']['race_outcome_log_loss'],
                                win_log_loss=scored['metrics']['win_log_loss'])
                     group_result['folds'].append(fold_result)
-                    del inputs, network, nn_matrix
+                    del inputs, network, nn_matrix, prepared
             summary = {}
             base = per_race[BASELINE]
             for key, scored_folds in per_race.items():
@@ -275,7 +313,7 @@ def run_experiment(database, race_db, output, *, validation_years=DEFAULT_VALIDA
             result['groups'][group] = group_result
             report(event='group_done', group=group, best=group_result['best_config'],
                    summary={key: row['race_outcome_log_loss'] for key, row in summary.items()})
-            del data, speed, rating
+            del data, ctx
     finally:
         losses_file.close()
     result['seconds'] = round(time.time() - started, 1)

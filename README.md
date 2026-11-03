@@ -616,6 +616,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-nn.ps1
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3j --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\exp_v3j --threads 2
 ```
 
+## v3実験K：ニューラルネットの改善
+
+`keiba_ai.experiment_v3k` は、実験JのLightGBM部分（完走モデル・A・B・ニューラルネットの入力）を `--cache-dir` に保存し、2回目以降はそれを再利用してニューラルネットだけを学習し直します。比べるのは、実験Jの設定（`nn_j`）、学習率の山を最後まで下げる設定（`nn_sched`）、正則化を強めた設定（`nn_reg`）、その5本平均（`nn_reg_x5`）、foldごとの設定探索＋5本平均（`nn_search_x5`）と、それぞれのBとの混ぜ合わせ（`D_…`）です。基準はAと、実験Jで最良だった `D_nn_j` です。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3k --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3k --threads 2
+```
+
 ## v3パイプライン：最良設定での学習と出馬表の予測（オッズ・トラックバイアス不使用）
 
 `keiba_ai.pipeline_v3` は、v3実験で最良だった設定で、中央平地・地方平地ごとのモデルを学習し、出馬表から各馬の順位分布を出します。
