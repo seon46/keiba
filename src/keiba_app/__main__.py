@@ -26,6 +26,8 @@ def main(argv=None):
     serve = commands.add_parser('serve', help='ブラウザ用の画面を起動します')
     serve.add_argument('--host', default='127.0.0.1')
     serve.add_argument('--port', type=int, default=8765)
+    serve.add_argument('--allow-host', action='append', default=[],
+                       help='127.0.0.1・localhost・*.ts.net以外で開くときの名前（例: PCの名前）')
     nightly = commands.add_parser('nightly', help='成績の追加・DB更新・照合・学習し直し・当日の予想')
     nightly.add_argument('--force-fit', action='store_true', help='学習し直しの日でなくても学習します')
     nightly.add_argument('--only', nargs='+', choices=('collect', 'prepare', 'score', 'fit', 'precompute'))
@@ -58,7 +60,7 @@ def main(argv=None):
         elif args.command == 'serve':
             from .server import serve
             app.require_ready()
-            serve(app, host=args.host, port=args.port)
+            serve(app, host=args.host, port=args.port, allowed_hosts=args.allow_host)
         elif args.command == 'nightly':
             from .nightly import run_nightly
             result = run_nightly(app, force_fit=args.force_fit, only=args.only, skip=args.skip, log=print)

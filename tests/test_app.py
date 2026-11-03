@@ -121,6 +121,54 @@ class AppTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_requests_from_other_sites_are_refused(self):
+        import http.client
+        from http.server import ThreadingHTTPServer
+        from app_fixtures import FakeScraper
+        from keiba_app.engine import Engine
+        from keiba_app.server import Api, host_allowed, make_handler
+        self.assertTrue(host_allowed('127.0.0.1:8765'))
+        self.assertTrue(host_allowed('localhost'))
+        self.assertTrue(host_allowed('[::1]:8765'))
+        self.assertTrue(host_allowed('my-pc.tail1234.ts.net'))
+        self.assertFalse(host_allowed('evil.example.com'))
+        self.assertFalse(host_allowed('127.0.0.1.evil.example.com:8765'))
+        self.assertTrue(host_allowed('my-pc:8765', ['my-pc']))
+        app = self._app('app3')
+        api = Api(app, Engine(app, scraper=FakeScraper(), samples=64))
+        server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(api))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+
+        def request(method, path, headers, body=None):
+            connection = http.client.HTTPConnection('127.0.0.1', port)
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+            return response.status
+
+        try:
+            local = f'127.0.0.1:{port}'
+            self.assertEqual(request('GET', '/api/status', {'Host': local}), 200)
+            self.assertEqual(request('GET', '/api/status', {'Host': 'rebind.example.com'}), 403)  # DNS rebinding
+            self.assertEqual(request('GET', '/', {'Host': 'rebind.example.com'}), 403)
+            body = json.dumps(dict(date='2025-09-03'))
+            # a cross-site page: form / no-cors fetch (text/plain), or an Origin of another site
+            self.assertEqual(request('POST', '/api/day/discover', {'Host': local, 'Content-Type': 'text/plain'}, body), 415)
+            self.assertEqual(request('POST', '/api/day/discover', {'Host': local, 'Content-Type': 'application/json',
+                                                                    'Origin': 'https://evil.example.com'}, body), 403)
+            self.assertEqual(request('POST', '/api/day/discover', {'Host': local, 'Content-Type': 'application/json',
+                                                                    'Sec-Fetch-Site': 'cross-site'}, body), 403)
+            # the app's own page
+            self.assertEqual(request('POST', '/api/day/discover', {'Host': local, 'Content-Type': 'application/json',
+                                                                    'Origin': f'http://{local}',
+                                                                    'Sec-Fetch-Site': 'same-origin'}, body), 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_nightly_scores_and_checks(self):
         from app_fixtures import FakeScraper
         from keiba_app.engine import Engine

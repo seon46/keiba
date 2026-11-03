@@ -241,9 +241,45 @@ class _Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def make_handler(api: Api):
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
+
+
+def host_allowed(host, extra=()):
+    """Only this PC's loopback names, Tailscale names (*.ts.net) and hosts given with --allow-host.
+    Rejecting other Host headers stops DNS-rebinding pages from reading or driving the API."""
+    if not host:
+        return False
+    name = host.strip().lower()
+    if name.startswith('['):
+        name = name[:name.index(']') + 1] if ']' in name else name
+    else:
+        name = name.rsplit(':', 1)[0] if name.count(':') == 1 else name
+    return name in LOCAL_HOSTS or name.endswith('.ts.net') or name in {value.lower() for value in extra}
+
+
+def make_handler(api: Api, *, allowed_hosts=()):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'KeibaApp/1'
+
+        def _trusted(self, write=False):
+            """Requests must name an allowed host; writes must also come from this app's own page."""
+            if not host_allowed(self.headers.get('Host'), allowed_hosts):
+                self._send(403, dict(error='このアドレスからは利用できません。'))
+                return False
+            if write:
+                origin = self.headers.get('Origin')
+                if origin and not host_allowed(urlsplit(origin).netloc, allowed_hosts):
+                    self._send(403, dict(error='他のサイトからの操作は受け付けません。'))
+                    return False
+                if self.headers.get('Sec-Fetch-Site') not in (None, 'same-origin', 'none'):
+                    self._send(403, dict(error='他のサイトからの操作は受け付けません。'))
+                    return False
+                if (self.headers.get('Content-Type') or '').split(';')[0].strip().lower() != 'application/json':
+                    # A cross-site form or no-cors fetch cannot send this type without a CORS preflight,
+                    # which this server never approves.
+                    self._send(415, dict(error='JSONで送ってください。'))
+                    return False
+            return True
 
         def log_message(self, format, *args):  # quiet console
             pass
@@ -255,6 +291,9 @@ def make_handler(api: Api):
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(data)))
                 self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                self.send_header('Referrer-Policy', 'no-referrer')
                 self.end_headers()
                 self.wfile.write(data)
             except _DISCONNECTED:  # the browser left (reload / navigation) before the answer arrived
@@ -273,6 +312,8 @@ def make_handler(api: Api):
                 return self._send(500, dict(error=f'内部エラー: {exc}'))
 
         def do_GET(self):
+            if not self._trusted():
+                return
             parts = urlsplit(self.path)
             if parts.path.startswith('/api/'):
                 query = {key: values[-1] for key, values in parse_qs(parts.query).items()}
@@ -289,6 +330,8 @@ def make_handler(api: Api):
             return self._send(200, path.read_bytes(), content_type)
 
         def do_POST(self):
+            if not self._trusted(write=True):
+                return
             parts = urlsplit(self.path)
             if not parts.path.startswith('/api/'):
                 return self._send(404, dict(error='見つかりません。'))
@@ -302,9 +345,9 @@ def make_handler(api: Api):
     return Handler
 
 
-def serve(app: App, *, host='127.0.0.1', port=8765):
+def serve(app: App, *, host='127.0.0.1', port=8765, allowed_hosts=()):
     api = Api(app)
-    server = _Server((host, port), make_handler(api))
+    server = _Server((host, port), make_handler(api, allowed_hosts=allowed_hosts))
     print(json.dumps(dict(event='serving', url=f'http://{host}:{port}/'), ensure_ascii=False), flush=True)
     try:
         server.serve_forever()
