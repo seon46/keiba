@@ -61,6 +61,34 @@ class PedigreeBlockTests(unittest.TestCase):
         self.assertGreater(block[4, theta], block[5, theta])  # SIREA's winner beat SIREB's runners
 
 
+@unittest.skipUnless(importlib.util.find_spec('torch'), 'PyTorch is required')
+class NeuralTests(unittest.TestCase):
+    def test_races_with_non_finishers_are_scored_whole(self):
+        from keiba_ai.neural import Inputs, NeuralConfig, predict, train
+        rng = np.random.default_rng(1)
+        races, finished, positions = [], [], []
+        for race in range(60):
+            for slot in range(8):
+                races.append(f'r{race:03d}')
+                done = not (race % 3 == 0 and slot == 7)  # every third race has a non-finisher
+                finished.append(done)
+                positions.append(slot + 1 if done else 0)
+        races, finished, positions = np.asarray(races), np.asarray(finished), np.asarray(positions)
+        matrix = rng.normal(size=(len(races), 5)).astype(np.float32)
+        matrix[:, 0] = -positions + rng.normal(size=len(races))
+        horses = np.asarray([f'h{i % 40}' for i in range(len(races))], dtype=object)
+        empty = np.full(len(races), '', dtype=object)
+        rows = np.arange(len(races))
+        fit, stop = rows[races < 'r040'], rows[races >= 'r040']
+        config = NeuralConfig(width=16, max_epochs=2, batch_races=8, pedigree_dim=4, embedding=4)
+        inputs = Inputs(matrix, [], races, finished, positions, empty, empty, {}, horses, fit, config)
+        network, _ = train(inputs, fit, stop[finished[stop]], config, device='cpu')
+        finisher_rows = stop[finished[stop]]
+        scores = predict(network, inputs, finisher_rows)
+        self.assertEqual(len(scores), len(finisher_rows))
+        self.assertTrue(np.isfinite(scores).all())
+
+
 @unittest.skipUnless(all(importlib.util.find_spec(name) for name in ('lightgbm', 'sklearn', 'scipy', 'torch')),
                      'Install requirements-ml.txt and PyTorch for the v3j experiment tests')
 class ExperimentJTests(unittest.TestCase):

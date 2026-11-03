@@ -134,15 +134,14 @@ class Inputs:
         self.cat_cards = [len(vocab) for vocab in self.cat_vocab]
 
     def races_for(self, rows, *, need_finishers=True):
-        """Race indices whose rows are all in ``rows`` (and with >= 2 finishers when requested)."""
+        """Races containing any of ``rows`` (with >= 2 finishers when requested).  The whole race is
+        always used, so non-finishers stay in the context even when ``rows`` lists finishers only."""
         import numpy as np
-        selected = np.zeros(len(self.starts), dtype=bool)
-        inside = np.zeros(len(self.race_of_row), dtype=bool)
-        inside[rows] = True
-        for race, (start, end) in enumerate(zip(self.starts, self.ends)):
-            if inside[start:end].all():
-                selected[race] = not need_finishers or self.finished[start:end].sum() >= 2
-        return np.flatnonzero(selected)
+        races = np.unique(self.race_of_row[np.asarray(rows, dtype=np.int64)])
+        if need_finishers:
+            finishers = np.add.reduceat(self.finished.astype(np.int64), self.starts)
+            races = races[finishers[races] >= 2]
+        return races
 
 
 def _batch(inputs, races, device):
@@ -244,8 +243,8 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
     model = build_model(inputs, config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     steps = math.ceil(len(fit_races) / config.batch_races) * config.max_epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.learning_rate, total_steps=steps,
-                                                    pct_start=.1)
+    scheduler = (torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.learning_rate, total_steps=steps,
+                                                     pct_start=.1) if steps >= 50 else None)
     use_amp = device == 'cuda'
     best, best_state, best_epoch, waited = math.inf, None, 0, 0
     started = time.time()
@@ -262,8 +261,9 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            scheduler.step()
-            total += float(loss)
+            if scheduler is not None:
+                scheduler.step()
+            total += loss.item()
             batches += 1
         stop_loss = evaluate_loss(model, inputs, stop_races, device, config.batch_races * 4)
         report(event='nn_epoch', epoch=epoch, train_loss=round(total / batches, 5), stop_loss=round(stop_loss, 5),

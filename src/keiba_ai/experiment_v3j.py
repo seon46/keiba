@@ -230,6 +230,8 @@ def run_experiment(database, race_db, output, *, validation_years=DEFAULT_VALIDA
                                              report=lambda **message: report(group=group, validation_year=year, **message))
                     scores['C_nn'] = nn_predict(network, inputs, validation_rows)
                     stop_scores['C_nn'] = nn_predict(network, inputs, stop_rows)
+                    if not (np.isfinite(scores['C_nn']).all() and np.isfinite(stop_scores['C_nn']).all()):
+                        raise ValueError('ニューラルネットの予測値に欠損があります。')
                     fold_result['variants']['C_nn'] = info
                     # D, E -------------------------------------------------------------
                     stop_structure = _structure(data, stop_rows)
