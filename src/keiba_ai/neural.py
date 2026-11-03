@@ -42,12 +42,25 @@ class NeuralConfig:
 
 
 def device_name(prefer='auto'):
+    """'cuda' only after a real kernel ran on the GPU (a wheel without this GPU's architecture fails here)."""
+    import warnings
     import torch
     if prefer == 'cpu':
         return 'cpu'
-    if prefer == 'cuda' and not torch.cuda.is_available():
+    if torch.cuda.is_available():
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                if float((torch.ones(4, device='cuda') * 2).sum()) == 8.0:
+                    return 'cuda'
+        except Exception as exc:  # e.g. "no kernel image is available for execution on the device"
+            if prefer == 'cuda' or prefer == 'auto':
+                raise ValueError('GPUはありますが、このPyTorchはそのGPUに対応していません'
+                                 f'（{torch.cuda.get_device_name(0)}）。scripts\\setup-nn.ps1 を実行し直してください。'
+                                 f' 詳細: {exc}') from exc
+    if prefer == 'cuda':
         raise ValueError('GPU（CUDA）を使えません。PyTorchのGPU版を入れてください（scripts\\setup-nn.ps1）。')
-    return 'cuda' if torch.cuda.is_available() else 'cpu'
+    return 'cpu'
 
 
 # --------------------------------------------------------------------------
