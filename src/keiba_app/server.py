@@ -229,6 +229,18 @@ class Api:
     POST = {'race/predict': predict_race, 'day/discover': discover, 'day/predict': predict_day, 'nightly': nightly}
 
 
+_DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], _DISCONNECTED):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_handler(api: Api):
     class Handler(BaseHTTPRequestHandler):
         server_version = 'KeibaApp/1'
@@ -238,12 +250,15 @@ def make_handler(api: Api):
 
         def _send(self, code, body, content_type='application/json; charset=utf-8'):
             data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode('utf-8')
-            self.send_response(code)
-            self.send_header('Content-Type', content_type)
-            self.send_header('Content-Length', str(len(data)))
-            self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(code)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(data)))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(data)
+            except _DISCONNECTED:  # the browser left (reload / navigation) before the answer arrived
+                self.close_connection = True
 
         def _api(self, table, name, argument):
             function = table.get(name)
@@ -289,7 +304,7 @@ def make_handler(api: Api):
 
 def serve(app: App, *, host='127.0.0.1', port=8765):
     api = Api(app)
-    server = ThreadingHTTPServer((host, port), make_handler(api))
+    server = _Server((host, port), make_handler(api))
     print(json.dumps(dict(event='serving', url=f'http://{host}:{port}/'), ensure_ascii=False), flush=True)
     try:
         server.serve_forever()
