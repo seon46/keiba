@@ -53,3 +53,35 @@ class ExperimentKTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipUnless(all(importlib.util.find_spec(name) for name in ('lightgbm', 'sklearn', 'scipy', 'torch')),
+                     'Install requirements-ml.txt and PyTorch for the v3l experiment tests')
+class ExperimentLTests(unittest.TestCase):
+    def test_tabm_variants_run(self):
+        from keiba_ai.cli import prepare
+        from keiba_ai.experiment_v3l import DEFAULT_VARIANTS, main
+        from test_ai_experiment_v3d import jockey_csv
+        from test_ai_experiment_v3j import pedigree_store
+        with TemporaryDirectory() as name:
+            root = Path(name)
+            jockey_csv(root / 'source.csv', years=(2021, 2022, 2023, 2024, 2025, 2026))
+            with (root / 'source.csv').open(encoding='utf-8') as file:
+                horses = sorted({row['horse_id'] for row in csv.DictReader(file)})
+            pedigree_store(root / 'data', horses)
+            with redirect_stdout(io.StringIO()):
+                database = prepare(root / 'source.csv', root / 'prepared')
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = main(['--dataset', str(database), '--race-db', str(root / 'data' / 'keiba.sqlite3'),
+                             '--cache-dir', str(root / 'cache'), '--output-dir', str(root / 'l'),
+                             '--validation-years', '2025', '--threads', '1', '--rounds', '200', '--patience', '20',
+                             '--evaluation-samples', '64', '--device', 'cpu'])
+            self.assertEqual(code, 0, output.getvalue()[-3000:])
+            report = json.loads((root / 'l' / 'experiment.json').read_text(encoding='utf-8'))
+            for group in ('central_flat', 'local_flat'):
+                summary = report['groups'][group]['summary']
+                for variant in DEFAULT_VARIANTS:
+                    self.assertTrue(np.isfinite(summary[variant]['race_outcome_log_loss']), variant)
+                    self.assertIn(f'D_{variant}', summary)
+                self.assertEqual(report['groups'][group]['folds'][0]['variants']['tabm']['config']['ensemble'], 32)

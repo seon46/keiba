@@ -624,6 +624,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-nn.ps1
 .\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3k --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3k --threads 2
 ```
 
+## v3実験L：TabM型のニューラルネット
+
+`keiba_ai.experiment_v3l` は、実験Kと同じLightGBMの保存分（`--cache-dir`）を使い、次を比べます。
+
+- `tabm`：TabM型（重みを共有した32個のモデルの平均）＋数値の周期埋め込み（各特徴量を学習された周波数のsin/cosでベクトル化）＋レース内の注意機構。
+- `tabm_noattn`：注意機構なし（各馬を自分の特徴量だけで評価）。`tabm_noemb`：数値の埋め込みなし。
+- 参考に `nn_j`（実験Jの設定）と `nn_sched`。それぞれ単体と、B（LightGBM＋血統）との混ぜ合わせ（`D_…`）で採点します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3l --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3l --threads 2
+```
+
 ## v3パイプライン：最良設定での学習と出馬表の予測（オッズ・トラックバイアス不使用）
 
 `keiba_ai.pipeline_v3` は、v3実験で最良だった設定で、中央平地・地方平地ごとのモデルを学習し、出馬表から各馬の順位分布を出します。

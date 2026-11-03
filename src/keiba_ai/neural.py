@@ -39,6 +39,16 @@ class NeuralConfig:
     ancestor_min_count: int = 2
     entity_min_count: int = 20
     seed: int = 42
+    # TabM-style parameter-efficient ensemble (1 = a single network, the experiment J model)
+    ensemble: int = 1
+    # periodic numerical embeddings (each scaled feature -> learned-frequency sin/cos -> small vector)
+    numeric_embedding: bool = False
+    n_frequencies: int = 48
+    frequency_scale: float = .01
+    numeric_dim: int = 16
+    # attention across the runners of a race
+    attention: bool = True
+    beta2: float = .999
 
 
 def device_name(prefer='auto'):
@@ -93,6 +103,7 @@ class Inputs:
         scaled = (np.clip(values, low, high) - mean) / spread
         scaled[missing] = 0.0
         self.numeric = np.concatenate([scaled, missing[:, flagged].astype(np.float64)], axis=1).astype(np.float32)
+        self.continuous = scaled.shape[1]  # the first columns are scaled values, the rest missing flags
         self.scaling = dict(numeric=numeric, low=low, high=high, mean=mean, spread=spread, flagged=flagged)
         # categorical codes -> indices (0 = unseen / missing)
         self.cat_vocab = []
@@ -167,6 +178,8 @@ def _batch(inputs, races, device):
 # --------------------------------------------------------------------------
 
 def build_model(inputs, config: NeuralConfig):
+    if config.ensemble > 1 or config.numeric_embedding or not config.attention:
+        return build_tabm_model(inputs, config)
     import torch
     from torch import nn
 
@@ -202,9 +215,115 @@ def build_model(inputs, config: NeuralConfig):
     return RaceNet()
 
 
+def build_tabm_model(inputs, config: NeuralConfig):
+    """TabM-style network: shared weights + per-member multiplicative adapters (k = ``config.ensemble``),
+    optional periodic numerical embeddings and optional attention across the runners.  Returns scores of
+    shape (races, k, runners); the members are trained on their own PL losses and averaged to predict."""
+    import math
+    import torch
+    from torch import nn
+
+    k = max(1, config.ensemble)
+
+    class EnsembleLinear(nn.Module):
+        def __init__(self, width_in, width_out, random_first):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(width_in, width_out))
+            nn.init.kaiming_uniform_(self.weight.T, a=math.sqrt(5))
+            if random_first:
+                self.r = nn.Parameter(torch.randint(0, 2, (k, width_in)).float() * 2 - 1)
+            else:
+                self.r = nn.Parameter(torch.ones(k, width_in))
+            self.s = nn.Parameter(torch.ones(k, width_out))
+            bound = 1 / math.sqrt(width_in)
+            self.bias = nn.Parameter(torch.empty(width_out).uniform_(-bound, bound).repeat(k, 1))
+
+        def forward(self, x):  # (..., k, in)
+            return (x * self.r) @ self.weight * self.s + self.bias
+
+    class Periodic(nn.Module):
+        def __init__(self, features):
+            super().__init__()
+            self.frequencies = nn.Parameter(torch.randn(features, config.n_frequencies) * config.frequency_scale)
+            self.linear = nn.Linear(2 * config.n_frequencies, config.numeric_dim)
+
+        def forward(self, x):  # (..., F) -> (..., F * numeric_dim)
+            angle = 2 * math.pi * self.frequencies * x[..., None]
+            embedded = torch.relu(self.linear(torch.cat([torch.cos(angle), torch.sin(angle)], dim=-1)))
+            return embedded.flatten(-2)
+
+    class TabRaceNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cat_embeddings = nn.ModuleList(nn.Embedding(card + 1, min(8, card + 1)) for card in inputs.cat_cards)
+            self.jockey = nn.Embedding(len(inputs.jockey_vocab) + 1, config.embedding, padding_idx=0)
+            self.trainer = nn.Embedding(len(inputs.trainer_vocab) + 1, config.embedding, padding_idx=0)
+            self.ancestor = nn.Embedding(len(inputs.ancestor_vocab) + 1, config.pedigree_dim, padding_idx=0)
+            generations = torch.tensor([len(path) for path in _paths()], dtype=torch.float32)
+            self.path_weight = nn.Parameter(.5 ** generations)
+            continuous = inputs.continuous
+            flags = inputs.numeric.shape[1] - continuous
+            self.periodic = Periodic(continuous) if config.numeric_embedding else None
+            numeric_width = continuous * (config.numeric_dim if config.numeric_embedding else 1) + flags
+            width = (numeric_width + sum(min(8, card + 1) for card in inputs.cat_cards)
+                     + 2 * config.embedding + config.pedigree_dim)
+            self.first = EnsembleLinear(width, config.width, True)
+            self.second = EnsembleLinear(config.width, config.width, False)
+            self.dropout = nn.Dropout(config.dropout)
+            if config.attention:
+                layer = nn.TransformerEncoderLayer(config.width, config.heads, 2 * config.width, config.dropout,
+                                                   batch_first=True, norm_first=True, activation='gelu')
+                self.context = nn.TransformerEncoder(layer, config.layers, enable_nested_tensor=False)
+            else:
+                self.context = None
+            self.norm = nn.LayerNorm(config.width)
+            self.head_weight = nn.Parameter(torch.randn(k, config.width) / math.sqrt(config.width))
+            self.head_bias = nn.Parameter(torch.zeros(k))
+
+        def forward(self, batch):
+            ancestry = batch['ancestry']
+            if self.training and config.ancestor_dropout:
+                ancestry = ancestry * (torch.rand(ancestry.shape, device=ancestry.device) >= config.ancestor_dropout)
+            pedigree = (self.ancestor(ancestry) * self.path_weight[None, None, :, None]).sum(2)
+            numeric = batch['numeric']
+            if self.periodic is not None:
+                numeric = torch.cat([self.periodic(numeric[..., :inputs.continuous]),
+                                     numeric[..., inputs.continuous:]], dim=-1)
+            parts = [numeric, pedigree, self.jockey(batch['jockey']), self.trainer(batch['trainer'])]
+            parts += [embedding(batch['cat'][..., position]) for position, embedding in enumerate(self.cat_embeddings)]
+            x = torch.cat(parts, dim=-1)                                  # (B, N, D)
+            races, runners = x.shape[0], x.shape[1]
+            x = x.unsqueeze(2).expand(races, runners, k, x.shape[-1])     # (B, N, k, D)
+            hidden = self.dropout(nn.functional.gelu(self.first(x)))
+            hidden = nn.functional.gelu(self.second(hidden))              # (B, N, k, W)
+            hidden = hidden.permute(0, 2, 1, 3)                           # (B, k, N, W)
+            if self.context is not None:
+                flat = hidden.reshape(races * k, runners, hidden.shape[-1])
+                mask = (~batch['mask']).repeat_interleave(k, dim=0)
+                hidden = self.context(flat, src_key_padding_mask=mask).reshape(races, k, runners, -1)
+            hidden = self.norm(hidden)
+            return torch.einsum('bknw,kw->bkn', hidden, self.head_weight) + self.head_bias[None, :, None]
+
+    return TabRaceNet()
+
+
 def _paths():
     from .pedigree import PATHS
     return PATHS
+
+
+def member_loss(scores, batch):
+    """PL loss of a (races, runners) score matrix, or the mean over members of (races, k, runners)."""
+    if scores.dim() == 2:
+        return pl_loss(scores, batch)
+    races, k, runners = scores.shape
+    expand = lambda tensor: tensor[:, None, :].expand(races, k, runners).reshape(races * k, runners)
+    return pl_loss(scores.reshape(races * k, runners), dict(finished=expand(batch['finished']),
+                                                           positions=expand(batch['positions'])))
+
+
+def ensemble_scores(scores):
+    return scores if scores.dim() == 2 else scores.mean(1)
 
 
 def pl_loss(scores, batch):
@@ -241,7 +360,8 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
     if not len(fit_races) or not len(stop_races):
         raise ValueError('ニューラルネットの学習または早期終了用のレースが不足しています。')
     model = build_model(inputs, config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
+                                  betas=(.9, config.beta2))
     steps = math.ceil(len(fit_races) / config.batch_races) * config.max_epochs
     scheduler = (torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=config.learning_rate, total_steps=steps,
                                                      pct_start=.1) if steps >= 50 else None)
@@ -256,7 +376,7 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
             batch = _batch(inputs, order[start:start + config.batch_races], device)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 scores = model(batch)
-            loss = pl_loss(scores, batch)
+            loss = member_loss(scores, batch)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -291,7 +411,7 @@ def evaluate_loss(model, inputs, races, device, batch_races):
             chunk = races[start:start + batch_races]
             batch = _batch(inputs, chunk, device)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=device == 'cuda'):
-                scores = model(batch)
+                scores = ensemble_scores(model(batch))
             total += float(pl_loss(scores, batch)) * len(chunk)
             count += len(chunk)
     return total / max(count, 1)
@@ -309,7 +429,7 @@ def predict(model, inputs, rows, *, device='auto', batch_races=1024):
         for start in range(0, len(races), batch_races):
             batch = _batch(inputs, races[start:start + batch_races], device)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=device == 'cuda'):
-                output = model(batch).float().cpu().numpy()
+                output = ensemble_scores(model(batch)).float().cpu().numpy()
             index = batch['index']
             scores[index[index >= 0]] = output[index >= 0]
     return scores[rows]

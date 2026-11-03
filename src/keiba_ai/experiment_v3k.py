@@ -36,13 +36,19 @@ from .neural import NeuralConfig
 BASELINE = 'A_lgbm'
 REFERENCE = 'D_nn_j'
 SEEDS = (42, 7, 1234, 2024, 99)
+VARIANT_NAMES = ('nn_j', 'nn_sched', 'nn_reg', 'nn_reg_x5', 'nn_search_x5', 'tabm', 'tabm_noattn', 'tabm_noemb')
 
 
 def variant_configs(seed=42):
     j = NeuralConfig(seed=seed)
     sched = replace(j, max_epochs=12, patience=12)
     reg = replace(sched, dropout=.3, weight_decay=.05, ancestor_dropout=.25, entity_min_count=50, width=160)
-    return dict(nn_j=j, nn_sched=sched, nn_reg=reg)
+    # experiment L: TabM (32 members) + periodic numerical embeddings + race attention, and its ablations
+    tabm = replace(sched, ensemble=32, numeric_embedding=True, attention=True, batch_races=128, dropout=.1,
+                   weight_decay=1e-3, beta2=.95)
+    return dict(nn_j=j, nn_sched=sched, nn_reg=reg, tabm=tabm,
+                tabm_noattn=replace(tabm, attention=False),
+                tabm_noemb=replace(tabm, numeric_embedding=False))
 
 
 def sample_config(rng, seed=42):
@@ -293,7 +299,7 @@ def main(argv=None):
     parser.add_argument('--cache-dir', required=True, type=Path, help='LightGBM部分の保存先（2回目以降は再利用）')
     parser.add_argument('--validation-years', nargs='+', type=int, default=list(DEFAULT_VALIDATION_YEARS))
     parser.add_argument('--groups', nargs='+', default=list(GROUPS), choices=list(GROUPS))
-    parser.add_argument('--variants', nargs='+', choices=('nn_j', 'nn_sched', 'nn_reg', 'nn_reg_x5', 'nn_search_x5'))
+    parser.add_argument('--variants', nargs='+', choices=VARIANT_NAMES)
     parser.add_argument('--search-trials', type=int, default=16)
     parser.add_argument('--seeds', nargs='+', type=int, default=list(SEEDS), help='平均する乱数の種（既定5個）')
     parser.add_argument('--threads', type=int, default=2)
