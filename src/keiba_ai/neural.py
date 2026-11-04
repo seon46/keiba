@@ -51,6 +51,28 @@ class NeuralConfig:
     beta2: float = .999
 
 
+class TrialTooSlow(RuntimeError):
+    """Raised when a training run would take longer than its time limit."""
+
+
+_CAPPED = []
+
+
+def _cap_gpu_memory(torch):
+    """Keep PyTorch within the GPU memory that is free now.  On Windows (WDDM) the driver otherwise
+    spills into system RAM and a run becomes tens of times slower instead of failing with
+    "out of memory"; with the cap an oversized setting fails fast and can be skipped."""
+    if _CAPPED:
+        return
+    try:
+        free, total = torch.cuda.mem_get_info()
+        fraction = max(.3, min(.92, (free - 600 * 2 ** 20) / total))
+        torch.cuda.set_per_process_memory_fraction(fraction)
+        _CAPPED.append(fraction)
+    except Exception:  # an older driver/runtime without mem_get_info: no cap
+        _CAPPED.append(None)
+
+
 def device_name(prefer='auto'):
     """'cuda' only after a real kernel ran on the GPU (a wheel without this GPU's architecture fails here)."""
     import warnings
@@ -62,6 +84,7 @@ def device_name(prefer='auto'):
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
                 if float((torch.ones(4, device='cuda') * 2).sum()) == 8.0:
+                    _cap_gpu_memory(torch)
                     return 'cuda'
         except Exception as exc:  # e.g. "no kernel image is available for execution on the device"
             if prefer == 'cuda' or prefer == 'auto':
@@ -349,7 +372,8 @@ def pl_loss(scores, batch):
 # Training / prediction
 # --------------------------------------------------------------------------
 
-def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', report=None):
+def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', report=None, time_limit=None):
+    """``time_limit`` (seconds): stop with TrialTooSlow as soon as the projected run time exceeds it."""
     import numpy as np
     import torch
     report = report or (lambda **message: None)
@@ -385,6 +409,13 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
                 scheduler.step()
             total += loss.item()
             batches += 1
+            if time_limit and epoch == 1 and batches == 20:
+                per_batch = (time.time() - started) / batches
+                projected = per_batch * math.ceil(len(fit_races) / config.batch_races) * config.max_epochs
+                if projected > time_limit:
+                    raise TrialTooSlow(f'推定{projected / 60:.0f}分かかるため打ち切りました。')
+            if time_limit and time.time() - started > time_limit:
+                raise TrialTooSlow('時間の上限を超えたため打ち切りました。')
         stop_loss = evaluate_loss(model, inputs, stop_races, device, config.batch_races * 4)
         report(event='nn_epoch', epoch=epoch, train_loss=round(total / batches, 5), stop_loss=round(stop_loss, 5),
                seconds=round(time.time() - started, 1))

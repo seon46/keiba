@@ -68,10 +68,11 @@ def sample_config(rng, seed=42):
 def sample_tabm_config(rng, seed=42):
     """Random TabM setting (experiment M search space)."""
     epochs = int(rng.choice([8, 12, 16]))
+    width = int(rng.choice([128, 192, 256]))
     return NeuralConfig(
-        width=int(rng.choice([128, 192, 256, 384])), layers=int(rng.choice([1, 2])), heads=4,
-        attention=bool(rng.random() < .5), ensemble=int(rng.choice([16, 32])),
-        numeric_embedding=bool(rng.random() < .8), numeric_dim=int(rng.choice([8, 16, 24])),
+        width=width, layers=int(rng.choice([1, 2])), heads=4,
+        attention=bool(rng.random() < .5), ensemble=int(rng.choice([16, 32])) if width <= 192 else 16,
+        numeric_embedding=bool(rng.random() < .8), numeric_dim=int(rng.choice([8, 16])),
         n_frequencies=int(rng.choice([16, 32, 48])), frequency_scale=float(10 ** rng.uniform(-2.5, -.5)),
         embedding=int(rng.choice([8, 16])), pedigree_dim=int(rng.choice([16, 32])),
         dropout=float(rng.uniform(0, .3)), ancestor_dropout=float(rng.uniform(0, .3)),
@@ -155,20 +156,21 @@ def load_or_build(cache_dir, database, pedigrees, group, fold, ctx_holder, *, se
 def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEFAULT_VALIDATION_YEARS, groups=GROUPS,
                    train_start='2022-04-01', test_start='2026-01-01', stop_months=2, threads=2, rounds=8000,
                    patience=150, announce_dropout=.05, crossfit_blocks=3, evaluation_samples=1024, seed=42,
-                   device='auto', search_trials=16, seeds=SEEDS, variants=None, report=None):
+                   device='auto', search_trials=16, seeds=SEEDS, variants=None, trial_minutes=15.0, resume=False,
+                   report=None):
     import numpy as np
     from .experiment_v3 import PLStructure
     from .experiment_v3i import fit_hybrid_temperatures
     from .model import feature_revision, readonly
-    from .neural import Inputs, device_name, predict as nn_predict, train as nn_train
+    from .neural import Inputs, TrialTooSlow, device_name, predict as nn_predict, train as nn_train
     from .pedigree import load_pedigrees
     from .ranking_v3 import paired_bootstrap, score_races
 
     report = report or (lambda **message: None)
     database, output = Path(database), Path(output)
     device = device_name(device)
-    if output.exists():
-        raise ValueError(f'出力先は既にあります。別の出力先を指定してください: {output}')
+    if output.exists() and not resume:
+        raise ValueError(f'出力先は既にあります。続きから再開するには --resume を付けてください: {output}')
     if any(f'{year:04d}-12-31' >= test_start for year in validation_years):
         raise ValueError('最終評価期間（test-start以降）を検証年に含めることはできません。')
     connection = readonly(database)
@@ -200,10 +202,16 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                                                  search_trials=search_trials,
                                                  fixed={name: asdict(config) for name, config in fixed.items()}),
                   groups={})
-    output.mkdir(parents=True)
-    losses_file = (output / 'race_losses.csv').open('w', encoding='utf-8', newline='')
+    output.mkdir(parents=True, exist_ok=True)
+    partial = output / 'partial'
+    partial.mkdir(exist_ok=True)
+    new_losses = not (output / 'race_losses.csv').exists()
+    losses_file = (output / 'race_losses.csv').open('a', encoding='utf-8', newline='')
     losses = csv.writer(losses_file)
-    losses.writerow(['group', 'config', 'validation_year', 'race_id', 'outcome_log_loss', 'top3_log_loss', 'win_log_loss'])
+    if new_losses:
+        losses.writerow(['group', 'config', 'validation_year', 'race_id', 'outcome_log_loss', 'top3_log_loss',
+                         'win_log_loss'])
+    variants_key = hashlib.sha256(json.dumps([wanted, search_trials, list(seeds)]).encode()).hexdigest()[:10]
     ctx_holder = {}
     try:
         for group in groups:
@@ -211,6 +219,17 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
             per_race = {}
             for fold in folds:
                 year = fold['validation_year']
+                saved = partial / f'{group}_{year}_{variants_key}.json'
+                if saved.is_file():
+                    stored = json.loads(saved.read_text(encoding='utf-8'))
+                    for name, scored in stored['scored'].items():
+                        per_race.setdefault(name, []).append(dict(
+                            scored, outcome=np.asarray(scored['outcome']), top3=np.asarray(scored['top3']),
+                            win=np.asarray([np.nan if value is None else value for value in scored['win']])))
+                    group_result['folds'].append(stored['fold_result'])
+                    report(event='fold_resumed', group=group, validation_year=year)
+                    continue
+                fold_scored = {}
                 arrays, cached = load_or_build(cache_dir, database, pedigrees, group, fold, ctx_holder, settings=settings,
                                                report=report)
                 race_ids = arrays['race_ids'].astype(object)
@@ -233,9 +252,9 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                                                    positions, jockeys, trainers, pedigrees, horses, fit_rows, config)
                     return inputs_cache[key]
 
-                def run(config, label):
+                def run(config, label, time_limit=None):
                     inputs = inputs_for(config)
-                    network, info = nn_train(inputs, fit_rows, stop_all, config, device=device,
+                    network, info = nn_train(inputs, fit_rows, stop_all, config, device=device, time_limit=time_limit,
                                              report=lambda **message: report(group=group, validation_year=year,
                                                                              config=label, **message))
                     validation_scores = nn_predict(network, inputs, validation_rows)
@@ -263,10 +282,12 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                     for trial in range(search_trials):
                         config = sampler(generator, seed)
                         try:
-                            _, _, info = run(config, f'{label}_search{trial}')
+                            _, _, info = run(config, f'{label}_search{trial}', time_limit=trial_minutes * 60)
                             loss = info['stop_loss']
-                        except torch.cuda.OutOfMemoryError:
+                        except (torch.cuda.OutOfMemoryError, TrialTooSlow) as exc:
                             torch.cuda.empty_cache()
+                            report(event='search_trial_skipped', group=group, validation_year=year, trial=trial,
+                                   reason='GPUのメモリ不足' if isinstance(exc, torch.cuda.OutOfMemoryError) else str(exc))
                             loss = float('inf')
                         trials.append((loss, config))
                         report(event='search_trial', group=group, validation_year=year, search=label, trial=trial,
@@ -333,11 +354,18 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
                     entry = fold_result['variants'].setdefault(name, {})
                     entry.update(temperatures=temperatures[:6], stop_pl_loss=stop_loss, metrics=scored['metrics'])
                     per_race.setdefault(name, []).append(scored)
+                    fold_scored[name] = dict(race_ids=list(scored['race_ids']), metrics=scored['metrics'],
+                                             outcome=scored['outcome'].tolist(), top3=scored['top3'].tolist(),
+                                             win=[None if np.isnan(value) else float(value) for value in scored['win']])
                     for race, a, b, c in zip(scored['race_ids'], scored['outcome'], scored['top3'], scored['win']):
                         losses.writerow([group, name, year, race, f'{a:.6f}', f'{b:.6f}', '' if np.isnan(c) else f'{c:.6f}'])
                     report(event='scored', group=group, validation_year=year, config=name,
                            race_outcome_log_loss=scored['metrics']['race_outcome_log_loss'])
                 group_result['folds'].append(fold_result)
+                temporary = saved.with_suffix('.tmp')
+                temporary.write_text(json.dumps(dict(fold_result=fold_result, scored=fold_scored), ensure_ascii=False,
+                                                default=str), encoding='utf-8')
+                temporary.replace(saved)
                 del arrays
             summary = {}
             combine = lambda field, folds_: np.concatenate([item[field] for item in folds_])
@@ -378,6 +406,8 @@ def main(argv=None):
     parser.add_argument('--variants', nargs='+', choices=VARIANT_NAMES)
     parser.add_argument('--search-trials', type=int, default=16)
     parser.add_argument('--seeds', nargs='+', type=int, default=list(SEEDS), help='平均する乱数の種（既定5個）')
+    parser.add_argument('--trial-minutes', type=float, default=15.0, help='設定探索の1回あたりの時間の上限（分）')
+    parser.add_argument('--resume', action='store_true', help='同じ出力先で、終わった年を飛ばして続きから再開')
     parser.add_argument('--threads', type=int, default=2)
     parser.add_argument('--rounds', type=int, default=8000)
     parser.add_argument('--patience', type=int, default=150)
@@ -396,6 +426,7 @@ def main(argv=None):
                                 validation_years=args.validation_years, groups=args.groups, threads=args.threads,
                                 rounds=args.rounds, patience=args.patience, evaluation_samples=args.evaluation_samples,
                                 device=args.device, search_trials=args.search_trials, variants=args.variants, seeds=tuple(args.seeds),
+                                trial_minutes=args.trial_minutes, resume=args.resume,
                                 report=emit)
     except (ValueError, OSError, sqlite3.Error, KeyError) as exc:
         emit(event='error', message=str(exc))
