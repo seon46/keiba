@@ -362,15 +362,15 @@ class Engine:
                     pick_horse_number=pick['horse_number'], pick_win_probability=pick.get('win_probability'),
                     pick_top3_probability=pick.get('top3_probability'))
 
-    def bets(self, prediction_id, *, min_hit=.2, max_points=10):
+    def bets(self, prediction_id, *, min_hit=.2, max_points=10, budget=1000):
         from keiba_ai.bets import BET_NAMES, propose
         prediction = self.logbook.prediction(prediction_id)
         if prediction is None:
             raise KeyError('予想がありません。')
         race_bets = self._race_bets(prediction)
         saved = self.saved.odds(prediction['region'], prediction['race_id'])
-        proposals = propose(race_bets, (saved or {}).get('odds'), min_hit=min_hit, max_points=max_points)
-        return dict(prediction_id=prediction_id, proposals=proposals, bet_names=BET_NAMES,
+        proposals = propose(race_bets, (saved or {}).get('odds'), min_hit=min_hit, max_points=max_points, budget=budget)
+        return dict(prediction_id=prediction_id, proposals=proposals, bet_names=BET_NAMES, budget=budget,
                     approximate=getattr(race_bets, 'approximate', False), samples=race_bets.samples,
                     odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
                                                          official_at=saved.get('official_at'), status=saved.get('status'),

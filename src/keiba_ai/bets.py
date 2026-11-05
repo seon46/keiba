@@ -161,13 +161,39 @@ def _odds_value(entry, conservative=True):
     return float(entry) if isinstance(entry, (int, float)) and entry > 0 else None
 
 
-def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, limit=8, per_type=1):
-    """Multi-point proposals (equal 100 yen per ticket).
+def allocate(odds, budget, unit=100):
+    """Stakes (yen, multiples of ``unit``) so that every ticket pays about the same when it hits.
+
+    The largest common payout target whose stakes fit in ``budget`` is used; returns
+    (stakes, smallest payout, total) or None when the budget cannot buy one unit of each ticket.
+    """
+    odds = [float(value) for value in odds]
+    if not odds or budget < unit * len(odds):
+        return None
+
+    def stakes_for(target):
+        return [max(unit, unit * math.ceil(target / (unit * value) - 1e-9)) for value in odds]
+
+    low, high = 0.0, float(budget) * max(odds)
+    for _ in range(60):  # largest target whose total fits in the budget
+        middle = (low + high) / 2
+        if sum(stakes_for(middle)) <= budget:
+            low = middle
+        else:
+            high = middle
+    stakes = stakes_for(low)
+    return stakes, min(stake * value for stake, value in zip(stakes, odds)), sum(stakes)
+
+
+def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, budget=1000, limit=8, per_type=1):
+    """Multi-point proposals.
 
     For each bet type the tickets are ranked by hit probability and every leading set of 1..N
-    tickets is a candidate.  Candidates below ``min_hit`` are dropped; the rest are sorted by
-    expected return (when odds are known) or by hit rate, keeping the best set of each bet type.
-    Expected return uses the lower odds of 複勝 / ワイド ranges.
+    tickets is a candidate.  Candidates below ``min_hit`` are dropped.  With odds, the ``budget`` is
+    split so that every ticket pays about the same (more on the shorter odds), sets that would lose
+    money even when they hit (トリガミ) are dropped, and the rest are sorted by expected return.
+    Without odds every ticket gets 100 yen and the sets are sorted by hit rate.  The lower odds of
+    複勝 / ワイド ranges are used.
     """
     odds = odds or {}
     proposals = []
@@ -186,14 +212,26 @@ def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, limit=8, pe
                 continue
             values = [_odds_value(table.get(key)) for key in keys]
             priced = all(value is not None for value in values)
-            expected = (sum(probabilities[key] * value for key, value in zip(keys, values)) / size
-                        if priced else None)
-            proposals.append(dict(
-                bet=bet, name=name, tickets=[dict(key=key, probability=probabilities[key], odds=table.get(key))
-                                             for key in keys],
-                points=size, cost=100 * size, hit_rate=hit, expected_return=expected,
-                payout_range=([round(min(v for v in values) * 100), round(max(v for v in values) * 100)]
-                              if priced else None)))
+            item = dict(bet=bet, name=name, points=size, hit_rate=hit, priced=priced)
+            if priced:
+                allocation = allocate(values, budget)
+                if allocation is None:
+                    continue
+                stakes, payout, total = allocation
+                if payout < total:  # a hit would still lose money
+                    continue
+                item.update(cost=total, stakes=stakes, min_payout=round(payout),
+                            max_payout=round(max(stake * value for stake, value in zip(stakes, values))),
+                            expected_return=sum(probabilities[key] * stake * value
+                                                for key, stake, value in zip(keys, stakes, values)) / total,
+                            synthetic_odds=1 / sum(1 / value for value in values))
+            else:
+                stakes = [100] * size
+                item.update(cost=100 * size, stakes=stakes, min_payout=None, max_payout=None, expected_return=None,
+                            synthetic_odds=None)
+            item['tickets'] = [dict(key=key, probability=probabilities[key], odds=table.get(key), stake=stake)
+                               for key, stake in zip(keys, stakes)]
+            proposals.append(item)
     proposals.sort(key=lambda item: (item['expected_return'] is None, -(item['expected_return'] or 0),
                                      -item['hit_rate'], item['points']))
     chosen, used = [], {}

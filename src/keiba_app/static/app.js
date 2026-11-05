@@ -404,6 +404,7 @@ const betsCache = new Map();
 const betsSettings = {
   get minHit() { return Number(store.get('minHit', '0.2')); },
   get maxPoints() { return Number(store.get('maxPoints', '10')); },
+  get budget() { return Number(store.get('budget', '1000')); },
 };
 
 function ticketLabel(key) {
@@ -432,12 +433,12 @@ function confidenceText(c) {
 }
 
 async function loadBets(region, raceId, prediction) {
-  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}`;
+  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}`;
   let data = betsCache.get(key);
   const box = () => view.querySelector('#bets');
   if (!data) {
     try {
-      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}`);
+      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}`);
       betsCache.set(key, data);
     } catch (e) {
       if (box()) box().innerHTML = `<h2>買い目の提案</h2><p class="error-text">${esc(e.message)}</p>`;
@@ -457,26 +458,28 @@ async function loadBets(region, raceId, prediction) {
     <div class="controls">
       ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
       ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
+      ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '予算')}
       <span class="spacer"></span>
       ${data.odds_partial ? '<span class="small muted">地方は3連複・3連単のオッズなし</span>' : ''}
       <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
     </div>
     <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
-      ${hasEv ? '期待値の高い順（1点100円・同額買い）。期待値はモデルの確率×オッズの目安で、100%を超えても儲かる保証はありません。' : ''}
+      ${hasEv ? 'どれが当たっても払戻がほぼ同じになるよう、オッズの低い買い目ほど多く買う配分です（当たっても損になる買い方は出しません）。期待値の高い順。期待値はモデルの確率×オッズの目安で、100%を超えても儲かる保証はありません。' : odds ? '' : 'オッズを取得すると、当たっても損にならない金額配分と期待値を出します。'}
       ${data.approximate ? 'この予想は温度の記録がない古い予想のため、確率は近似です。' : ''}</p>
     ${data.proposals.length ? `<div class="list-wrap"><table class="list bets-table">
-      <thead><tr><th>券種</th><th>買い目</th><th class="num">点数</th><th class="num">的中率</th><th class="num">期待値</th><th class="num opt">払戻（的中時）</th></tr></thead>
+      <thead><tr><th>券種</th><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
       <tbody>${data.proposals.map((p) => `<tr class="${p.expected_return != null && p.expected_return >= 1 ? 'good' : ''}">
         <td class="bet-name">${esc(p.name)}</td>
-        <td><div class="tickets">${p.tickets.map((t) => `<span class="ticket">${esc(ticketLabel(t.key))}<small>${t.odds != null ? `${oddsLabel(t.odds)}倍` : ''}<span class="detail">${t.odds != null ? ' · ' : ''}${pct(t.probability)}</span></small></span>`).join('')}</div></td>
-        <td class="num">${p.points}点<div class="small muted">${p.cost.toLocaleString()}円</div></td>
+        <td><div class="tickets">${p.tickets.map((t) => `<span class="ticket">${esc(ticketLabel(t.key))}${p.priced ? `<b class="stake">${t.stake.toLocaleString()}円</b>` : ''}<small>${t.odds != null ? `${oddsLabel(t.odds)}倍` : ''}<span class="detail">${t.odds != null ? ' · ' : ''}${pct(t.probability)}</span></small></span>`).join('')}</div></td>
+        <td class="num opt">${p.cost.toLocaleString()}円<div class="small muted">${p.points}点</div></td>
         <td class="num prob">${pct(p.hit_rate)}</td>
         <td class="num">${p.expected_return != null ? pct(p.expected_return, 0) : '–'}</td>
-        <td class="num opt">${p.payout_range ? (p.payout_range[0] === p.payout_range[1] ? `${p.payout_range[0].toLocaleString()}円` : `${p.payout_range[0].toLocaleString()}〜${p.payout_range[1].toLocaleString()}円`) : '–'}</td>
+        <td class="num opt">${p.min_payout != null ? `${p.min_payout.toLocaleString()}${p.max_payout > p.min_payout ? `〜${p.max_payout.toLocaleString()}` : ''}円<div class="small muted">+${(p.min_payout - p.cost).toLocaleString()}円〜</div>` : '–'}</td>
       </tr>`).join('')}</tbody></table></div>`
     : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}`;
   box().querySelector('#min-hit').addEventListener('change', (e) => { store.set('minHit', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#max-points').addEventListener('change', (e) => { store.set('maxPoints', e.target.value); loadBets(region, raceId, prediction); });
+  box().querySelector('#budget').addEventListener('change', (e) => { store.set('budget', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#odds')?.addEventListener('click', async (event) => {
     event.target.disabled = true;
     try {

@@ -161,9 +161,10 @@ class Api:
             identifier = int(query.get('prediction', ''))
             min_hit = min(max(float(query.get('min_hit', .2)), 0), 1)
             max_points = min(max(int(query.get('max_points', 10)), 1), 30)
+            budget = min(max(int(query.get('budget', 1000)) // 100 * 100, 100), 1_000_000)
         except ValueError as exc:
-            raise ValueError('prediction・min_hit・max_points の指定が不正です。') from exc
-        return self.engine.bets(identifier, min_hit=min_hit, max_points=max_points)
+            raise ValueError('prediction・min_hit・max_points・budget の指定が不正です。') from exc
+        return self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget)
 
     def job(self, query):
         job = self.jobs.get(query.get('id', ''))
