@@ -5,7 +5,7 @@ import unittest
 
 
 SAMPLE = {"status": "middle", "data": {"official_datetime": "2026-11-08 15:20:00", "odds": {
-    "1": {"01": ["2.3", "", "1"], "02": ["15.8", "", "5"], "03": ["---.-", "", "0"]},
+    "1": {"1": ["2.3", "", "1"], "2": ["15.8", "", "5"], "3": ["---.-", "", "0"]},
     "2": {"01": ["1.1", "1.3", "1"], "02": ["2.5", "4.1", "4"]},
     "4": {"0102": ["12.4", "", "3"]},
     "5": {"0102": ["3.1", "3.9", "2"]},
@@ -35,6 +35,10 @@ class OddsParserTests(unittest.TestCase):
             parse_odds_json('<html></html>', race_id='202605050811', region='central')
         with self.assertRaises(ParseError):
             parse_odds_json(json.dumps({"status": "yoso", "data": ""}), race_id='202605050811', region='central')
+        with self.assertRaisesRegex(ParseError, '発売前'):  # real response of a race days before sales
+            parse_odds_json(json.dumps({"status": "yoso", "data": {"odds": {"1": {"18": ["4.8", "", "1"]}}},
+                                        "reason": "empty free odds schedule"}), race_id='202605050211',
+                            region='central')
         with self.assertRaises(ParseError):
             parse_odds_json(json.dumps({"data": {"odds": {"4": {"012": ["1.0"]}}}}), race_id='202605050811',
                             region='central')

@@ -587,6 +587,9 @@ def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
     if not isinstance(tables, dict):
         status = payload.get("status") if isinstance(payload, dict) else None
         raise ParseError(f"オッズの表がありません（status={status!r}）。発売前か、形式が変わった可能性があります。")
+    if payload.get("status") == "yoso":
+        # Before sales open netkeiba shows only forecast win odds, keyed before the horse numbers are drawn.
+        raise ParseError("まだ発売前で、予想オッズしかありません（馬番の確定前）。発売が始まってから取得してください。")
     odds, popularity = {}, {}
     for code, table in tables.items():
         if str(code) not in ODDS_TYPES or not isinstance(table, dict):
@@ -595,6 +598,8 @@ def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
         entries, ranks = {}, {}
         for raw_key, value in table.items():
             digits = str(raw_key)
+            if width == 1 and digits.isdigit() and len(digits) <= 2:
+                digits = digits.zfill(2)  # single horses come unpadded ("5")
             if not digits.isdigit() or len(digits) != 2 * width:
                 raise ParseError(f"オッズの組み合わせの形式が想定と違います: {bet} {raw_key!r}")
             numbers = [int(digits[index:index + 2]) for index in range(0, len(digits), 2)]
