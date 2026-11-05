@@ -215,6 +215,16 @@ class Logbook:
                             bool(row['pick_top3']) if scored and row['pick_top3'] is not None else None))
         return history
 
+    def day_win_probabilities(self, day):
+        """{race_id: (region, win probabilities)} of the latest prediction of each race on ``day``."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT p.race_id,p.region,GROUP_CONCAT(r.win_probability) AS wins FROM predictions p "
+                "JOIN prediction_runners r ON r.prediction_id=p.id WHERE p.race_date=? AND r.win_probability IS NOT NULL "
+                "AND p.id=(SELECT q.id FROM predictions q WHERE q.race_id=p.race_id ORDER BY q.created_at DESC, q.id DESC "
+                "LIMIT 1) GROUP BY p.id", (day,)).fetchall()
+        return {row['race_id']: (row['region'], [float(value) for value in row['wins'].split(',')]) for row in rows}
+
     # -- day races and runs --------------------------------------------
     def set_day_races(self, day, region, races, discovered_at):
         with self._connect() as connection:

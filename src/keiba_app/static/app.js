@@ -148,13 +148,14 @@ async function dayView(day) {
         <button type="button" id="discover">レース一覧を取得</button>
         <button type="button" id="all" class="primary" ${data.races.length ? '' : 'disabled'}>この日の全レースを予想</button>
       </div>
+      ${confidentPanel(races)}
       ${races.length ? `<div class="venues">${[...venues].map(([course, list]) => `
         <section class="venue"><h3>${esc(course)}</h3><ol>${list.map((race) => `
           <li class="${race.supported ? '' : 'unsupported'}"><a href="#/race/${race.region}/${race.race_id}">
             <span class="rno">${race.race_number}R</span>
             <span class="time">${esc(race.start_time || '')}</span>
             <span class="name">${esc(race.race_name || (race.supported ? '' : '対象外'))}</span>
-            <span class="mark">${race.predictions ? '予想済' : ''}</span>
+            <span class="mark">${race.confidence ? `<span class="conf-mini conf-${race.confidence.tier}" title="自信度">${race.confidence.tier}</span>` : race.predictions ? '予想済' : ''}</span>
           </a></li>`).join('')}</ol></section>`).join('')}</div>`
         : `<p class="empty">${data.races.length ? `この日の${regionName(region)}のレースはありません。` : 'この日のレースはまだ取得していません。「レース一覧を取得」を押すと、netkeibaの日別一覧から取得します。'}</p>`}`;
     view.querySelector('#pick').addEventListener('change', (event) => { location.hash = '#/day/' + event.target.value; });
@@ -179,6 +180,25 @@ async function dayView(day) {
     });
   };
   draw();
+}
+
+// Predicted races of the shown region with confidence A, most concentrated first.
+function confidentPanel(races) {
+  const predicted = races.filter((race) => race.confidence);
+  if (!predicted.length) return '';
+  const top = predicted.filter((race) => race.confidence.tier === 'A')
+    .sort((a, b) => b.confidence.value - a.confidence.value);
+  return `<section class="confident">
+      <h2>自信度の高いレース <span class="small muted">予想済み${predicted.length}レース中 A ${top.length}レース</span></h2>
+      ${top.length ? `<ol>${top.map((race) => `<li><a href="#/race/${race.region}/${race.race_id}">
+          <span class="conf-mini conf-A">A</span>
+          <span class="where">${esc(race.course)} ${race.race_number}R</span>
+          <span class="time">${esc(race.start_time || '')}</span>
+          <span class="name">${esc(race.race_name || '')}</span>
+          <span class="score small muted">偏り ${(race.confidence.value * 100).toFixed(0)}</span></a></li>`).join('')}</ol>`
+        : '<p class="muted small">自信度Aのレースはありません。</p>'}
+      <p class="small muted">自信度は予想済みのレースだけに付きます。全レースに付けるには「この日の全レースを予想」を押してください。</p>
+    </section>`;
 }
 
 function alertJob(error) {

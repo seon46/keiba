@@ -113,12 +113,14 @@ class Api:
             entry = listed.setdefault(key, dict(region=key[0], race_id=key[1]))
             entry.update({field: value for field, value in saved.items() if value is not None})
         marks = self.engine.logbook.predicted_races(day)
+        confidence = self.engine.day_confidence(day)
         from .sources import course_of, race_number_of
         races = []
         for (region, race_id), race in listed.items():
             race.setdefault('course', course_of(region, race_id))
             race['race_number'] = race.get('race_number') or race_number_of(race_id)
             race['predictions'] = marks.get(race_id, {}).get('count', 0)
+            race['confidence'] = confidence.get(race_id)
             surface = race.get('surface') or ''
             race['supported'] = race.get('race_type') != 'banei' and '帯広' not in str(race['course']) and '障' not in surface
             races.append(race)

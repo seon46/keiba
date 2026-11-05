@@ -309,28 +309,42 @@ class Engine:
             self._bets.popitem(last=False)
         return bets
 
-    def confidence(self, prediction):
-        """Concentration of the win probabilities, its tier (A/B/C among this region's races) and the past record."""
+    def confidence_scale(self, region):
+        """(tier function, thresholds, basis, history) for a region; refreshed at most once a minute."""
         import time
         from keiba_ai.bets import concentration
-        region = prediction['region']
         cached = self._confidence.get(region)
         if cached is None or time.time() - cached[0] > 60:
             history = [(concentration(wins), won, top3) for wins, won, top3 in self.logbook.confidence_history(region)]
-            cached = self._confidence[region] = (time.time(), [item for item in history if item[0] is not None])
-        history = cached[1]
+            history = [item for item in history if item[0] is not None]
+            values = sorted(item[0] for item in history)
+            if len(values) >= 30:
+                low, high, basis = values[len(values) // 3], values[2 * len(values) // 3], 'history'
+            else:
+                low, high, basis = .10, .20, 'default'
+            cached = self._confidence[region] = (time.time(), history, low, high, basis)
+        _, history, low, high, basis = cached
+        return (lambda c: 'A' if c >= high else 'B' if c >= low else 'C'), [low, high], basis, history
+
+    def day_confidence(self, day):
+        """{race_id: dict(tier, value)} from the latest prediction of each race of the day."""
+        from keiba_ai.bets import concentration
+        result = {}
+        for race_id, (region, wins) in self.logbook.day_win_probabilities(day).items():
+            value = concentration(wins)
+            if value is not None:
+                tier_of = self.confidence_scale(region)[0]
+                result[race_id] = dict(tier=tier_of(value), value=value)
+        return result
+
+    def confidence(self, prediction):
+        """Concentration of the win probabilities, its tier (A/B/C among this region's races) and the past record."""
+        from keiba_ai.bets import concentration
+        tier_of, (low, high), basis, history = self.confidence_scale(prediction['region'])
         value = concentration([runner.get('win_probability') for runner in prediction['runners']
                                if runner.get('distribution') is not None])
         if value is None:
             return None
-        values = sorted(item[0] for item in history)
-        if len(values) >= 30:
-            low, high = values[len(values) // 3], values[2 * len(values) // 3]
-            basis = 'history'
-        else:
-            low, high = .10, .20
-            basis = 'default'
-        tier_of = lambda c: 'A' if c >= high else 'B' if c >= low else 'C'
         tiers = {}
         for c, won, top3 in history:
             if won is None:
