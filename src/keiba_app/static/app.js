@@ -148,7 +148,6 @@ async function dayView(day) {
         <button type="button" id="discover">レース一覧を取得</button>
         <button type="button" id="all" class="primary" ${data.races.length ? '' : 'disabled'}>この日の全レースを予想</button>
       </div>
-      ${confidentPanel(races)}
       ${races.length ? `<div class="venues">${[...venues].map(([course, list]) => `
         <section class="venue"><h3>${esc(course)}</h3><ol>${list.map((race) => `
           <li class="${race.supported ? '' : 'unsupported'}"><a href="#/race/${race.region}/${race.race_id}">
@@ -157,7 +156,8 @@ async function dayView(day) {
             <span class="name">${esc(race.race_name || (race.supported ? '' : '対象外'))}</span>
             <span class="mark">${race.confidence ? `<span class="conf-mini conf-${race.confidence.tier}" title="自信度">${race.confidence.tier}</span>` : race.predictions ? '予想済' : ''}</span>
           </a></li>`).join('')}</ol></section>`).join('')}</div>`
-        : `<p class="empty">${data.races.length ? `この日の${regionName(region)}のレースはありません。` : 'この日のレースはまだ取得していません。「レース一覧を取得」を押すと、netkeibaの日別一覧から取得します。'}</p>`}`;
+        : `<p class="empty">${data.races.length ? `この日の${regionName(region)}のレースはありません。` : 'この日のレースはまだ取得していません。「レース一覧を取得」を押すと、netkeibaの日別一覧から取得します。'}</p>`}
+      ${confidentPanel(races)}`;
     view.querySelector('#pick').addEventListener('change', (event) => { location.hash = '#/day/' + event.target.value; });
     view.querySelectorAll('[data-region]').forEach((button) => button.addEventListener('click', () => {
       region = button.dataset.region; store.set('region', region); draw();
