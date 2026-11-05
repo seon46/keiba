@@ -183,6 +183,8 @@ table.card { border-collapse: collapse; width: 100%; min-width: 860px; }
 .sub { font-size: 12px; color: var(--muted); white-space: nowrap; }
 .prob { font-weight: 700; }
 .prob.lead { color: var(--bar); }
+.card td.odds { font-weight: 700; white-space: nowrap; }
+.card td.odds-place { white-space: nowrap; font-size: 13px; }
 td.dist { width: 1%; padding-top: 2px; padding-bottom: 2px; }
 td.finish { font-weight: 700; font-size: 16px; text-align: center; }
 td.finish.top3 { color: var(--hit); }
@@ -274,6 +276,8 @@ pre.log { background: var(--surface); border: 1px solid var(--line); border-radi
   .card thead th { white-space: normal; font-size: 11px; }
   .card .prob, .card td.num { font-size: 13px; }
   td.finish { font-size: 14px; }
+  .card td.odds { font-size: 13px; }
+  .card td.odds .sub { font-size: 10px; }
   .hn { display: inline-flex; width: 26px; height: 26px; align-items: center; justify-content: center;
         border-radius: 4px; font-size: 13px; border: 1px solid rgba(0,0,0,.18); }
   .horse { font-size: 14px; white-space: normal; }

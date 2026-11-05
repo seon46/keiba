@@ -149,7 +149,12 @@ class Api:
                         race_start_time=latest['start_time'], race_surface=latest['surface'],
                         race_distance_m=latest['distance_m'], race_track_condition=latest['track_condition'],
                         race_date=latest['race_date'])
-        return dict(region=region, race_id=race_id, race=race, card=card, results=finish, predictions=predictions)
+        saved_odds = self.engine.saved.odds(region, race_id)
+        odds = None if not saved_odds else dict(
+            win=saved_odds['odds'].get('win', {}), place=saved_odds['odds'].get('place', {}),
+            retrieved_at=saved_odds.get('retrieved_at'), official_at=saved_odds.get('official_at'))
+        return dict(region=region, race_id=race_id, race=race, card=card, results=finish, predictions=predictions,
+                    odds=odds)
 
     def bets(self, query):
         try:

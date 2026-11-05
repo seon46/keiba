@@ -331,6 +331,11 @@ async function raceView(region, raceId) {
     : (a, b) => a.horse_number - b.horse_number);
   const leader = Math.max(...runners.map((r) => r.win_probability ?? 0));
   const hasResults = !!data.results;
+  const odds = data.odds && Object.keys(data.odds.win || {}).length ? data.odds : null;
+  if (odds) {  // 人気 from the win odds (ties share a rank)
+    const values = Object.values(odds.win).sort((a, b) => a - b);
+    odds.rank = (number) => (odds.win[number] == null ? null : values.indexOf(odds.win[number]) + 1);
+  }
   view.innerHTML = `
     <div class="band ${surface === 'ダ' ? 'dirt' : ''}">
       <div class="where"><a href="#/day/${day}">${day ? dateLabel(day) : ''}</a>　${esc(course)} ${number}R　${regionName(region)}</div>
@@ -341,6 +346,8 @@ async function raceView(region, raceId) {
     <div class="controls">
       <button type="button" class="primary" id="refresh">最新の出馬表で予想</button>
       <button type="button" id="saved">保存済みの出馬表で予想</button>
+      <button type="button" id="card-odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
+      ${odds ? `<span class="small muted">オッズ ${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}</span>` : ''}
       <span class="spacer"></span>
       ${predictions.length ? `<label class="small muted">予想
         <select id="history">${predictions.map((p) => `<option value="${p.id}" ${p === prediction ? 'selected' : ''}>
@@ -352,10 +359,11 @@ async function raceView(region, raceId) {
     <div class="card-wrap"><table class="card">
       <thead><tr>
         <th class="opt">枠</th><th class="num sortable" data-sort="number">馬番</th><th>馬名</th><th class="opt">騎手・厩舎</th><th class="num opt">馬体重</th>
+        ${odds ? '<th class="num">単勝</th><th class="num opt">複勝</th>' : ''}
         <th class="num sortable" data-sort="win">勝率</th><th class="num">3着内</th><th class="num opt">期待着順</th>
         <th>着順の確率</th>${hasResults ? '<th>着順</th>' : ''}
       </tr></thead>
-      <tbody>${sorted.map((r) => runnerRow(r, yMax, leader, hasResults)).join('')}</tbody>
+      <tbody>${sorted.map((r) => runnerRow(r, yMax, leader, hasResults, odds)).join('')}</tbody>
     </table></div>
     ${prediction ? `<h2>着順ごとの確率</h2><div class="heat-wrap">${heatmap(runners)}</div>
     <p class="small muted">色が濃いほど確率が高い着順です。${hasResults ? '枠で囲んだマスが実際の着順です。' : ''}右端は競走中止など完走しない確率です。</p>` : ''}
@@ -376,6 +384,12 @@ async function raceView(region, raceId) {
   }
   view.querySelector('#refresh').addEventListener('click', () => predict(region, raceId, true));
   view.querySelector('#saved').addEventListener('click', () => predict(region, raceId, false));
+  view.querySelector('#card-odds').addEventListener('click', async (event) => {
+    event.target.disabled = true;
+    try {
+      watch(await api('race/odds', {region, race_id: raceId}), () => { betsCache.clear(); if (location.hash.includes(raceId)) raceView(region, raceId); });
+    } catch (e) { alertJob(e); event.target.disabled = false; }
+  });
   view.querySelector('#history')?.addEventListener('change', (e) => { const id = Number(e.target.value); raceState.selectedId = id === predictions[0].id ? null : id; raceView(region, raceId); });
   view.querySelectorAll('[data-sort]').forEach((th) => th.addEventListener('click', () => { raceState.sort = th.dataset.sort; raceView(region, raceId); }));
   view.querySelectorAll('tr.runner').forEach((tr) => tr.addEventListener('click', () => {
@@ -516,7 +530,7 @@ function finishText(result) {
   return ({did_not_finish: '中止', disqualified: '失格', scratched: '取消', excluded: '除外'})[result.finish_status] || '–';
 }
 
-function runnerRow(r, yMax, leader, hasResults) {
+function runnerRow(r, yMax, leader, hasResults, odds) {
   const open = raceState.open.has(r.horse_id);
   const sexAge = `${r.sex || ''}${r.age || ''}`;
   const actual = r.result?.finish_status === 'finished' ? r.result.finish_position - 1
@@ -529,6 +543,8 @@ function runnerRow(r, yMax, leader, hasResults) {
       <td><div class="horse">${esc(r.horse_name || r.horse_id)}</div><div class="sub">${esc(sexAge)}　${r.carried_weight_kg ?? ''}kg<span class="narrow-only">${esc(r.jockey_name || '')}　${esc(weightText(r))}</span></div></td>
       <td class="opt"><div>${esc(r.jockey_name || '')}</div><div class="sub">${esc(r.trainer_name || '')}</div></td>
       <td class="num opt">${esc(weightText(r))}</td>
+      ${odds ? `<td class="num odds">${oddsLabel(odds.win[r.horse_number])}<div class="sub">${odds.rank(r.horse_number) ? `${odds.rank(r.horse_number)}人気` : ''}</div></td>
+        <td class="num opt odds-place">${oddsLabel(odds.place[r.horse_number])}</td>` : ''}
       <td class="num prob ${r.win_probability && r.win_probability === leader ? 'lead' : ''}">${r.status === 'scratched' ? '取消' : pct(r.win_probability)}</td>
       <td class="num">${pct(r.top3_probability)}</td>
       <td class="num opt">${num(r.expected_rank, 1)}</td>
@@ -536,7 +552,7 @@ function runnerRow(r, yMax, leader, hasResults) {
       ${hasResults ? `<td class="finish ${typeof finish === 'number' && finish <= 3 ? 'top3' : ''}">${esc(finish)}</td>` : ''}
     </tr>`;
   if (!open || !r.distribution) return row;
-  return row + `<tr class="detail"><td colspan="${hasResults ? 10 : 9}"><div class="detail-grid">
+  return row + `<tr class="detail"><td colspan="${(hasResults ? 10 : 9) + (odds ? 2 : 0)}"><div class="detail-grid">
     ${bigChart(r.distribution, actual)}
     <div class="facts">
       <div>勝率 <b>${pct(r.win_probability)}</b></div>
