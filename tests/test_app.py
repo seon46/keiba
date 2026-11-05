@@ -181,6 +181,33 @@ class AppTests(unittest.TestCase):
         self.assertEqual(engine.logbook.runs()[0]['status'], 'ok')
         self.assertEqual(check_model(model_info(self.fixture['model_dir'])), [])
         self.assertTrue(check_model({'groups': {}}))
+        v4 = dict(model_info(self.fixture['model_dir']), pipeline='v4-pipeline-1')
+        self.assertTrue(check_model(v4))  # no blend weights / networks
+        for group in v4['groups'].values():
+            group.update(blend_weights=[.3, .7], networks=[dict(best_epoch=3)])
+        self.assertEqual(check_model(v4), [])
+
+    def test_pedigree_step_fetches_only_missing_horses(self):
+        from app_fixtures import FakeScraper, save_snapshot
+        from keiba_app.engine import Engine
+        from keiba_app.nightly import run_nightly
+        from keiba_app.state import day_after, today
+        app = self._app('app_pedigree')
+        rows = [dict(row) for row in self.fixture['rows'] if row['race_id'] == self.fixture['rows'][0]['race_id']]
+        recent = day_after(today(), -3)
+        for row in rows:
+            row['race_date'] = recent
+        save_snapshot(self.fixture['data_dir'], rows[0]['region'], 'R' + rows[0]['race_id'], 'results', rows,
+                      f'{recent}T18:00:00+09:00')
+        scraper = FakeScraper()
+        engine = Engine(app, scraper=scraper, samples=128)
+        horses = sorted({row['horse_id'] for row in rows})
+        self.assertEqual(engine.saved.missing_pedigrees(horses), horses)
+        result = run_nightly(app, only=('pedigree',), engine=engine)
+        self.assertEqual(result['steps'][0]['step'], 'pedigree')
+        self.assertEqual(scraper.pedigree_requests, [horses])
+        # the v3 test model does not use pedigrees, so predicting never fetches them
+        self.assertEqual(engine.ensure_pedigrees(rows), 0)
 
 
 if __name__ == '__main__':

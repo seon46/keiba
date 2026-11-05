@@ -101,7 +101,7 @@ class Api:
             summary = model_info(state['model_dir'])
             if summary:
                 model = dict(train_end=summary.get('train_end'), created_at=summary.get('created_at'),
-                             seconds=summary.get('seconds'))
+                             seconds=summary.get('seconds'), pipeline=summary.get('pipeline'))
         running = (self.app.home / 'nightly.lock').exists()
         return dict(today=today(), state=state, dataset=dataset, model=model, runs=self.engine.logbook.runs(10),
                     nightly_running=running, jobs=self.jobs.active())

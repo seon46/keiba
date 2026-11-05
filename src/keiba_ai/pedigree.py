@@ -31,14 +31,22 @@ def load_pedigrees(race_db, horse_ids=None):
     path = Path(race_db)
     if not path.is_file():
         raise ValueError(f'収集DBがありません: {path}')
-    wanted = set(horse_ids) if horse_ids is not None else None
+    query = ('SELECT p.horse_id,p.metadata_json FROM pedigrees p JOIN observations o ON o.id=p.snapshot_id {} '
+             'ORDER BY o.retrieved_at,o.rowid')
     connection = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=30)
     try:
-        rows = connection.execute('SELECT p.horse_id,p.metadata_json FROM pedigrees p JOIN observations o '
-                                  'ON o.id=p.snapshot_id ORDER BY o.retrieved_at,o.rowid')
         latest = {}
-        for horse, metadata in rows:
-            if wanted is None or horse in wanted:
+        if horse_ids is None:
+            chunks = [None]
+        else:
+            wanted = sorted({str(horse) for horse in horse_ids if horse})
+            chunks = [wanted[start:start + 500] for start in range(0, len(wanted), 500)]
+        for chunk in chunks:
+            if chunk is None:
+                rows = connection.execute(query.format(''))
+            else:
+                rows = connection.execute(query.format(f'WHERE p.horse_id IN ({",".join("?" * len(chunk))})'), chunk)
+            for horse, metadata in rows:
                 latest[horse] = metadata
     except sqlite3.Error as exc:
         raise ValueError(f'収集DBに血統の表がありません: {exc}') from exc
@@ -63,9 +71,73 @@ def distance_band(distance):
     return 's' if distance < 1400 else 'm' if distance <= 1800 else 'i' if distance <= 2200 else 'l'
 
 
+def _entities(horses, surfaces, distances, pedigrees):
+    """(sire, sire|surface, sire|band, damsire, damsire|surface, dam, known share) per row."""
+    import numpy as np
+    count = len(horses)
+    index = {path: position for position, path in enumerate(PATHS)}
+    sire = np.full(count, '', dtype=object)
+    damsire = np.full(count, '', dtype=object)
+    dam = np.full(count, '', dtype=object)
+    known = np.zeros(count, dtype=np.float32)
+    for row, horse in enumerate(list(horses)):
+        keys = pedigrees.get(horse)
+        if keys is None:
+            continue
+        sire[row] = keys[index['S']] or ''
+        dam[row] = keys[index['D']] or ''
+        damsire[row] = keys[index['DS']] or ''
+        known[row] = sum(key is not None for key in keys) / len(PATHS)
+    surface = np.asarray([str(int(value)) if np.isfinite(value) else '' for value in np.asarray(surfaces, dtype=float)],
+                         dtype=object)
+    band = np.asarray([distance_band(value) for value in np.asarray(distances, dtype=float)], dtype=object)
+
+    def joined(entity, suffix):
+        return np.asarray([f'{a}|{b}' if a and b else '' for a, b in zip(entity.tolist(), suffix.tolist())], dtype=object)
+
+    return dict(sire=sire, sire_surface=joined(sire, surface), sire_distance=joined(sire, band), damsire=damsire,
+                damsire_surface=joined(damsire, surface), dam=dam), known
+
+
+def _columns(results, known, race_ids):
+    import numpy as np
+    from .experiment_v3c import _race_z
+    sire_all, sire_surface, sire_distance = results['sire'], results['sire_surface'], results['sire_distance']
+    damsire_all, damsire_surface, dam_all = results['damsire'], results['damsire_surface'], results['dam']
+    columns = [
+        sire_all['theta'], sire_all['theta_sd'], sire_all['rides'], _race_z(sire_all['theta'], race_ids),
+        sire_surface['theta'], sire_surface['rides'], sire_distance['theta'], sire_distance['rides'],
+        damsire_all['theta'], damsire_all['rides'], damsire_surface['theta'], damsire_surface['rides'],
+        dam_all['theta'], dam_all['rides'], known,
+    ]
+    return np.column_stack(columns).astype(np.float32)
+
+
+def pedigree_query(saved, race_ids, horses, surfaces, distances, pedigrees, day):
+    """PEDIGREE_FEATURES for new rows of ``day`` from ``pedigree_block(..., return_state=True)``."""
+    from .experiment_v3d import timeline_query
+    entities, known = _entities(horses, surfaces, distances, pedigrees)
+    results = {name: timeline_query(saved[name], entity, horses, day) for name, entity in entities.items()}
+    return _columns(results, known, race_ids)
+
+
 def pedigree_block(days, race_ids, horses, finished, positions, strength, surfaces, distances, pedigrees, *,
-                   half_life=1095.0, short_half_life=180.0, prior_sd=.3):
+                   half_life=1095.0, short_half_life=180.0, prior_sd=.3, return_state=False):
     """Rows x PEDIGREE_FEATURES (float32) from causal sire / damsire / dam effects."""
+    from .experiment_v3d import jockey_timeline
+    entities, known = _entities(horses, surfaces, distances, pedigrees)
+    results, states = {}, {}
+    for name, entity in entities.items():
+        results[name], states[name] = jockey_timeline(
+            days, race_ids, entity, horses, finished, positions, strength, half_life=half_life,
+            short_half_life=short_half_life, prior_sd=prior_sd, return_state=True)
+    block = _columns(results, known, race_ids)
+    return (block, states) if return_state else block
+
+
+def _pedigree_block_reference(days, race_ids, horses, finished, positions, strength, surfaces, distances, pedigrees, *,
+                              half_life=1095.0, short_half_life=180.0, prior_sd=.3):
+    """The original implementation (kept for the equivalence test)."""
     import numpy as np
     from .experiment_v3c import _race_z
     from .experiment_v3d import jockey_timeline

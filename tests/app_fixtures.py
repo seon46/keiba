@@ -47,6 +47,7 @@ class FakeScraper:
     def __init__(self, listing=None):
         self.listing = listing or {}
         self.fetched = []
+        self.pedigree_requests = []
 
     def discover(self, day, region, *, refresh=True):
         if (day, region) not in self.listing and region == 'central' and self.listing:
@@ -56,6 +57,10 @@ class FakeScraper:
     def fetch(self, region, race_ids, page, *, refresh=True):
         self.fetched.append((region, tuple(race_ids), page))
         return []
+
+    def pedigrees(self, horse_ids, *, chunk=200, log=None):
+        self.pedigree_requests.append(sorted(horse_ids))
+        return 0
 
 
 def build(root, *, train_end='2025-07-01'):

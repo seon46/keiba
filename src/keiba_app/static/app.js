@@ -465,7 +465,7 @@ async function statusView() {
     <dl class="kv">
       <dt>成績の収集</dt><dd>${st.collected_through ? dateLabel(st.collected_through) + 'まで' : '–'}</dd>
       <dt>予想に使うDB</dt><dd>${data.dataset?.last_day ? dateLabel(data.dataset.last_day) + 'までの成績' : '–'}<div class="small muted">${esc(st.dataset || '')}</div></dd>
-      <dt>モデル</dt><dd>${data.model ? `${dateLabel(data.model.train_end)}より前の成績で学習（作成 ${timeLabel(data.model.created_at)}）` : '–'}<div class="small muted">${esc(st.model_dir || '')}</div></dd>
+      <dt>モデル</dt><dd>${data.model ? `${data.model.pipeline === 'v4-pipeline-1' ? 'LightGBM＋血統＋ニューラルネット / ' : ''}${dateLabel(data.model.train_end)}より前の成績で学習（作成 ${timeLabel(data.model.created_at)}）` : '–'}<div class="small muted">${esc(st.model_dir || '')}</div></dd>
       <dt>学習し直し</dt><dd>${st.last_fit ? dateLabel(st.last_fit) : '–'}に実行。${st.retrain_days}日ごとに自動で実行します。</dd>
     </dl>
     <div class="controls">

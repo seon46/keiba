@@ -63,7 +63,7 @@ def _params(threads, seed):
 # --------------------------------------------------------------------------
 
 def jockey_timeline(days, race_ids, jockeys, horses, finished, positions, strength, *,
-                    half_life=365.0, short_half_life=90.0, prior_sd=.3):
+                    half_life=365.0, short_half_life=90.0, prior_sd=.3, return_state=False):
     """Day-by-day Gaussian approximation of a PL jockey effect with strength offsets.
 
     Returns per-row arrays holding the state *before* that row's day:
@@ -147,6 +147,42 @@ def jockey_timeline(days, race_ids, jockeys, horses, finished, positions, streng
                 entry[5] += 1
                 pair_rides[(jockey, horses[row])] = pair_rides.get((jockey, horses[row]), 0) + 1
                 last_jockey[horses[row]] = jockey
+    if return_state:
+        return out, dict(state=state, last_jockey=last_jockey, pair_rides=pair_rides, half_life=half_life,
+                         short_half_life=short_half_life, prior_sd=prior_sd)
+    return out
+
+
+def timeline_query(saved, jockeys, horses, day):
+    """The per-row outputs of ``jockey_timeline`` for new rows on ``day`` (after every saved day),
+    from the state it returned with ``return_state=True`` -- without re-running the history."""
+    import numpy as np
+    count = len(jockeys)
+    out = {name: np.full(count, np.nan) for name in ('theta', 'theta_sd', 'theta_recent', 'theta_previous_jockey',
+                                                       'rides_with_horse', 'rides')}
+    state, half_life, short_half_life = saved['state'], saved['half_life'], saved['short_half_life']
+    prior_precision = 1.0 / saved['prior_sd'] ** 2
+    today = date.fromisoformat(day).toordinal()
+
+    def current(jockey):
+        entry = state.get(jockey)
+        if entry is None:
+            return 0.0, prior_precision, 0.0, prior_precision, 0
+        theta, precision, recent, precision_recent, last, rides = entry
+        gap = today - last
+        return (theta, max(precision * 2 ** (-gap / half_life), prior_precision), recent,
+                max(precision_recent * 2 ** (-gap / short_half_life), prior_precision), rides)
+
+    for row, (jockey, horse) in enumerate(zip(list(jockeys), list(horses))):
+        if not jockey:
+            continue
+        theta, precision, recent, _, rides = current(jockey)
+        out['theta'][row], out['theta_sd'][row], out['theta_recent'][row] = theta, precision ** -.5, recent
+        out['rides'][row] = rides
+        out['rides_with_horse'][row] = saved['pair_rides'].get((jockey, horse), 0)
+        previous = saved['last_jockey'].get(horse)
+        if previous:
+            out['theta_previous_jockey'][row] = current(previous)[0]
     return out
 
 

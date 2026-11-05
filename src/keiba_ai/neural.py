@@ -101,58 +101,93 @@ def device_name(prefer='auto'):
 # --------------------------------------------------------------------------
 
 class Inputs:
-    """Encoded arrays for every row of a group (fitted vocabularies / scaling come from ``fit_rows``)."""
+    """Encoded arrays for every row of a group (fitted vocabularies / scaling come from ``fit_rows``).
+
+    ``encoders()`` returns what was fitted (plain Python / numpy, picklable); ``Inputs.from_encoders``
+    encodes other rows (e.g. a new race card) exactly the same way.
+    """
 
     def __init__(self, matrix, categorical, race_ids, finished, positions, jockeys, trainers, pedigrees, horses,
-                 fit_rows, config: NeuralConfig):
+                 fit_rows, config: NeuralConfig, *, encoders=None):
         import warnings
         import numpy as np
         warnings.filterwarnings('ignore', message='All-NaN slice', category=RuntimeWarning)
         warnings.filterwarnings('ignore', message='Mean of empty slice', category=RuntimeWarning)
         warnings.filterwarnings('ignore', message='Degrees of freedom', category=RuntimeWarning)
-        count, width = matrix.shape
-        self.categorical = list(categorical)
-        numeric = [column for column in range(width) if column not in set(self.categorical)]
+        if encoders is None:
+            encoders = self._fit(matrix, list(categorical), jockeys, trainers, pedigrees, horses, fit_rows, config)
+        self._set(encoders)
+        self._encode(matrix, race_ids, finished, positions, jockeys, trainers, pedigrees, horses)
+
+    @classmethod
+    def from_encoders(cls, encoders, matrix, race_ids, finished, positions, jockeys, trainers, pedigrees, horses):
+        return cls(matrix, encoders['categorical'], race_ids, finished, positions, jockeys, trainers, pedigrees,
+                   horses, None, None, encoders=encoders)
+
+    @staticmethod
+    def _fit(matrix, categorical, jockeys, trainers, pedigrees, horses, fit_rows, config):
+        import numpy as np
+        width = matrix.shape[1]
+        numeric = [column for column in range(width) if column not in set(categorical)]
         fit_values = matrix[np.ix_(fit_rows, numeric)].astype(np.float64)
-        low = np.nanpercentile(fit_values, .5, axis=0)
-        high = np.nanpercentile(fit_values, 99.5, axis=0)
-        low, high = np.nan_to_num(low), np.nan_to_num(high)
+        low = np.nan_to_num(np.nanpercentile(fit_values, .5, axis=0))
+        high = np.nan_to_num(np.nanpercentile(fit_values, 99.5, axis=0))
         clipped = np.clip(fit_values, low, high)
         mean, spread = np.nanmean(clipped, axis=0), np.nanstd(clipped, axis=0)
         mean, spread = np.nan_to_num(mean), np.where(np.nan_to_num(spread) > 1e-9, np.nan_to_num(spread), 1.0)
-        values = matrix[:, numeric].astype(np.float64)
-        missing = np.isnan(values)
-        flagged = np.flatnonzero(missing[fit_rows].mean(axis=0) > .001)
-        scaled = (np.clip(values, low, high) - mean) / spread
-        scaled[missing] = 0.0
-        self.numeric = np.concatenate([scaled, missing[:, flagged].astype(np.float64)], axis=1).astype(np.float32)
-        self.continuous = scaled.shape[1]  # the first columns are scaled values, the rest missing flags
-        self.scaling = dict(numeric=numeric, low=low, high=high, mean=mean, spread=spread, flagged=flagged)
-        # categorical codes -> indices (0 = unseen / missing)
-        self.cat_vocab = []
-        codes = np.zeros((count, len(self.categorical)), dtype=np.int64)
-        for position, column in enumerate(self.categorical):
+        flagged = np.flatnonzero(np.isnan(fit_values).mean(axis=0) > .001)
+        cat_vocab = []
+        for column in categorical:
             seen = sorted({float(value) for value in matrix[fit_rows, column] if np.isfinite(value)})
-            vocab = {value: index + 1 for index, value in enumerate(seen)}
-            self.cat_vocab.append(vocab)
-            codes[:, position] = [vocab.get(float(value), 0) if np.isfinite(value) else 0 for value in matrix[:, column]]
-        self.cat_codes = codes
+            cat_vocab.append({value: index + 1 for index, value in enumerate(seen)})
 
         def vocabulary(values, minimum):
             counts = Counter(value for value in values if value)
             return {value: index + 1 for index, value in enumerate(sorted(key for key, n in counts.items() if n >= minimum))}
 
-        self.jockey_vocab = vocabulary(jockeys[fit_rows].tolist(), config.entity_min_count)
-        self.trainer_vocab = vocabulary(trainers[fit_rows].tolist(), config.entity_min_count)
-        self.jockeys = np.asarray([self.jockey_vocab.get(value, 0) for value in jockeys.tolist()], dtype=np.int64)
-        self.trainers = np.asarray([self.trainer_vocab.get(value, 0) for value in trainers.tolist()], dtype=np.int64)
         fit_horses = set(horses[fit_rows].tolist())
         ancestor_counts = Counter(key for horse in fit_horses for key in pedigrees.get(horse, ()) if key)
-        self.ancestor_vocab = {key: index + 1 for index, key in enumerate(
-            sorted(key for key, n in ancestor_counts.items() if n >= config.ancestor_min_count))}
+        return dict(
+            width=width, categorical=list(categorical), scaling=dict(numeric=numeric, low=low, high=high, mean=mean,
+                                                                    spread=spread, flagged=flagged),
+            cat_vocab=cat_vocab, jockey_vocab=vocabulary(jockeys[fit_rows].tolist(), config.entity_min_count),
+            trainer_vocab=vocabulary(trainers[fit_rows].tolist(), config.entity_min_count),
+            ancestor_vocab={key: index + 1 for index, key in enumerate(
+                sorted(key for key, n in ancestor_counts.items() if n >= config.ancestor_min_count))})
+
+    def _set(self, encoders):
+        self._encoders = encoders
+        self.categorical = list(encoders['categorical'])
+        self.scaling = encoders['scaling']
+        self.cat_vocab = encoders['cat_vocab']
+        self.jockey_vocab, self.trainer_vocab = encoders['jockey_vocab'], encoders['trainer_vocab']
+        self.ancestor_vocab = encoders['ancestor_vocab']
+        self.cat_cards = [len(vocab) for vocab in self.cat_vocab]
+
+    def encoders(self):
+        return self._encoders
+
+    def _encode(self, matrix, race_ids, finished, positions, jockeys, trainers, pedigrees, horses):
+        import numpy as np
+        scaling = self.scaling
+        if matrix.shape[1] != self._encoders['width']:
+            raise ValueError('ニューラルネットの入力の列数が学習時と一致しません。')
+        values = matrix[:, scaling['numeric']].astype(np.float64)
+        missing = np.isnan(values)
+        scaled = (np.clip(values, scaling['low'], scaling['high']) - scaling['mean']) / scaling['spread']
+        scaled[missing] = 0.0
+        self.numeric = np.concatenate([scaled, missing[:, scaling['flagged']].astype(np.float64)], axis=1).astype(np.float32)
+        self.continuous = scaled.shape[1]  # the first columns are scaled values, the rest missing flags
+        count = len(matrix)
+        codes = np.zeros((count, len(self.categorical)), dtype=np.int64)
+        for position, (column, vocab) in enumerate(zip(self.categorical, self.cat_vocab)):
+            codes[:, position] = [vocab.get(float(value), 0) if np.isfinite(value) else 0 for value in matrix[:, column]]
+        self.cat_codes = codes
+        self.jockeys = np.asarray([self.jockey_vocab.get(value, 0) for value in list(jockeys)], dtype=np.int64)
+        self.trainers = np.asarray([self.trainer_vocab.get(value, 0) for value in list(trainers)], dtype=np.int64)
         ancestry = np.zeros((count, ANCESTORS), dtype=np.int64)
         cache = {}
-        for row, horse in enumerate(horses.tolist()):
+        for row, horse in enumerate(list(horses)):
             encoded = cache.get(horse)
             if encoded is None:
                 keys = pedigrees.get(horse)
@@ -160,12 +195,11 @@ class Inputs:
                                           if keys else [0] * ANCESTORS)
             ancestry[row] = encoded
         self.ancestry = ancestry
-        # races (rows contiguous per race)
-        boundaries = np.flatnonzero(np.r_[True, race_ids[1:] != race_ids[:-1], True])
+        race_ids = np.asarray(race_ids)
+        boundaries = np.flatnonzero(np.r_[True, race_ids[1:] != race_ids[:-1], True]) if count else np.asarray([0])
         self.starts, self.ends = boundaries[:-1], boundaries[1:]
         self.race_of_row = np.repeat(np.arange(len(self.starts)), self.ends - self.starts)
-        self.finished, self.positions = finished.astype(bool), positions.astype(np.int64)
-        self.cat_cards = [len(vocab) for vocab in self.cat_vocab]
+        self.finished, self.positions = np.asarray(finished).astype(bool), np.asarray(positions).astype(np.int64)
 
     def races_for(self, rows, *, need_finishers=True):
         """Races containing any of ``rows`` (with >= 2 finishers when requested).  The whole race is

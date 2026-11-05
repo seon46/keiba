@@ -46,15 +46,26 @@ class Engine:
 
     # -- predictor -----------------------------------------------------
     def predictor(self):
-        from keiba_ai.pipeline_v3 import Predictor
+        from keiba_ai.pipeline_v4 import load_predictor
         state = self.app.require_ready()
         key = (state['dataset'], state['model_dir'])
         with self._lock:
             if self._key != key:
-                self._predictor = Predictor(state['dataset'], state['model_dir'], threads=state['threads'],
-                                            report=self.report)
+                self._predictor = load_predictor(state['dataset'], state['model_dir'], self.app.scraper_db,
+                                                 threads=state['threads'], report=self.report)
                 self._key = key
             return self._predictor
+
+    def ensure_pedigrees(self, rows):
+        """Fetch missing pedigrees of the card's horses when the model uses them (failures only lower accuracy)."""
+        if not getattr(self.predictor(), 'race_db', None):
+            return 0
+        missing = self.saved.missing_pedigrees([row.get('horse_id') for row in rows])
+        if missing:
+            self.report(event='fetching_pedigrees', horses=len(missing))
+            if self.scraper.pedigrees(missing):
+                self.report(event='pedigree_fetch_failed', horses=len(missing))
+        return len(missing)
 
     def reset(self):
         with self._lock:
@@ -136,6 +147,7 @@ class Engine:
         if not Predictor.supported(races[0][3]):
             raise ValueError(UNSUPPORTED)
         predictor = self.predictor()
+        self.ensure_pedigrees(races[0][3])
         results = predictor.predict_races(races, samples=self.samples)
         if not results:
             raise ValueError('予想できる出走馬がいません。')
@@ -184,6 +196,9 @@ class Engine:
             return dict(predicted=[], skipped=skipped)
         progress(message=f'{len(cards)}レースを予想中')
         predictor = self.predictor()
+        if cards:
+            progress(message='血統を確認中')
+            self.ensure_pedigrees([row for card in cards for row in card[0][3]])
         results = predictor.predict_races([card[0] for card in cards], samples=self.samples)
         by_race = {}
         for row in results:

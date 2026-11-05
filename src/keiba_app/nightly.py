@@ -14,7 +14,8 @@ import time
 from .engine import Engine
 from .state import App, day_after, now, today
 
-STEPS = ('collect', 'prepare', 'score', 'fit', 'precompute')
+STEPS = ('collect', 'pedigree', 'prepare', 'score', 'fit', 'precompute')
+PEDIGREE_DAYS = 60  # look for new horses in races of this many recent days
 
 
 class Busy(RuntimeError):
@@ -72,6 +73,12 @@ def check_model(summary):
         temperatures = result.get('temperatures') or []
         if not temperatures or any(not (.2 < value < 6) for value in temperatures):
             problems.append(f'{group}: 温度が不正です。')
+        if summary.get('pipeline') == 'v4-pipeline-1':
+            weights = result.get('blend_weights') or []
+            if len(weights) != 2 or not all(0 <= value <= 3 for value in weights) or sum(weights) <= 0:
+                problems.append(f'{group}: 混ぜ合わせの重みが不正です。')
+            if not result.get('networks') or any((network.get('best_epoch') or 0) < 1 for network in result['networks']):
+                problems.append(f'{group}: ニューラルネットの学習に失敗しています。')
     return problems
 
 
@@ -146,6 +153,18 @@ def run_nightly(app: App, *, force_fit=False, only=None, skip=(), python=None, e
                     else:
                         overall = 'warning'
                         record('collect', 'incomplete', started, start=start, end=yesterday, exit_code=code)
+            # 1b. pedigrees of new horses (the v4 model uses them) -------------
+            if 'pedigree' in selected:
+                started = time.time()
+                missing = engine.saved.missing_pedigrees(since=day_after(today(), -PEDIGREE_DAYS))
+                if not missing:
+                    record('pedigree', 'skipped', started, reason='新しい馬はいません')
+                else:
+                    failed = engine.scraper.pedigrees(missing, log=write)
+                    left = len(engine.saved.missing_pedigrees(missing))
+                    if failed:
+                        overall = 'warning' if overall == 'ok' else overall
+                    record('pedigree', 'incomplete' if failed else 'ok', started, horses=len(missing), missing=left)
             # 2. export + prepare ----------------------------------------------
             if 'prepare' in selected:
                 started = time.time()
@@ -192,8 +211,12 @@ def run_nightly(app: App, *, force_fit=False, only=None, skip=(), python=None, e
                     record('fit', 'skipped', started, reason='学習し直しの日ではありません', last_fit=state['last_fit'])
                 else:
                     output = app.home / 'models' / stamp
-                    code = subprocess_run([python, '-X', 'utf8', '-m', 'keiba_ai.pipeline_v3', 'fit', '--dataset',
-                                           state['dataset'], '--output-dir', output, '--threads', state['threads']])
+                    if (model or {}).get('pipeline') == 'v4-pipeline-1':
+                        command = ['keiba_ai.pipeline_v4', 'fit', '--race-db', app.scraper_db]
+                    else:
+                        command = ['keiba_ai.pipeline_v3', 'fit']
+                    code = subprocess_run([python, '-X', 'utf8', '-m', *command, '--dataset', state['dataset'],
+                                           '--output-dir', output, '--threads', state['threads']])
                     summary = model_info(output) if code == 0 else None
                     problems = check_model(summary) if code == 0 else [f'終了コード{code}']
                     if problems:

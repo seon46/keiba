@@ -27,13 +27,14 @@ RATING_FEATURES = (
 
 
 def rating_block(days, race_ids, horses, finished, positions, *, half_life=240.0, short_half_life=60.0,
-                 prior_sd=1.0):
+                 prior_sd=1.0, return_state=False):
     import numpy as np
     from .experiment_v3d import jockey_timeline
     count = len(days)
     zeros = np.zeros(count)
-    timeline = jockey_timeline(days, race_ids, horses, horses, finished, positions, zeros,
-                               half_life=half_life, short_half_life=short_half_life, prior_sd=prior_sd)
+    timeline, timeline_state = jockey_timeline(days, race_ids, horses, horses, finished, positions, zeros,
+                                               half_life=half_life, short_half_life=short_half_life,
+                                               prior_sd=prior_sd, return_state=True)
     rating, sd, recent = timeline['theta'], timeline['theta_sd'], timeline['theta_recent']
     out = np.full((count, len(RATING_FEATURES)), np.nan, dtype=np.float32)
     out[:, 0], out[:, 1], out[:, 2] = rating, sd, recent
@@ -81,4 +82,47 @@ def rating_block(days, race_ids, horses, finished, positions, *, half_life=240.0
                     out[row, 10] = field_mean[row] - np.mean(fields)
         for row in range(start, end):
             history[horses[row]].append((surprise[row], field_mean[row]))
+    if return_state:
+        return out, dict(timeline=timeline_state, history=history)
+    return out
+
+
+def _race_columns(out, field_mean, start, end, r):
+    import numpy as np
+    n = end - start
+    if n < 2:
+        return
+    spread = r.std()
+    out[start:end, 3] = (r - r.mean()) / spread if spread > 0 else 0.0
+    for local in range(n):
+        others = np.delete(r, local)
+        out[start + local, 4] = r[local] - others.max()
+        field_mean[start + local] = others.mean()
+    out[start:end, 5] = np.sort(r)[::-1][:3].mean()
+
+
+def rating_query(saved, race_ids, horses, day):
+    """RATING_FEATURES for new rows of ``day`` (races contiguous) from ``rating_block(..., return_state=True)``."""
+    import numpy as np
+    from .experiment_v3d import timeline_query
+    count = len(race_ids)
+    queried = timeline_query(saved['timeline'], horses, horses, day)
+    out = np.full((count, len(RATING_FEATURES)), np.nan, dtype=np.float32)
+    rating = queried['theta']
+    out[:, 0], out[:, 1], out[:, 2] = rating, queried['theta_sd'], queried['theta_recent']
+    field_mean = np.full(count, np.nan)
+    boundaries = np.flatnonzero(np.r_[True, race_ids[1:] != race_ids[:-1], True]) if count else np.asarray([0])
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        _race_columns(out, field_mean, start, end, rating[start:end])
+    for row in range(count):
+        past = saved['history'].get(horses[row])
+        if past:
+            surprises = [item[0] for item in past if np.isfinite(item[0])]
+            fields = [item[1] for item in past if np.isfinite(item[1])]
+            out[row, 6] = np.mean(surprises) if surprises else np.nan
+            out[row, 7] = past[-1][0]
+            out[row, 8] = np.mean(fields) if fields else np.nan
+            out[row, 9] = past[-1][1]
+            if fields and np.isfinite(field_mean[row]):
+                out[row, 10] = field_mean[row] - np.mean(fields)
     return out

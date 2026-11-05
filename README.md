@@ -677,6 +677,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-nn.ps1
 
 出力には `rank_k_probability`（k着の確率）、`nonfinish_probability`、`win_probability`、`top3_probability`、`expected_rank_given_finish`、`strength_score` が入ります。地方で馬体重が出馬表にあれば使い、なければ空欄扱いで予測します（`bodyweight_used`）。
 
+## v4パイプライン（本番）：LightGBM＋血統 と TabM型ニューラルネットの混ぜ合わせ
+
+`keiba_ai.pipeline_v4` は、実験Mで最良だった組み合わせ（`D_tabm_search_x3`）を本番用に学習・予測します。
+
+- B：v3パイプラインの特徴量に、血統の特徴量（父・母父・母のθ。芝ダ別・距離帯別。基準の強さはv3モデルの交差推定）を加えたLightGBM＋Plackett–Luce。
+- NN：TabM型ネットワーク（内部16本、数値の周期埋め込み、注意機構なし、祖先62頭・騎手・調教師の埋め込み）。設定は実験Mで2025年に中央・地方とも選ばれたものに固定し、乱数を変えた3本の平均。
+- 強さ = w_B·B + w_NN·NN（重みと温度は直前2か月で推定）。予測にはGPUは不要です（学習はGPU推奨）。
+- 予測時の履歴（指数・レーティング・騎手θ・血統θ）は日付・区分ごとに一度だけ作り、同じ日の2レース目以降は数秒で出ます。
+
+学習（`--race-db` は血統を集めた収集DB）。確認用（2025年を採点し、実験Mの値と比べる）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v4 fit --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\v4_check --train-end 2025-01-01 --evaluate-until 2026-01-01 --threads 2
+```
+
+本番（データ最終日まで全部で学習）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v4 fit --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\v4_model --threads 2
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v4 predict --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --model-dir data\v4_model --entries data\entries.csv --output data\v4_predictions.csv
+```
+
+出力はv3と同じ列に、`lightgbm_score`（B）と `network_score`（NN）が加わります。アプリに `keiba_app init --model-dir data\v4_model` で登録すると、毎晩の自動処理は新しく出てきた馬（直近60日のレース）の血統を集め、7日ごとにv4で学習し直します。予想するときに血統が未取得の馬がいれば、その場で取得してから予想します（取得に失敗しても、血統なしとして予想します）。
+
 ## 競馬AIアプリ（ブラウザで予想・記録・自動更新）
 
 設計は `docs/app_design.md`。開催日 → 競馬場 → R でレースを選び、出馬表の並びで各馬の着順ごとの確率（小さな棒グラフ・クリックで拡大・ヒートマップ）を表示します。予想はすべて記録し、結果が出たら自動で照合します。外部サーバーは使わず、自分のPCで動きます。
@@ -696,7 +720,7 @@ git pull
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.ps1
 ```
 
-毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
+毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 新しい馬の血統の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
 
 外出先の端末から見るには、PCとスマホなどにTailscaleを入れて同じアカウントでログインし、PCで一度だけ次を実行します。表示されたHTTPSのアドレスを、自分の端末から開けます（自分のアカウントの端末以外からは見えません）。
 

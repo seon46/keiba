@@ -63,6 +63,34 @@ class SavedRaces:
                  'snapshot_id': head['snapshot_id'], 'retrieved_at': head['retrieved_at']} for child in children]
         return rows or None
 
+    def missing_pedigrees(self, horse_ids=None, *, since=None):
+        """Horse IDs without a saved pedigree: of ``horse_ids``, or of every runner of races dated ``since`` or
+        later (ばんえい excluded)."""
+        if not self.database.exists():
+            return sorted(set(horse_ids or ()))
+        candidates = set()
+        connection = self._connect()
+        try:
+            if horse_ids is None:
+                found = connection.execute(
+                    "SELECT DISTINCT n.horse_id FROM runners n JOIN races r ON r.snapshot_id=n.snapshot_id "
+                    "WHERE n.horse_id IS NOT NULL AND json_extract(r.metadata_json,'$.race_date')>=? "
+                    "AND COALESCE(json_extract(r.metadata_json,'$.course'),'') NOT LIKE '帯広%'", (since,))
+                candidates = {row[0] for row in found}
+            else:
+                candidates = {str(horse) for horse in horse_ids if horse}
+            known = set()
+            ordered = sorted(candidates)
+            for start in range(0, len(ordered), 500):
+                chunk = ordered[start:start + 500]
+                known.update(row[0] for row in connection.execute(
+                    f'SELECT DISTINCT horse_id FROM pedigrees WHERE horse_id IN ({",".join("?" * len(chunk))})', chunk))
+        except sqlite3.Error:
+            return sorted(candidates) if horse_ids is not None else []
+        finally:
+            connection.close()
+        return sorted(candidates - known)
+
     def races_on(self, day):
         """{(region, race_id): summary} of every saved race page with this race date."""
         if not self.database.exists():
@@ -159,6 +187,22 @@ class Scraper:
             detail = ' '.join(message.get('text', '') for message in messages).replace('ERROR: ', '')[-300:]
             raise ValueError(f'{"中央" if region == "central" else "地方"}の一覧を読めませんでした（開催がない日の可能性があります）。{detail}')
         return listed[-1]['race_ids']
+
+    def pedigrees(self, horse_ids, *, chunk=200, log=None):
+        """Fetch the 5-generation pedigrees of ``horse_ids``; returns how many chunks failed."""
+        horse_ids = sorted(set(horse_ids))
+        failed = 0
+        for start in range(0, len(horse_ids), chunk):
+            part = horse_ids[start:start + chunk]
+            arguments = ['pedigree']
+            for horse in part:
+                arguments += ['--horse-id', horse]
+            try:
+                code, _ = self.run(*arguments, log=log, timeout=300 + 30 * len(part))
+            except ValueError:
+                code = 1
+            failed += code != 0
+        return failed
 
     def fetch(self, region, race_ids, page, *, refresh=True):
         race_ids = list(race_ids)

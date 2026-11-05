@@ -13,8 +13,9 @@ def emit(**message):
 
 
 def main(argv=None):
+    from .nightly import STEPS
     from .state import App
-    parser = argparse.ArgumentParser(prog='keiba_app', description='競馬AIアプリ（v3順位分布モデル）')
+    parser = argparse.ArgumentParser(prog='keiba_app', description='競馬AIアプリ（順位分布モデル）')
     parser.add_argument('--data-dir', default='data', type=Path, help='スクレイパーのデータフォルダー（既定: data）')
     commands = parser.add_subparsers(dest='command', required=True)
     init = commands.add_parser('init', help='使うDBとモデルを登録します（コピーはしません）')
@@ -30,8 +31,8 @@ def main(argv=None):
                        help='127.0.0.1・localhost・*.ts.net以外で開くときの名前（例: PCの名前）')
     nightly = commands.add_parser('nightly', help='成績の追加・DB更新・照合・学習し直し・当日の予想')
     nightly.add_argument('--force-fit', action='store_true', help='学習し直しの日でなくても学習します')
-    nightly.add_argument('--only', nargs='+', choices=('collect', 'prepare', 'score', 'fit', 'precompute'))
-    nightly.add_argument('--skip', nargs='+', default=(), choices=('collect', 'prepare', 'score', 'fit', 'precompute'))
+    nightly.add_argument('--only', nargs='+', choices=STEPS)
+    nightly.add_argument('--skip', nargs='+', default=(), choices=STEPS)
     predict = commands.add_parser('predict', help='1レースを予想して記録します')
     predict.add_argument('--region', required=True, choices=('central', 'local'))
     predict.add_argument('--race-id', required=True)
@@ -46,7 +47,7 @@ def main(argv=None):
             info = dataset_info(dataset)
             summary = model_info(model)
             if summary is None:
-                raise ValueError(f'v3モデルのフォルダーではありません（model.jsonがありません）: {model}')
+                raise ValueError(f'モデルのフォルダーではありません（model.jsonがありません）: {model}')
             changes = dict(dataset=str(dataset), model_dir=str(model),
                            collected_through=args.collected_through or info['last_day'],
                            prepared_through=args.collected_through or info['last_day'],
