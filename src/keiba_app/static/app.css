@@ -180,6 +180,31 @@ table.heat { border-collapse: separate; border-spacing: 2px; font-size: 12px; }
 .heat td { width: 34px; min-width: 34px; height: 26px; text-align: center; border-radius: 3px; }
 .heat td.hit { outline: 2px solid var(--hit); outline-offset: -2px; }
 
+/* bets */
+.conf { display: inline-block; vertical-align: middle; margin-left: 10px; padding: 1px 9px; border-radius: 10px;
+        font-size: 13px; font-weight: 700; background: var(--surface); color: var(--ink); }
+.conf-line .conf { margin-left: 0; margin-right: 6px; border: 1px solid var(--line); }
+.conf-A { box-shadow: inset 0 0 0 2px var(--bar); }
+.conf-C { color: var(--muted); }
+.bets-table td { vertical-align: top; }
+.bets-table tr.good td.prob, .bets-table tr.good td:nth-child(5) { color: var(--bar); font-weight: 700; }
+.bet-name { white-space: nowrap; font-weight: 700; }
+.tickets { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.ticket { display: inline-flex; flex-direction: column; padding: 2px 8px; border-radius: 6px; background: var(--soft);
+          font-weight: 700; line-height: 1.3; }
+.ticket small { font-weight: 400; font-size: 11px; color: var(--muted); }
+.bets-table td.num, .bets-table th.num { white-space: nowrap; }
+@media (max-width: 640px) {
+  .bets-table th.opt, .bets-table td.opt { display: none; }
+  .bets-table th, .bets-table td { padding: 6px 5px; }
+  .ticket { flex-direction: row; align-items: baseline; gap: 3px; padding: 1px 5px; white-space: nowrap; font-size: 13px; }
+  .bets-table td, .bets-table .prob { font-size: 13px; }
+  .bets-table .bet-name { font-size: 12px; }
+  .bets-table td.num .small { display: none; }
+  .bets-table th, .bets-table td { padding: 6px 4px; }
+  .ticket small .detail { display: none; }
+}
+
 /* records */
 .filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0 20px; }
 .filters label { display: inline-flex; gap: 6px; align-items: center; }

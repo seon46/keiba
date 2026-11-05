@@ -73,6 +73,11 @@ def parser() -> argparse.ArgumentParser:
     pedigree.add_argument('--max-tasks', type=nonnegative, default=0, help='今回取得する頭数の上限（0: 制限なし）')
     pedigree.add_argument('--max-hours', type=positive, help='今回の実行時間の上限')
     pedigree.add_argument('--min-free-mb', type=nonnegative, default=1024, help='空き容量の下限MB')
+    odds = commands.add_parser('odds', help='指定したレースの全券種のオッズを取得（中央。毎回新しく取得）')
+    odds.add_argument('--region', choices=('central', 'local'), required=True)
+    odds.add_argument('--race-id', action='append', required=True,
+                      type=lambda v: identifier(v, urls.race_id), help='12桁のレースID。複数回指定可')
+    odds.add_argument('--sample-dir', type=Path, help='形式確認用に受信した原本をこのフォルダーにも保存（地方はこれのみ）')
     listing = commands.add_parser('list', help='指定日のレースIDを表示')
     listing.add_argument('--date', required=True, type=iso_date)
     listing.add_argument('--region', choices=('central', 'local'), required=True)
@@ -113,6 +118,11 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument('--output', required=True, type=Path)
     export.add_argument('--overwrite', action='store_true', help='既存の出力ファイルを置き換える')
     return app
+
+
+def save_sample(directory: Path, name: str, text: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(text, encoding='utf-8')
 
 
 def report(**payload) -> None:
@@ -208,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'export' and args.dataset == 'pedigrees' and (
             args.page or args.region or args.start_date or args.end_date):
         app.error('pedigrees には --page/--region/期間フィルターはありません。')
+    if args.command == 'odds' and args.offline:
+        app.error('odds は毎回新しく取得します。--offline は指定できません。')
     if args.command == 'reparse' and args.refresh:
         app.error('reparse は保存済み原本のみを使います。--refresh は指定できません。')
     if args.command == 'backfill' and args.resume:
@@ -306,6 +318,26 @@ def main(argv: list[str] | None = None) -> int:
                 store.save_horse(observation, parsed)
                 report(horse_id=horse_id, runs=len(parsed['runs']), cached=cached,
                        retrieved_at=observation.retrieved_at, snapshot_id=observation.id)
+        elif args.command == 'odds':
+            from .parsers import parse_odds_json
+            client.refresh = True  # odds change until the race starts
+            for race_id in dict.fromkeys(args.race_id):
+                if args.region == 'local':
+                    if not args.sample_dir:
+                        raise ValueError('地方のオッズはまだ取得できません（--sample-dir で形式確認用の原本だけ保存できます）。')
+                    for kind in ('b1', 'b4'):
+                        observation, html, _ = client.fetch(urls.odds_page_url(race_id, 'local', kind))
+                        save_sample(args.sample_dir, f'local_{race_id}_{kind}.html', html)
+                        report(race_id=race_id, region='local', sample=kind, retrieved_at=observation.retrieved_at)
+                    continue
+                observation, text, _ = client.fetch(urls.odds_url(race_id, 'central'), json_ok=True)
+                if args.sample_dir:
+                    save_sample(args.sample_dir, f'central_{race_id}_odds.json', text)
+                parsed = parse_odds_json(text, race_id=race_id, region='central')
+                store.save_odds(observation, parsed)
+                report(race_id=race_id, region='central', bets={bet: len(table) for bet, table in parsed['odds'].items()},
+                       status=parsed['status'], official_at=parsed['official_at'], retrieved_at=observation.retrieved_at,
+                       snapshot_id=observation.id)
         elif args.command == 'list':
             observation, html, cached = load(urls.list_url(args.date, args.region))
             report(date=args.date, region=args.region, **urls.discover_day(html, day=args.date, region=args.region),

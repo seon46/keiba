@@ -185,14 +185,16 @@ class Client:
         if request_rate:
             self.interval = max(self.interval, request_rate.seconds / request_rate.requests)
 
-    def fetch(self, url: str) -> tuple[Observation, str, bool]:
+    def fetch(self, url: str, *, json_ok: bool = False) -> tuple[Observation, str, bool]:
         validate_url(url)
         cached = None if self.refresh else self.store.cached(url)
         if cached:
             return cached, self.store.body(cached).decode(cached.encoding), True
         self._check_robots(url)
         body, content_type, status = self._request(url)
-        if content_type and not any(t in content_type.lower() for t in ("text/html", "application/xhtml+xml")):
+        accepted = ("text/html", "application/xhtml+xml") + (("application/json", "text/javascript", "text/plain")
+                                                              if json_ok else ())
+        if content_type and not any(t in content_type.lower() for t in accepted):
             raise FetchError(f"HTMLではない応答を受信しました: {content_type}")
         text, encoding = decode_body(body, content_type)
         observation = self.store.observe(url, body, encoding=encoding, status=status)

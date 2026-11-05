@@ -54,6 +54,21 @@ class AppTests(unittest.TestCase):
             self.assertTrue(runner['horse_name'])
         self.assertIsNone(prediction['outcome'])
 
+        # Bet proposals from the logged prediction (no odds saved: sorted by hit rate)
+        self.assertTrue(json.loads(prediction['temperatures_json']))
+        bets = engine.bets(identifier, min_hit=.2, max_points=10)
+        self.assertTrue(bets['proposals'])
+        self.assertIsNone(bets['odds'])
+        rates = [item['hit_rate'] for item in bets['proposals']]
+        self.assertEqual(rates, sorted(rates, reverse=True))
+        self.assertTrue(all(rate >= .2 for rate in rates))
+        win = {runner['horse_number']: runner['win_probability'] for runner in prediction['runners']}
+        single = engine._race_bets(prediction).probabilities('win')
+        for number, probability in win.items():
+            self.assertAlmostEqual(single.get(str(number), 0), probability, delta=.1)  # the card used 256 samples
+        self.assertIn(bets['confidence']['tier'], 'ABC')
+        self.assertEqual(bets['confidence']['basis'], 'default')
+
         # Results arrive -> scoring
         for (region_, race_id_), race_rows in races.items():
             save_snapshot(self.fixture['data_dir'], region_, race_id_, 'results', race_rows, f'{day}T18:00:00+09:00')

@@ -104,6 +104,7 @@ async function checkChanges() {
     if (changeToken !== null && token !== changeToken && !document.querySelector('select:focus, input:focus')) {
       refreshing = true;
       dayCache.clear();
+      betsCache.clear();
       const y = window.scrollY;
       await route();
       window.scrollTo(0, y);
@@ -287,7 +288,7 @@ async function raceView(region, raceId) {
   view.innerHTML = `
     <div class="band ${surface === 'ダ' ? 'dirt' : ''}">
       <div class="where"><a href="#/day/${day}">${day ? dateLabel(day) : ''}</a>　${esc(course)} ${number}R　${regionName(region)}</div>
-      <h1>${esc(race.race_name || `${course}${number}R`)}</h1>
+      <h1>${esc(race.race_name || `${course}${number}R`)}<span id="confidence-badge"></span></h1>
       <div class="facts">${esc(facts)}</div>
     </div>
     ${nav.html}
@@ -312,9 +313,11 @@ async function raceView(region, raceId) {
     </table></div>
     ${prediction ? `<h2>着順ごとの確率</h2><div class="heat-wrap">${heatmap(runners)}</div>
     <p class="small muted">色が濃いほど確率が高い着順です。${hasResults ? '枠で囲んだマスが実際の着順です。' : ''}右端は競走中止など完走しない確率です。</p>` : ''}
+    ${prediction ? '<section id="bets" class="bets"><h2>買い目の提案</h2><p class="muted small">計算中…</p></section>' : ''}
     ${prediction?.outcome?.status === 'scored' ? outcomeBox(prediction.outcome) : ''}
     ${prediction ? `<p class="small muted">モデル：${esc(prediction.model_train_end)}より前の成績で学習　作成：${timeLabel(prediction.created_at)}</p>` : ''}`
     : ''}`;
+  if (prediction) loadBets(region, raceId, prediction);
   const strip = view.querySelector('.rnos');
   const chosen = strip?.querySelector('[aria-current]');
   if (chosen) {
@@ -334,6 +337,91 @@ async function raceView(region, raceId) {
     raceState.open.has(id) ? raceState.open.delete(id) : raceState.open.add(id);
     raceView(region, raceId);
   }));
+}
+
+// ---------------------------------------------------------------- bets
+const betsCache = new Map();
+const betsSettings = {
+  get minHit() { return Number(store.get('minHit', '0.2')); },
+  get maxPoints() { return Number(store.get('maxPoints', '10')); },
+};
+
+function ticketLabel(key) {
+  return key.replace(/>/g, '→');
+}
+
+function oddsLabel(value) {
+  if (value == null) return '–';
+  if (Array.isArray(value)) return value[0] === value[1] ? value[0].toFixed(1) : `${value[0].toFixed(1)}–${value[1].toFixed(1)}`;
+  return value >= 100 ? value.toFixed(0) : value.toFixed(1);
+}
+
+function confidenceBadge(c) {
+  if (!c) return '';
+  return `<span class="conf conf-${c.tier}" title="勝率の偏り ${(c.value * 100).toFixed(0)}（0〜100）">自信度 ${c.tier}</span>`;
+}
+
+function confidenceText(c) {
+  if (!c) return '';
+  const rec = c.record[c.tier];
+  const basis = c.basis === 'history' ? 'この地域の過去の予想の上位1/3がA・下位1/3がC' : '予想の記録が30レース未満のため仮の基準';
+  const past = rec ? `過去の自信度${c.tier}のレース（${rec.races}R）では、本命の勝率${pct(rec.pick_win_rate, 0)}・3着内率${pct(rec.pick_top3_rate, 0)}でした。`
+    : `自信度${c.tier}のレースの結果はまだありません。`;
+  return `<p class="conf-line">${confidenceBadge(c)} 本命 ${c.pick_horse_number}番（勝率${pct(c.pick_win_probability)}・3着内${pct(c.pick_top3_probability)}）。${past}
+    <span class="muted small">（勝率の偏り ${(c.value * 100).toFixed(0)}。${basis}）</span></p>`;
+}
+
+async function loadBets(region, raceId, prediction) {
+  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}`;
+  let data = betsCache.get(key);
+  const box = () => view.querySelector('#bets');
+  if (!data) {
+    try {
+      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}`);
+      betsCache.set(key, data);
+    } catch (e) {
+      if (box()) box().innerHTML = `<h2>買い目の提案</h2><p class="error-text">${esc(e.message)}</p>`;
+      return;
+    }
+  }
+  if (!box() || !location.hash.includes(raceId)) return;
+  const badge = view.querySelector('#confidence-badge');
+  if (badge) badge.innerHTML = confidenceBadge(data.confidence);
+  const odds = data.odds;
+  const hasEv = data.proposals.some((p) => p.expected_return != null);
+  const select = (id, values, current, label) => `<label class="small">${label}
+    <select id="${id}">${values.map(([v, t]) => `<option value="${v}" ${Number(v) === current ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
+  box().innerHTML = `
+    <h2>買い目の提案</h2>
+    ${confidenceText(data.confidence)}
+    <div class="controls">
+      ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
+      ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
+      <span class="spacer"></span>
+      ${data.odds_supported ? `<button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>` : '<span class="small muted">地方のオッズは未対応です</span>'}
+    </div>
+    <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
+      ${hasEv ? '期待値の高い順（1点100円・同額買い）。期待値はモデルの確率×オッズの目安で、100%を超えても儲かる保証はありません。' : ''}
+      ${data.approximate ? 'この予想は温度の記録がない古い予想のため、確率は近似です。' : ''}</p>
+    ${data.proposals.length ? `<div class="list-wrap"><table class="list bets-table">
+      <thead><tr><th>券種</th><th>買い目</th><th class="num">点数</th><th class="num">的中率</th><th class="num">期待値</th><th class="num opt">払戻（的中時）</th></tr></thead>
+      <tbody>${data.proposals.map((p) => `<tr class="${p.expected_return != null && p.expected_return >= 1 ? 'good' : ''}">
+        <td class="bet-name">${esc(p.name)}</td>
+        <td><div class="tickets">${p.tickets.map((t) => `<span class="ticket">${esc(ticketLabel(t.key))}<small>${t.odds != null ? `${oddsLabel(t.odds)}倍` : ''}<span class="detail">${t.odds != null ? ' · ' : ''}${pct(t.probability)}</span></small></span>`).join('')}</div></td>
+        <td class="num">${p.points}点<div class="small muted">${p.cost.toLocaleString()}円</div></td>
+        <td class="num prob">${pct(p.hit_rate)}</td>
+        <td class="num">${p.expected_return != null ? pct(p.expected_return, 0) : '–'}</td>
+        <td class="num opt">${p.payout_range ? (p.payout_range[0] === p.payout_range[1] ? `${p.payout_range[0].toLocaleString()}円` : `${p.payout_range[0].toLocaleString()}〜${p.payout_range[1].toLocaleString()}円`) : '–'}</td>
+      </tr>`).join('')}</tbody></table></div>`
+    : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}`;
+  box().querySelector('#min-hit').addEventListener('change', (e) => { store.set('minHit', e.target.value); loadBets(region, raceId, prediction); });
+  box().querySelector('#max-points').addEventListener('change', (e) => { store.set('maxPoints', e.target.value); loadBets(region, raceId, prediction); });
+  box().querySelector('#odds')?.addEventListener('click', async (event) => {
+    event.target.disabled = true;
+    try {
+      watch(await api('race/odds', {region, race_id: raceId}), () => { betsCache.clear(); loadBets(region, raceId, prediction); });
+    } catch (e) { alertJob(e); event.target.disabled = false; }
+  });
 }
 
 async function predict(region, raceId, refresh) {

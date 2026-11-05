@@ -49,7 +49,7 @@ RUNNER_FIELDS = ('horse_id', 'horse_number', 'frame', 'horse_name', 'sex', 'age'
 PREDICTION_FIELDS = ('created_at', 'race_id', 'region', 'race_date', 'course', 'race_number', 'race_name',
                      'start_time', 'surface', 'distance_m', 'track_condition', 'starters', 'timing', 'source',
                      'origin', 'model_dir', 'model_train_end', 'dataset', 'history_through', 'bodyweight_known',
-                     'entries_retrieved_at')
+                     'entries_retrieved_at', 'temperatures_json')
 
 
 class Logbook:
@@ -57,6 +57,9 @@ class Logbook:
         self.path = Path(path)
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {row['name'] for row in connection.execute('PRAGMA table_info(predictions)')}
+            if 'temperatures_json' not in columns:  # added with the bet proposals
+                connection.execute('ALTER TABLE predictions ADD COLUMN temperatures_json TEXT')
 
     @contextmanager
     def _connect(self):
@@ -193,6 +196,24 @@ class Logbook:
         daily = [dict(day=day, races=len(values[0]), model=mean(values[0]), uniform=mean(values[1]))
                  for day, values in sorted(by_day.items())]
         return dict(summary=summary, daily=daily, races=rows[:limit])
+
+    def confidence_history(self, region):
+        """[(win probabilities, pick_won or None, pick_top3 or None)] of the last pre-race prediction of each race."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT p.id,o.status,o.pick_position,o.pick_top3,GROUP_CONCAT(r.win_probability) AS wins "
+                "FROM predictions p JOIN prediction_runners r ON r.prediction_id=p.id "
+                "LEFT JOIN outcomes o ON o.prediction_id=p.id "
+                "WHERE p.region=? AND p.timing='before' AND r.win_probability IS NOT NULL AND p.id=("
+                "SELECT q.id FROM predictions q WHERE q.race_id=p.race_id AND q.timing='before' "
+                "ORDER BY q.created_at DESC, q.id DESC LIMIT 1) GROUP BY p.id", (region,)).fetchall()
+        history = []
+        for row in rows:
+            scored = row['status'] == 'scored'
+            history.append(([float(value) for value in row['wins'].split(',')],
+                            (row['pick_position'] == 1) if scored else None,
+                            bool(row['pick_top3']) if scored and row['pick_top3'] is not None else None))
+        return history
 
     # -- day races and runs --------------------------------------------
     def set_day_races(self, day, region, races, discovered_at):

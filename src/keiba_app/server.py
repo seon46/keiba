@@ -149,6 +149,15 @@ class Api:
                         race_date=latest['race_date'])
         return dict(region=region, race_id=race_id, race=race, card=card, results=finish, predictions=predictions)
 
+    def bets(self, query):
+        try:
+            identifier = int(query.get('prediction', ''))
+            min_hit = min(max(float(query.get('min_hit', .2)), 0), 1)
+            max_points = min(max(int(query.get('max_points', 10)), 1), 30)
+        except ValueError as exc:
+            raise ValueError('prediction・min_hit・max_points の指定が不正です。') from exc
+        return self.engine.bets(identifier, min_hit=min_hit, max_points=max_points)
+
     def job(self, query):
         job = self.jobs.get(query.get('id', ''))
         if job is None:
@@ -181,6 +190,16 @@ class Api:
             identifier = self.engine.predict_race(region, race_id, refresh=refresh)
             return dict(prediction_id=identifier)
         return self.jobs.submit('race', f'{race_id}の予想', work, race_id=race_id)
+
+    def fetch_odds(self, body):
+        region, race_id = body.get('region'), body.get('race_id')
+        if region not in ('central', 'local') or not race_id:
+            raise ValueError('region と race_id を指定してください。')
+
+        def work(progress):
+            progress(message='オッズを取得中')
+            return dict(fetched=self.engine.fetch_odds(region, race_id))
+        return self.jobs.submit('odds', f'{race_id}のオッズ', work, race_id=race_id)
 
     def discover(self, body):
         day = body.get('date') or today()
@@ -225,8 +244,9 @@ class Api:
             parts.extend(f'{job["id"]}:{job["status"]}' for job in self.jobs.jobs.values())
         return dict(token=hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16])
 
-    GET = dict(status=status, day=day, race=race, job=job, records=records, log=log, changes=changes)
-    POST = {'race/predict': predict_race, 'day/discover': discover, 'day/predict': predict_day, 'nightly': nightly}
+    GET = dict(status=status, day=day, race=race, bets=bets, job=job, records=records, log=log, changes=changes)
+    POST = {'race/predict': predict_race, 'race/odds': fetch_odds, 'day/discover': discover, 'day/predict': predict_day,
+            'nightly': nightly}
 
 
 _DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)

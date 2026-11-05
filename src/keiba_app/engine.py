@@ -1,7 +1,9 @@
 """Predictions for races (with logging) and scoring of logged predictions against results."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import datetime
+import json
 import math
 import threading
 
@@ -43,6 +45,7 @@ class Engine:
         self._predictor, self._key = None, None
         self._lock = threading.Lock()
         self.discover_errors = {}
+        self._bets, self._confidence = OrderedDict(), {}
 
     # -- predictor -----------------------------------------------------
     def predictor(self):
@@ -133,7 +136,8 @@ class Engine:
                     origin=origin, model_dir=str(predictor.model_dir), model_train_end=predictor.train_end(group),
                     dataset=str(predictor.database), history_through=predictor.last_day,
                     bodyweight_known=int(any(runner.get('weight_kg') for runner in runners if runner.get('distribution'))),
-                    entries_retrieved_at=first.get('retrieved_at'))
+                    entries_retrieved_at=first.get('retrieved_at'),
+                    temperatures_json=json.dumps([float(value) for value in predictor.bundle(group)['temperatures']]))
         identifier = self.logbook.save_prediction(meta, runners)
         self.score(identifier)
         return identifier
@@ -271,3 +275,95 @@ class Engine:
             status = self.score(item['id'])
             counts[status or 'waiting'] = counts.get(status or 'waiting', 0) + 1
         return counts
+
+
+    # -- bets and confidence ---------------------------------------------
+    def _race_bets(self, prediction):
+        """Simulated finishing orders of a logged prediction (cached)."""
+        from keiba_ai.bets import RaceBets, simulate_top3
+        from keiba_ai.rank_model import race_seed
+        identifier = prediction['id']
+        if identifier in self._bets:
+            self._bets.move_to_end(identifier)
+            return self._bets[identifier]
+        runners = [runner for runner in prediction['runners'] if runner.get('distribution') is not None]
+        if len(runners) < 2 or any(runner.get('strength_score') is None for runner in runners):
+            raise ValueError('この予想からは馬券の確率を計算できません。')
+        approximate = False
+        temperatures = json.loads(prediction.get('temperatures_json') or 'null')
+        if not temperatures:  # predictions made before the temperatures were logged
+            from .nightly import model_info
+            group = 'central_flat' if prediction['region'] == 'central' else 'local_flat'
+            temperatures = ((model_info(prediction['model_dir']) or {}).get('groups', {}).get(group) or {}).get(
+                'temperatures')
+            approximate = True
+            if not temperatures:
+                raise ValueError('この予想のモデルが見つからないため、馬券の確率を計算できません。予想し直してください。')
+        top3 = simulate_top3([runner['strength_score'] for runner in runners],
+                             [runner['finish_probability'] for runner in runners], temperatures,
+                             seed=race_seed(prediction['race_id'], 42))
+        bets = RaceBets([runner['horse_number'] for runner in runners], [runner.get('frame') for runner in runners], top3)
+        bets.approximate = approximate
+        self._bets[identifier] = bets
+        while len(self._bets) > 24:
+            self._bets.popitem(last=False)
+        return bets
+
+    def confidence(self, prediction):
+        """Concentration of the win probabilities, its tier (A/B/C among this region's races) and the past record."""
+        import time
+        from keiba_ai.bets import concentration
+        region = prediction['region']
+        cached = self._confidence.get(region)
+        if cached is None or time.time() - cached[0] > 60:
+            history = [(concentration(wins), won, top3) for wins, won, top3 in self.logbook.confidence_history(region)]
+            cached = self._confidence[region] = (time.time(), [item for item in history if item[0] is not None])
+        history = cached[1]
+        value = concentration([runner.get('win_probability') for runner in prediction['runners']
+                               if runner.get('distribution') is not None])
+        if value is None:
+            return None
+        values = sorted(item[0] for item in history)
+        if len(values) >= 30:
+            low, high = values[len(values) // 3], values[2 * len(values) // 3]
+            basis = 'history'
+        else:
+            low, high = .10, .20
+            basis = 'default'
+        tier_of = lambda c: 'A' if c >= high else 'B' if c >= low else 'C'
+        tiers = {}
+        for c, won, top3 in history:
+            if won is None:
+                continue
+            entry = tiers.setdefault(tier_of(c), dict(races=0, pick_wins=0, pick_top3=0))
+            entry['races'] += 1
+            entry['pick_wins'] += bool(won)
+            entry['pick_top3'] += bool(top3)
+        record = {tier: dict(races=entry['races'], pick_win_rate=entry['pick_wins'] / entry['races'],
+                             pick_top3_rate=entry['pick_top3'] / entry['races'])
+                  for tier, entry in tiers.items()}
+        pick = max((runner for runner in prediction['runners'] if runner.get('distribution') is not None),
+                   key=lambda runner: runner.get('win_probability') or 0)
+        return dict(value=value, tier=tier_of(value), thresholds=[low, high], basis=basis, record=record,
+                    pick_horse_number=pick['horse_number'], pick_win_probability=pick.get('win_probability'),
+                    pick_top3_probability=pick.get('top3_probability'))
+
+    def bets(self, prediction_id, *, min_hit=.2, max_points=10):
+        from keiba_ai.bets import BET_NAMES, propose
+        prediction = self.logbook.prediction(prediction_id)
+        if prediction is None:
+            raise KeyError('予想がありません。')
+        race_bets = self._race_bets(prediction)
+        saved = self.saved.odds(prediction['region'], prediction['race_id'])
+        proposals = propose(race_bets, (saved or {}).get('odds'), min_hit=min_hit, max_points=max_points)
+        return dict(prediction_id=prediction_id, proposals=proposals, bet_names=BET_NAMES,
+                    approximate=getattr(race_bets, 'approximate', False), samples=race_bets.samples,
+                    odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
+                                                         official_at=saved.get('official_at'), status=saved.get('status'),
+                                                         bets=sorted(saved.get('odds', {}))),
+                    odds_supported=prediction['region'] == 'central', confidence=self.confidence(prediction))
+
+    def fetch_odds(self, region, race_id):
+        if region != 'central':
+            raise ValueError('地方のオッズはまだ取得できません（ページの形式を確認中）。')
+        return self.scraper.odds(region, race_id)

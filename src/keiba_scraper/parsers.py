@@ -554,3 +554,63 @@ def parse_horse_history(html: str, *, horse_id: str) -> dict:
     horse_name = re.sub(r"の(?:競走成績|競走馬データ)$", "", horse_name).strip()
     horse_name = re.sub(r"\s*\([^)]*\)$", "", horse_name).strip()
     return {"horse_id": horse_id, "horse_name": horse_name, "runs": runs}
+
+
+# --------------------------------------------------------------------------
+# Odds (central: the odds page's JSON data)
+# --------------------------------------------------------------------------
+
+ODDS_TYPES = {"1": ("win", 1, False), "2": ("place", 1, False), "3": ("bracket", 2, False), "4": ("quinella", 2, False),
+              "5": ("wide", 2, False), "6": ("exacta", 2, True), "7": ("trio", 3, False), "8": ("trifecta", 3, True)}
+
+
+def _odds_number(value):
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    text = str(value or "").replace(",", "").strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
+    """{race_id, region, status, official_at, odds: {bet: {ticket key: odds | [low, high]}}, popularity}."""
+    import json
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise ParseError(f"オッズの応答がJSONではありません: {text[:120]!r}") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    tables = data.get("odds") if isinstance(data, dict) else None
+    if not isinstance(tables, dict):
+        status = payload.get("status") if isinstance(payload, dict) else None
+        raise ParseError(f"オッズの表がありません（status={status!r}）。発売前か、形式が変わった可能性があります。")
+    odds, popularity = {}, {}
+    for code, table in tables.items():
+        if str(code) not in ODDS_TYPES or not isinstance(table, dict):
+            continue
+        bet, width, ordered = ODDS_TYPES[str(code)]
+        entries, ranks = {}, {}
+        for raw_key, value in table.items():
+            digits = str(raw_key)
+            if not digits.isdigit() or len(digits) != 2 * width:
+                raise ParseError(f"オッズの組み合わせの形式が想定と違います: {bet} {raw_key!r}")
+            numbers = [int(digits[index:index + 2]) for index in range(0, len(digits), 2)]
+            key = (">" if ordered else "-").join(str(number) for number in (numbers if ordered else sorted(numbers)))
+            values = value if isinstance(value, list) else [value]
+            if bet in ("place", "wide"):
+                low, high = _odds_number(values[0]), _odds_number(values[1]) if len(values) > 1 else None
+                entry = [low, high or low] if low else None
+            else:
+                entry = _odds_number(values[0])
+            if entry is not None:
+                entries[key] = entry
+                rank = _number(str(values[-1]), integer=True) if len(values) > 1 else None
+                if rank:
+                    ranks[key] = rank
+        if entries:
+            odds[bet], popularity[bet] = entries, ranks
+    return dict(race_id=race_id, region=region, status=payload.get("status"),
+                official_at=data.get("official_datetime"), odds=odds, popularity=popularity)

@@ -81,6 +81,11 @@ class Store:
                 horse_id TEXT NOT NULL, metadata_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS pedigrees_identity ON pedigrees(horse_id);
+            CREATE TABLE IF NOT EXISTS odds (
+                snapshot_id TEXT PRIMARY KEY REFERENCES observations(id),
+                race_id TEXT NOT NULL, region TEXT NOT NULL, metadata_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS odds_identity ON odds(region, race_id);
             CREATE TABLE IF NOT EXISTS request_state (
                 host TEXT PRIMARY KEY, next_request REAL NOT NULL DEFAULT 0,
                 blocked_until REAL NOT NULL DEFAULT 0, reason TEXT
@@ -187,6 +192,14 @@ class Store:
                 [(observation.id, i, run.get("race_id"), json.dumps(run, ensure_ascii=False))
                  for i, run in enumerate(runs)],
             )
+
+    def save_odds(self, observation: Observation, parsed: dict) -> None:
+        if observation.status != 200 or not parsed.get("odds"):
+            raise StorageError("オッズが0件のため保存しません。")
+        with self.db:
+            self.db.execute(
+                "INSERT INTO odds VALUES (?,?,?,?) ON CONFLICT(snapshot_id) DO UPDATE SET metadata_json=excluded.metadata_json",
+                (observation.id, parsed["race_id"], parsed["region"], json.dumps(parsed, ensure_ascii=False)))
 
     def save_pedigree(self, observation: Observation, parsed: dict) -> None:
         """Keep the complete path-labelled tree with its original observation."""

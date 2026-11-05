@@ -91,6 +91,24 @@ class SavedRaces:
             connection.close()
         return sorted(candidates - known)
 
+    def odds(self, region, race_id):
+        """The latest saved odds of the race ({odds: {bet: {key: value}}, retrieved_at, status, official_at}) or None."""
+        if not self.database.exists():
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                'SELECT d.metadata_json,o.retrieved_at FROM odds d JOIN observations o ON o.id=d.snapshot_id '
+                'WHERE d.region=? AND d.race_id=? ORDER BY o.retrieved_at DESC,o.rowid DESC LIMIT 1',
+                (region, race_id)).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return dict(json.loads(row['metadata_json']), retrieved_at=row['retrieved_at'])
+
     def races_on(self, day):
         """{(region, race_id): summary} of every saved race page with this race date."""
         if not self.database.exists():
@@ -203,6 +221,13 @@ class Scraper:
                 code = 1
             failed += code != 0
         return failed
+
+    def odds(self, region, race_id):
+        code, messages = self.run('odds', '--region', region, '--race-id', race_id, timeout=180)
+        if code != 0:
+            detail = ' '.join(message.get('text', '') for message in messages).replace('ERROR: ', '')[-300:]
+            raise ValueError(f'オッズを取得できません: {detail}')
+        return [message for message in messages if 'bets' in message]
 
     def fetch(self, region, race_ids, page, *, refresh=True):
         race_ids = list(race_ids)
