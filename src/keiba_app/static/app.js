@@ -90,7 +90,7 @@ async function route() {
     view.innerHTML = `<p class="error-text">${esc(error.message)}</p>`;
   }
 }
-window.addEventListener('hashchange', route);
+window.addEventListener('hashchange', () => { window.scrollTo(0, 0); route(); });
 
 // ---------------------------------------------------------------- live refresh
 // The page polls a small change token; when predictions, results, day lists, runs or jobs change
@@ -103,6 +103,7 @@ async function checkChanges() {
     const {token} = await api('changes');
     if (changeToken !== null && token !== changeToken && !document.querySelector('select:focus, input:focus')) {
       refreshing = true;
+      dayCache.clear();
       const y = window.scrollY;
       await route();
       window.scrollTo(0, y);
@@ -186,6 +187,71 @@ function alertJob(error) {
 // ---------------------------------------------------------------- race
 const raceState = {sort: 'number', open: new Set(), selectedId: null};
 
+// Race lists of a day, shared by the race pages (cleared whenever the live-refresh token changes).
+const dayCache = new Map();
+async function dayRaces(day) {
+  if (!day) return [];
+  const cached = dayCache.get(day);
+  if (cached && Date.now() - cached.at < 60000) return cached.races;
+  const data = await api('day?date=' + day);
+  dayCache.set(day, {at: Date.now(), races: data.races});
+  return data.races;
+}
+
+const raceHref = (race) => `#/race/${race.region}/${race.race_id}`;
+
+// Previous / next race at the same course, every race number there, and the day's other courses.
+function raceNav(races, raceId, currentNumber) {
+  const current = races.find((race) => race.race_id === raceId);
+  if (!current) return {html: '', previous: null, next: null};
+  const venues = new Map();
+  races.forEach((race) => {
+    const key = `${race.region}|${race.course}`;
+    if (!venues.has(key)) venues.set(key, {region: race.region, course: race.course, races: []});
+    venues.get(key).races.push(race);
+  });
+  venues.forEach((venue) => venue.races.sort((a, b) => a.race_number - b.race_number));
+  const here = venues.get(`${current.region}|${current.course}`).races;
+  const index = here.findIndex((race) => race.race_id === raceId);
+  const previous = here[index - 1] || null;
+  const next = here[index + 1] || null;
+  const step = (race, label, rel) => (race
+    ? `<a class="navbtn" rel="${rel}" href="${raceHref(race)}">${label}</a>`
+    : `<span class="navbtn" aria-disabled="true">${label}</span>`);
+  const numbers = here.map((race) => `<a href="${raceHref(race)}" class="${race.supported ? '' : 'unsupported'}"
+      ${race.race_id === raceId ? 'aria-current="page"' : ''} title="${esc(race.race_name || '')}">${race.race_number}R</a>`).join('');
+  const target = (venue) => {
+    const list = venue.races;
+    return list.find((race) => race.race_number === currentNumber)
+      || [...list].reverse().find((race) => race.race_number < currentNumber) || list[0];
+  };
+  const group = (region) => {
+    const list = [...venues.values()].filter((venue) => venue.region === region);
+    if (!list.length) return '';
+    return `<div class="chips"><span class="chips-label">${regionName(region)}</span>${list.map((venue) => {
+      const active = venue.region === current.region && venue.course === current.course;
+      return `<a href="${raceHref(target(venue))}" ${active ? 'aria-current="true"' : ''}>${esc(venue.course)}</a>`;
+    }).join('')}</div>`;
+  };
+  const html = `<nav class="racenav" aria-label="ほかのレースへ">
+      <div class="racenav-step">
+        ${step(previous, '‹ 前のレース', 'prev')}
+        <div class="rnos">${numbers}</div>
+        ${step(next, '次のレース ›', 'next')}
+      </div>
+      <div class="racenav-venues">${group('central')}${group('local')}</div>
+    </nav>`;
+  return {html, previous, next};
+}
+
+// ← / → move to the previous / next race while a race page is open.
+document.addEventListener('keydown', (event) => {
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if (!location.hash.startsWith('#/race/') || event.target.closest('input, select, textarea')) return;
+  const link = view.querySelector(`.racenav a[rel="${event.key === 'ArrowLeft' ? 'prev' : event.key === 'ArrowRight' ? 'next' : ''}"]`);
+  if (link) { event.preventDefault(); location.hash = link.getAttribute('href'); }
+});
+
 async function raceView(region, raceId) {
   const data = await api(`race?region=${region}&race_id=${raceId}`);
   const race = data.race;
@@ -196,6 +262,8 @@ async function raceView(region, raceId) {
   const course = race.race_course || prediction?.course || '';
   const number = race.race_number || prediction?.race_number || Number(raceId.slice(-2));
   const day = race.race_date || prediction?.race_date || '';
+  let nav = {html: ''};
+  try { nav = raceNav(await dayRaces(day), raceId, Number(number)); } catch (e) { /* the race page works without it */ }
   const facts = [surface && race.race_distance_m ? `${surfaceName(surface)}${race.race_distance_m}m` : '',
     race.race_track_condition ? `馬場 ${race.race_track_condition}` : '',
     race.race_weather ? `天候 ${race.race_weather}` : '',
@@ -222,6 +290,7 @@ async function raceView(region, raceId) {
       <h1>${esc(race.race_name || `${course}${number}R`)}</h1>
       <div class="facts">${esc(facts)}</div>
     </div>
+    ${nav.html}
     <div class="controls">
       <button type="button" class="primary" id="refresh">最新の出馬表で予想</button>
       <button type="button" id="saved">保存済みの出馬表で予想</button>
@@ -246,6 +315,16 @@ async function raceView(region, raceId) {
     ${prediction?.outcome?.status === 'scored' ? outcomeBox(prediction.outcome) : ''}
     ${prediction ? `<p class="small muted">モデル：${esc(prediction.model_train_end)}より前の成績で学習　作成：${timeLabel(prediction.created_at)}</p>` : ''}`
     : ''}`;
+  const strip = view.querySelector('.rnos');
+  const chosen = strip?.querySelector('[aria-current]');
+  if (chosen) {
+    const center = () => {
+      const box = strip.getBoundingClientRect(), item = chosen.getBoundingClientRect();
+      strip.scrollLeft += item.left - box.left - (box.width - item.width) / 2;
+    };
+    requestAnimationFrame(center);
+    document.fonts?.ready.then(() => requestAnimationFrame(center));  // the web font changes the widths
+  }
   view.querySelector('#refresh').addEventListener('click', () => predict(region, raceId, true));
   view.querySelector('#saved').addEventListener('click', () => predict(region, raceId, false));
   view.querySelector('#history')?.addEventListener('change', (e) => { const id = Number(e.target.value); raceState.selectedId = id === predictions[0].id ? null : id; raceView(region, raceId); });

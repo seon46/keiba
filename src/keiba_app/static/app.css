@@ -108,6 +108,23 @@ h2 { font-size: 17px; margin: 32px 0 12px; }
 .band h1 { font-size: 26px; margin: 2px 0 4px; }
 .band .facts { font-size: 15px; opacity: .95; }
 .band a { color: inherit; }
+/* moving between races */
+.racenav { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+           margin-bottom: 12px; display: grid; gap: 8px; }
+.racenav-step { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; }
+.navbtn { display: inline-block; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
+          text-decoration: none; white-space: nowrap; background: var(--surface); }
+a.navbtn:hover { background: var(--soft); }
+.navbtn[aria-disabled="true"] { color: var(--muted); opacity: .5; }
+.rnos { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: thin; padding: 2px 0; }
+.rnos a, .chips a { flex: none; text-decoration: none; padding: 4px 9px; border-radius: 6px; font-size: 14px;
+                    border: 1px solid transparent; }
+.rnos a:hover, .chips a:hover { background: var(--soft); }
+.rnos a.unsupported { color: var(--muted); }
+.rnos a[aria-current], .chips a[aria-current] { background: var(--ink); color: var(--paper); font-weight: 700; }
+.racenav-venues { display: flex; flex-wrap: wrap; gap: 4px 16px; border-top: 1px solid var(--soft); padding-top: 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.chips-label { font-size: 12px; color: var(--muted); margin-right: 2px; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0 4px; }
 
 /* race card */
@@ -212,4 +229,7 @@ pre.log { background: var(--surface); border: 1px solid var(--line); border-radi
   .sub { white-space: normal; }
   .band h1 { font-size: 22px; }
   .datebar .date-title { width: 100%; }
+  .racenav-step { grid-template-columns: 1fr 1fr; }
+  .racenav-step .rnos { grid-column: 1 / -1; grid-row: 1; }
+  .racenav-step .navbtn { text-align: center; }
 }
