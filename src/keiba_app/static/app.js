@@ -432,6 +432,27 @@ function confidenceText(c) {
     <span class="muted small">（勝率の偏り ${(c.value * 100).toFixed(0)}。${basis}）</span></p>`;
 }
 
+function ticketChip(t) {
+  return `<span class="ticket">${esc(ticketLabel(t.key))}<b class="stake">${t.stake.toLocaleString()}円</b><small>${oddsLabel(t.odds)}倍<span class="detail"> · ${pct(t.probability)}</span></small></span>`;
+}
+
+// Mixes of two or three bet types: any ticket that hits alone still covers the total.
+function mixesTable(mixes, hasOdds) {
+  if (!hasOdds) return '';
+  if (!mixes.length) return '<h3 class="mix-title">組み合わせの提案</h3><p class="muted small">この条件で、当たっても損にならない組み合わせはありません。</p>';
+  return `<h3 class="mix-title">組み合わせの提案</h3>
+    <p class="small muted">券種をまたいで買う提案です。どの買い目が1つだけ当たっても合計金額以上が戻る配分で、複数当たれば払戻は足し算になります。的中率は「どれかが当たる確率」です。</p>
+    <div class="list-wrap"><table class="list bets-table mixes">
+      <thead><tr><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
+      <tbody>${mixes.map((m) => `<tr class="${m.expected_return >= 1 ? 'good' : ''}">
+        <td>${m.parts.map((part) => `<div class="mix-part"><span class="bet-name">${esc(part.name)}</span><div class="tickets">${part.tickets.map(ticketChip).join('')}</div></div>`).join('')}</td>
+        <td class="num opt">${m.cost.toLocaleString()}円<div class="small muted">${m.points}点</div></td>
+        <td class="num prob">${pct(m.hit_rate)}</td>
+        <td class="num">${pct(m.expected_return, 0)}</td>
+        <td class="num opt">${m.min_payout.toLocaleString()}〜${m.max_payout.toLocaleString()}円<div class="small muted">+${(m.min_payout - m.cost).toLocaleString()}円〜</div></td>
+      </tr>`).join('')}</tbody></table></div>`;
+}
+
 async function loadBets(region, raceId, prediction) {
   const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}`;
   let data = betsCache.get(key);
@@ -476,7 +497,8 @@ async function loadBets(region, raceId, prediction) {
         <td class="num">${p.expected_return != null ? pct(p.expected_return, 0) : '–'}</td>
         <td class="num opt">${p.min_payout != null ? `${p.min_payout.toLocaleString()}${p.max_payout > p.min_payout ? `〜${p.max_payout.toLocaleString()}` : ''}円<div class="small muted">+${(p.min_payout - p.cost).toLocaleString()}円〜</div>` : '–'}</td>
       </tr>`).join('')}</tbody></table></div>`
-    : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}`;
+    : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}
+    ${mixesTable(data.mixes || [], !!odds)}`;
   box().querySelector('#min-hit').addEventListener('change', (e) => { store.set('minHit', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#max-points').addEventListener('change', (e) => { store.set('maxPoints', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#budget').addEventListener('change', (e) => { store.set('budget', e.target.value); loadBets(region, raceId, prediction); });

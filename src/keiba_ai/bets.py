@@ -245,6 +245,90 @@ def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, budget=1000
     return chosen
 
 
+def combine(bets: RaceBets, odds, *, min_hit=.2, max_points=10, budget=1000, limit=5, pool=14):
+    """Proposals that mix two or three bet types (e.g. 単勝 + 馬連 + 3連単).
+
+    Parts are the "N most likely tickets" sets of each priced bet type.  The budget is split over all
+    tickets of the mix so that any single ticket that hits pays back at least the total (so a hit
+    never loses money even when only the cheapest part hits); hits of several parts add up.  Hit
+    rate, payouts and expected return come from the simulated finishing orders.
+    """
+    from itertools import combinations as choose
+    if not odds:
+        return []
+    parts = []
+    for bet, name, _, _ in BET_TYPES:
+        table = odds.get(bet) or {}
+        probabilities = bets.probabilities(bet)
+        if not table or not probabilities:
+            continue
+        order = sorted(probabilities.items(), key=lambda item: -item[1])[:CANDIDATES]
+        for size in range(1, min(MAX_POINTS[bet], max_points - 1, len(order)) + 1):
+            keys = [key for key, _ in order[:size]]
+            values = [_odds_value(table.get(key)) for key in keys]
+            if any(value is None for value in values):
+                break
+            hits = np.stack([bets._hits(bet, key) for key in keys])
+            parts.append(dict(bet=bet, name=name, keys=keys, values=values, hits=hits,
+                              probabilities=[probabilities[key] for key in keys]))
+    if len(parts) < 2:
+        return []
+
+    def evaluate(members):
+        tickets = [(part, index) for part in members for index in range(len(part['keys']))]
+        if len(tickets) > max_points:
+            return None
+        values = [part['values'][index] for part, index in tickets]
+        allocation = allocate(values, budget)
+        if allocation is None or allocation[1] < allocation[2]:
+            return None
+        stakes, smallest, total = allocation
+        payout = np.zeros(bets.samples)
+        for (part, index), stake, value in zip(tickets, stakes, values):
+            payout += part['hits'][index] * stake * value
+        hit = payout > 0
+        if hit.mean() < min_hit:
+            return None
+        position, rows = 0, []
+        for part in members:
+            size = len(part['keys'])
+            share = stakes[position:position + size]
+            rows.append(dict(bet=part['bet'], name=part['name'], cost=sum(share), tickets=[
+                dict(key=key, probability=probability, odds=(odds[part['bet']] or {}).get(key), stake=stake)
+                for key, probability, stake in zip(part['keys'], part['probabilities'], share)]))
+            position += size
+        return dict(parts=rows, points=len(tickets), cost=total, hit_rate=float(hit.mean()),
+                    expected_return=float(payout.mean() / total), min_payout=round(float(payout[hit].min())),
+                    max_payout=round(float(payout.max())), profit_rate=float((payout > total).mean()))
+
+    singles = []
+    for part in parts:
+        result = evaluate([part])
+        if result is not None:
+            singles.append((part, result))
+    singles.sort(key=lambda item: -item[1]['expected_return'])
+    top = [part for part, _ in singles[:pool]]
+    mixes = []
+    for count in (2, 3):
+        for members in choose(top, count):
+            if len({part['bet'] for part in members}) < count:
+                continue
+            result = evaluate(list(members))
+            if result is not None:
+                mixes.append(result)
+    mixes.sort(key=lambda item: (-item['expected_return'], -item['hit_rate']))
+    chosen, seen = [], set()
+    for item in mixes:
+        kinds = tuple(part['bet'] for part in item['parts'])
+        if kinds in seen:
+            continue
+        seen.add(kinds)
+        chosen.append(item)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def concentration(win_probabilities):
     """0 (all horses equal) .. 1 (one certain winner): 1 - entropy / log(starters)."""
     values = np.asarray([value for value in win_probabilities if value is not None and value > 0], dtype=float)

@@ -46,6 +46,16 @@ class BetTests(unittest.TestCase):
             self.assertGreaterEqual(item['hit_rate'], .2)
         returns = [item['expected_return'] for item in proposals]
         self.assertEqual(returns, sorted(returns, reverse=True))
+        from keiba_ai.bets import combine
+        mixes = combine(self.bets, odds, min_hit=.2, max_points=10, budget=1000)
+        self.assertTrue(mixes)
+        for mix in mixes:
+            self.assertGreaterEqual(len({part['bet'] for part in mix['parts']}), 2)
+            self.assertLessEqual(mix['cost'], 1000)
+            self.assertLessEqual(mix['points'], 10)
+            self.assertGreaterEqual(mix['min_payout'], mix['cost'])
+            self.assertGreaterEqual(mix['hit_rate'], .2)
+        self.assertEqual(combine(self.bets, None), [])
         # without odds: 100 yen each, by hit rate
         plain = propose(self.bets, None, min_hit=.2)
         self.assertTrue(all(ticket['stake'] == 100 for item in plain for ticket in item['tickets']))
