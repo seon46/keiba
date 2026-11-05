@@ -150,14 +150,15 @@ async function dayView(day) {
       </div>
       ${races.length ? `<div class="venues">${[...venues].map(([course, list]) => `
         <section class="venue"><h3>${esc(course)}</h3><ol>${list.map((race) => `
-          <li class="${race.supported ? '' : 'unsupported'}"><a href="#/race/${race.region}/${race.race_id}">
+          <li class="${race.supported ? '' : 'unsupported'}" data-day="${day}" data-start="${esc(race.start_time || '')}"><a href="#/race/${race.region}/${race.race_id}">
             <span class="rno">${race.race_number}R</span>
-            <span class="time">${esc(race.start_time || '')}</span>
+            <span class="time">${esc(race.start_time || '')}<span class="until"></span></span>
             <span class="name">${esc(race.race_name || (race.supported ? '' : '対象外'))}</span>
             <span class="mark">${race.confidence ? `<span class="conf-mini conf-${race.confidence.tier}" title="自信度">${race.confidence.tier}</span>` : race.predictions ? '予想済' : ''}</span>
           </a></li>`).join('')}</ol></section>`).join('')}</div>`
         : `<p class="empty">${data.races.length ? `この日の${regionName(region)}のレースはありません。` : 'この日のレースはまだ取得していません。「レース一覧を取得」を押すと、netkeibaの日別一覧から取得します。'}</p>`}
       ${confidentPanel(races)}`;
+    markStarts();
     view.querySelector('#pick').addEventListener('change', (event) => { location.hash = '#/day/' + event.target.value; });
     view.querySelectorAll('[data-region]').forEach((button) => button.addEventListener('click', () => {
       region = button.dataset.region; store.set('region', region); draw();
@@ -181,6 +182,31 @@ async function dayView(day) {
   };
   draw();
 }
+
+// Today's race list: finished races fade, the next race of each course is highlighted with the minutes left.
+function markStarts() {
+  const now = Date.now();
+  view.querySelectorAll('.venue').forEach((venue) => {
+    let next = null;
+    venue.querySelectorAll('li[data-start]').forEach((li) => {
+      li.classList.remove('done', 'next', 'soon');
+      li.querySelector('.until').textContent = '';
+      const start = li.dataset.start && Date.parse(`${li.dataset.day}T${li.dataset.start}:00+09:00`);
+      if (!start) return;
+      if (start <= now) { li.classList.add('done'); return; }
+      if (!next) {
+        next = li;
+        const minutes = Math.ceil((start - now) / 60000);
+        if (minutes <= 180) {
+          li.classList.add('next');
+          if (minutes <= 15) li.classList.add('soon');
+          li.querySelector('.until').textContent = minutes >= 60 ? `あと${Math.floor(minutes / 60)}時間${minutes % 60}分` : `あと${minutes}分`;
+        }
+      }
+    });
+  });
+}
+setInterval(() => { if (view.querySelector('.venue li[data-start]')) markStarts(); }, 30000);
 
 // Predicted races of the shown region with confidence A, most concentrated first.
 function confidentPanel(races) {

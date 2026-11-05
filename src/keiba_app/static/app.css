@@ -90,7 +90,7 @@ h2 { font-size: 17px; margin: 32px 0 12px; }
 .venue h3 { margin: 0; padding: 8px 12px; font-size: 16px; border-bottom: 1px solid var(--line); }
 .venue ol { list-style: none; margin: 0; padding: 0; }
 .venue li a {
-  display: grid; grid-template-columns: 38px 46px 1fr auto; gap: 6px; align-items: baseline;
+  display: grid; grid-template-columns: 38px 56px 1fr auto; gap: 6px; align-items: baseline;
   padding: 7px 12px; text-decoration: none; border-top: 1px solid var(--soft);
 }
 .venue li:first-child a { border-top: 0; }
@@ -100,6 +100,11 @@ h2 { font-size: 17px; margin: 32px 0 12px; }
 .venue .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
 .venue .mark { font-size: 12px; color: var(--bar); font-weight: 700; }
 .venue li.unsupported a { color: var(--muted); }
+.venue li.done a { opacity: .45; }
+.venue li.next a { background: var(--soft); box-shadow: inset 3px 0 0 var(--bar); }
+.venue li.next .rno { color: var(--bar); }
+.venue .until { display: block; white-space: nowrap; font-size: 11px; font-weight: 700; color: var(--bar); line-height: 1.2; }
+.venue li.soon .until { color: var(--hit); }
 
 /* confident races on the day page */
 .confident { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 4px 14px 8px;
