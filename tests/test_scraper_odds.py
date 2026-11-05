@@ -81,6 +81,12 @@ class LocalOddsTests(unittest.TestCase):
         self.assertEqual(b1['place'], {'1': [1.7, 3.7], '2': [1.1, 2.0]})
         b4 = parse_local_odds(NAR_B4, race_id='202647110504', kind='b4')['odds']
         self.assertEqual(b4['quinella'], {'1-2': 18.3, '1-3': 285.0})
+        exacta = NAR_B4.replace('_b4_c0_1_2', '_b6_c0_2_1').replace('_b4_c0_1_3', '_b6_c0_1_3')
+        self.assertEqual(parse_local_odds(exacta, race_id='x', kind='b6')['odds']['exacta'], {'2>1': 18.3, '1>3': 285.0})
+        wide = NAR_B4.replace('_b4_', '_b5_').replace('18.3', '1.3 - 1.4')
+        self.assertEqual(parse_local_odds(wide, race_id='x', kind='b5')['odds']['wide'], {'1-2': [1.3, 1.4], '1-3': [285.0, 285.0]})
+        bracket = NAR_B4.replace('_b4_c0_1_2', '_b3_c0_7_7').replace('_b4_', '_b3_')
+        self.assertEqual(parse_local_odds(bracket, race_id='x', kind='b3')['odds']['bracket'], {'7-7': 18.3, '1-3': 285.0})
 
     def test_presale_pages_have_no_odds(self):
         from keiba_scraper.parsers import parse_local_odds

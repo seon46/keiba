@@ -623,7 +623,9 @@ def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
 
 # Local (NAR) odds pages carry the numbers in the HTML.  Only the page types whose layout has been
 # checked against real pages are read; the other bet types stay without odds.
-LOCAL_ODDS_PAGES = ("b1", "b4")
+# 3連複・3連単 pages hold one axis horse each (a dozen requests per race), so they are not read.
+LOCAL_ODDS_PAGES = ("b1", "b3", "b4", "b5", "b6")
+_LOCAL_PAIRS = {"b3": ("bracket", False), "b4": ("quinella", False), "b5": ("wide", False), "b6": ("exacta", True)}
 
 
 def _range(text):
@@ -633,7 +635,7 @@ def _range(text):
 
 
 def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
-    """{bet: {ticket key: odds}} from one nar.netkeiba.com odds page (b1: 単勝・複勝, b4: 馬連)."""
+    """{bet: {ticket key: odds}} from one nar.netkeiba.com odds page (b1 単勝・複勝, b3 枠連, b4 馬連, b5 ワイド, b6 馬単)."""
     soup = BeautifulSoup(html, "html.parser")
     odds = {}
     if kind == "b1":
@@ -654,16 +656,21 @@ def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
                     entries[str(number)] = value
             if entries:
                 odds[bet] = entries
-    elif kind == "b4":
+    elif kind in _LOCAL_PAIRS:
+        bet, ordered = _LOCAL_PAIRS[kind]
         entries = {}
         for cell in soup.select("td.Odds[id]"):
-            match = re.search(r"_b4_c\d+_(\d+)_(\d+)$", cell.get("id", ""))
-            value = _odds_number(_cell_text(cell))
-            if match and value:
-                a, b = sorted(int(group) for group in match.groups())
-                entries[f"{a}-{b}"] = value
+            match = re.search(rf"_{kind}_c\d+_(\d+)_(\d+)$", cell.get("id", ""))
+            if not match:
+                continue
+            text = _cell_text(cell)
+            value = _range(text) if bet == "wide" else _odds_number(text)
+            if not value:
+                continue
+            a, b = (int(group) for group in match.groups())  # 馬単: the first number finishes first
+            entries[f"{a}>{b}" if ordered else f"{min(a, b)}-{max(a, b)}"] = value
         if entries:
-            odds["quinella"] = entries
+            odds[bet] = entries
     else:
         raise ParseError(f"未確認の地方オッズのページです: {kind}")
     return dict(race_id=race_id, region="local", status=None, official_at=None, odds=odds, popularity={})

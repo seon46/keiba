@@ -398,7 +398,7 @@ async function loadBets(region, raceId, prediction) {
       ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
       ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
       <span class="spacer"></span>
-      ${data.odds_partial ? '<span class="small muted">地方は単勝・複勝・馬連のオッズのみ</span>' : ''}
+      ${data.odds_partial ? '<span class="small muted">地方は3連複・3連単のオッズなし</span>' : ''}
       <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
     </div>
     <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
