@@ -64,6 +64,14 @@ select, input[type="date"] {
 .job::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%;
                background: var(--bar); margin-right: 8px; animation: pulse 1.2s ease-in-out infinite; }
 .job.error::before { background: var(--error-ink); animation: none; }
+a.job { text-decoration: none; }
+a.job:hover { color: var(--ink); }
+table.jobs td { vertical-align: top; }
+table.jobs td:first-child, table.jobs td:nth-child(3), table.jobs td:last-child { width: 1%; white-space: nowrap; }
+.job-status { font-size: 12px; font-weight: 700; white-space: nowrap; padding: 1px 8px; border-radius: 10px; background: var(--soft); }
+.job-running .job-status { color: var(--bar); }
+.job-error .job-status { color: var(--error-ink); }
+.job-done .job-status { color: var(--muted); }
 @keyframes pulse { 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .job::before { animation: none; } }
 
@@ -271,7 +279,10 @@ pre.log { background: var(--surface); border: 1px solid var(--line); border-radi
           max-height: 420px; overflow: auto; font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
 
 @media (max-width: 640px) {
-  .topbar { gap: 10px; }
+  .topbar { gap: 6px; padding: 0 10px; }
+  .brand { display: none; }
+  .topbar nav a { padding: 6px 8px; white-space: nowrap; }
+  .job { max-width: 40vw; font-size: 12px; }
   table.card { min-width: 0; }
   .card th.opt, .card td.opt { display: none; }
   .card th, .card td { padding: 6px 5px; }

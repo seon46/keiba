@@ -85,6 +85,7 @@ async function route() {
     if (page === 'race') await raceView(parts[1], parts[2]);
     else if (page === 'records') await recordsView();
     else if (page === 'status') await statusView();
+    else if (page === 'jobs') await jobsView();
     else await dayView(parts[1] || store.get('day', todayJst()));
   } catch (error) {
     view.innerHTML = `<p class="error-text">${esc(error.message)}</p>`;
@@ -111,8 +112,68 @@ async function checkChanges() {
       refreshing = false;
     }
     changeToken = token;
+    updateJobBadge();
   } catch (e) { refreshing = false; /* server restarting; try again next time */ }
 }
+
+// Top bar: how many jobs (from any device) and whether the nightly update is running.
+let badgeBusy = false;
+async function updateJobBadge() {
+  if (watched.size || badgeBusy) return;  // a watched job shows its own progress
+  badgeBusy = true;
+  try {
+    const data = await api('jobs');
+    const active = data.jobs.filter((job) => job.status === 'queued' || job.status === 'running');
+    const parts = [];
+    if (active.length) parts.push(`処理中 ${active.length}件`);
+    if (data.nightly) parts.push(`毎晩の更新：${data.nightly.step || '実行中'}${progressText(data.nightly)}`);
+    jobBox.classList.remove('error');
+    jobBox.hidden = !parts.length;
+    jobBox.textContent = parts.join('　');
+    jobBox.title = jobBox.textContent;
+    if (location.hash.startsWith('#/jobs')) renderJobs(data);
+  } catch (e) { /* ignore */ } finally { badgeBusy = false; }
+}
+
+function progressText(n) {
+  if (!n || n.done == null) return '';
+  return n.total ? `（${n.done.toLocaleString()} / ${n.total.toLocaleString()}${n.unit}）` : `（${n.done.toLocaleString()}${n.unit}取得）`;
+}
+
+// ---------------------------------------------------------------- jobs
+const JOB_STATUS = {queued: '待ち', running: '実行中', done: '完了', error: 'エラー'};
+
+async function jobsView() {
+  view.innerHTML = '<h1>処理</h1><p class="muted">読み込み中…</p>';
+  renderJobs(await api('jobs'));
+}
+
+function renderJobs(data) {
+  if (!location.hash.startsWith('#/jobs')) return;
+  const n = data.nightly;
+  const active = data.jobs.filter((job) => job.status === 'queued' || job.status === 'running')
+    .sort((a, b) => (a.status === 'running' ? 0 : a.position) - (b.status === 'running' ? 0 : b.position));
+  const recent = data.jobs.filter((job) => job.status === 'done' || job.status === 'error').slice(0, 15);
+  const link = (job) => (job.race_id && job.region ? `<a href="#/race/${job.region}/${job.race_id}">開く</a>` : '');
+  const row = (job) => `<tr class="job-${job.status}">
+      <td><span class="job-status">${JOB_STATUS[job.status] || job.status}${job.position ? ` ${job.position}番目` : ''}</span></td>
+      <td>${esc(job.label)}<div class="small muted">${esc(job.status === 'error' ? job.error : job.message)}</div></td>
+      <td class="num small muted">${timeLabel(job.created_at).slice(-5)}${job.finished_at ? `<br>〜${timeLabel(job.finished_at).slice(-5)}` : ''}</td>
+      <td class="num">${link(job)}</td></tr>`;
+  view.innerHTML = `
+    <h1>処理</h1>
+    <h2>毎晩の更新</h2>
+    ${n ? `<div class="kv"><dt>今の段階</dt><dd><b>${esc(n.step || '実行中')}</b> ${progressText(n)}</dd>
+        <dt>最後の動き</dt><dd class="small">${esc(n.last_line || '')}</dd></div>
+      <p class="small muted">毎晩の更新が動いている間は、netkeibaへの取得を順番に行うため、下の「最新の出馬表で予想」や「オッズを取得」も遅くなります。</p>`
+      : '<p class="muted">動いていません。</p>'}
+    <h2>このアプリの処理 ${active.length ? `<span class="small muted">${active.length}件</span>` : ''}</h2>
+    ${active.length ? `<div class="list-wrap"><table class="list jobs">${active.map(row).join('')}</table></div>`
+      : '<p class="muted">処理中・順番待ちはありません。</p>'}
+    <p class="small muted">処理は1件ずつ、押した順に実行します。</p>
+    ${recent.length ? `<h2>最近終わった処理</h2><div class="list-wrap"><table class="list jobs">${recent.map(row).join('')}</table></div>` : ''}`;
+}
+setInterval(() => { if (location.hash.startsWith('#/jobs') && document.visibilityState === 'visible') updateJobBadge(); }, 5000);
 checkChanges();
 setInterval(checkChanges, 5000);
 document.addEventListener('visibilitychange', checkChanges);

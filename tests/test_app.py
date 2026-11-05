@@ -205,6 +205,25 @@ class AppTests(unittest.TestCase):
             group.update(blend_weights=[.3, .7], networks=[dict(best_epoch=3)])
         self.assertEqual(check_model(v4), [])
 
+    def test_nightly_progress_from_log(self):
+        import json
+        from keiba_app.nightly import progress
+        app = self._app('app_progress')
+        self.assertIsNone(progress(app))
+        (app.home / 'nightly.lock').write_text('1')
+        (app.home / 'logs').mkdir(parents=True, exist_ok=True)
+        plan = dict(event='plan', config=dict(type='pedigree'), total_horses=500, completed_horses=0, remaining_horses=500)
+        lines = ['14:00:00 $ python -m keiba_scraper --data-dir data backfill --start-date 2026-11-02',
+                 '14:30:00 [collect] ok {}', '14:30:01 ' + json.dumps(plan)]
+        lines += [f'14:3{i}:00 ' + json.dumps(dict(event='saved', kind='pedigree', horse_id='2024100558')) for i in range(3)]
+        (app.home / 'logs' / 'nightly-20261105-140000.log').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        try:
+            state = progress(app)
+            self.assertEqual((state['step'], state['done'], state['total'], state['unit']), ('血統の収集', 3, 500, '頭'))
+            self.assertIn('血統を保存（馬ID 2024100558）', state['last_line'])
+        finally:
+            (app.home / 'nightly.lock').unlink()
+
     def test_pedigree_step_fetches_only_missing_horses(self):
         from app_fixtures import FakeScraper, save_snapshot
         from keiba_app.engine import Engine

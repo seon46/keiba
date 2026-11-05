@@ -57,6 +57,16 @@ class Jobs:
         with self.lock:
             return [dict(job) for job in self.jobs.values() if job['status'] in ('queued', 'running')]
 
+    def listing(self, limit=30):
+        """Newest first; queued jobs carry their place in the line (1 = next)."""
+        with self.lock:
+            jobs = [dict(job) for job in self.jobs.values()]
+        waiting = [job['id'] for job in jobs if job['status'] == 'queued']
+        for job in jobs:
+            if job['status'] == 'queued':
+                job['position'] = waiting.index(job['id']) + 1
+        return list(reversed(jobs))[:limit]
+
     def _update(self, identifier, **changes):
         with self.lock:
             if identifier in self.jobs:
@@ -74,6 +84,14 @@ class Jobs:
                 traceback.print_exc()
                 self._update(identifier, status='error', message=str(exc), error=str(exc),
                              finished_at=now().isoformat(timespec='seconds'))
+
+
+def _race_label(region, race_id):
+    from .sources import course_of, race_number_of
+    try:
+        return f'{course_of(region, race_id)}{race_number_of(race_id)}R'
+    except (KeyError, ValueError, TypeError):
+        return race_id
 
 
 def _pick(row, fields):
@@ -166,6 +184,10 @@ class Api:
             raise ValueError('prediction・min_hit・max_points・budget の指定が不正です。') from exc
         return self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget)
 
+    def jobs_overview(self, _query):
+        from .nightly import progress
+        return dict(jobs=self.jobs.listing(), nightly=progress(self.app), now=now().isoformat(timespec='seconds'))
+
     def job(self, query):
         job = self.jobs.get(query.get('id', ''))
         if job is None:
@@ -197,7 +219,7 @@ class Api:
             progress(message='最新の出馬表を取得中' if refresh else '出馬表を準備中')
             identifier = self.engine.predict_race(region, race_id, refresh=refresh)
             return dict(prediction_id=identifier)
-        return self.jobs.submit('race', f'{race_id}の予想', work, race_id=race_id)
+        return self.jobs.submit('race', f'{_race_label(region, race_id)}の予想', work, race_id=race_id, region=region)
 
     def fetch_odds(self, body):
         region, race_id = body.get('region'), body.get('race_id')
@@ -207,7 +229,7 @@ class Api:
         def work(progress):
             progress(message='オッズを取得中')
             return dict(fetched=self.engine.fetch_odds(region, race_id))
-        return self.jobs.submit('odds', f'{race_id}のオッズ', work, race_id=race_id)
+        return self.jobs.submit('odds', f'{_race_label(region, race_id)}のオッズ', work, race_id=race_id, region=region)
 
     def discover(self, body):
         day = body.get('date') or today()
@@ -252,7 +274,8 @@ class Api:
             parts.extend(f'{job["id"]}:{job["status"]}' for job in self.jobs.jobs.values())
         return dict(token=hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16])
 
-    GET = dict(status=status, day=day, race=race, bets=bets, job=job, records=records, log=log, changes=changes)
+    GET = dict(status=status, day=day, race=race, bets=bets, job=job, jobs=jobs_overview, records=records, log=log,
+               changes=changes)
     POST = {'race/predict': predict_race, 'race/odds': fetch_odds, 'day/discover': discover, 'day/predict': predict_day,
             'nightly': nightly}
 

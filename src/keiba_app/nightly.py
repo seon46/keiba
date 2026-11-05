@@ -253,3 +253,79 @@ def run_nightly(app: App, *, force_fit=False, only=None, skip=(), python=None, e
     logbook.update_run(run_id, status=overall, steps=steps, finished_at=now().isoformat(timespec='seconds'))
     log_file.close()
     return dict(status=overall, steps=steps, log=str(log_path))
+
+
+def progress(app: App, *, tail_bytes=1_500_000):
+    """What the running nightly update is doing, read from its log (None when it is not running)."""
+    if not (app.home / 'nightly.lock').exists():
+        return None
+    logs = sorted((app.home / 'logs').glob('nightly-*.log'), key=lambda path: path.stat().st_mtime)
+    if not logs:
+        return dict(step=None, message='開始しています')
+    path = logs[-1]
+    with path.open('rb') as file:
+        size = file.seek(0, 2)
+        file.seek(max(0, size - tail_bytes))
+        lines = file.read().decode('utf-8', errors='replace').splitlines()
+    step, plan, saved, last = None, None, 0, None
+    names = {'backfill': '成績の収集', 'export': 'DBの作り直し', 'prepare': 'DBの作り直し', 'fit': '学習し直し'}
+    for line in lines:
+        text = line[9:] if len(line) > 9 and line[2] == ':' else line
+        if not text.strip():
+            continue
+        last = line
+        if text.startswith('$ '):
+            for word, name in names.items():
+                if f' {word} ' in text + ' ':
+                    step, plan, saved = name, None, 0
+                    break
+            continue
+        if text.startswith('[') and ']' in text:
+            done = text[1:text.index(']')]
+            step = {'collect': '血統の収集', 'pedigree': 'DBの作り直し', 'prepare': '予想の照合', 'score': '学習し直し',
+                    'fit': '当日の先行予想'}.get(done, step)
+            plan, saved = None, 0
+            continue
+        if text.startswith('{'):
+            try:
+                message = json.loads(text)
+            except ValueError:
+                continue
+            if message.get('event') == 'plan':
+                plan, saved = message, 0
+                if (message.get('config') or {}).get('type') == 'pedigree':
+                    step = '血統の収集'
+            elif message.get('event') == 'saved':
+                saved += 1
+        elif '出馬表を取得中' in text or 'レースを予想中' in text:
+            step = '当日の先行予想'
+    result = dict(step=step, log=str(path), last_line=_describe(last), last_at=(last or '')[:8] if last else None)
+    if plan is not None:
+        if plan.get('total_horses') is not None:
+            total = plan.get('remaining_horses') or 0
+            result.update(done=saved, total=total, unit='頭')
+        else:
+            result.update(done=saved, total=None, unit='ページ')
+    return result
+
+
+def _describe(line):
+    """A log line in words (the time, then what was saved)."""
+    if not line:
+        return ''
+    stamp, text = (line[:8], line[9:]) if len(line) > 9 and line[2] == ':' else ('', line)
+    try:
+        message = json.loads(text) if text.startswith('{') else None
+    except ValueError:
+        message = None
+    if isinstance(message, dict) and message.get('event') == 'saved':
+        kind = message.get('kind')
+        if kind == 'pedigree':
+            text = f'血統を保存（馬ID {message.get("horse_id")}）'
+        elif kind in ('race', 'day'):
+            text = f'{"レース" if kind == "race" else "開催日"}を保存（{message.get("race_id") or message.get("day") or ""}）'
+        else:
+            text = f'{kind}を保存'
+    elif isinstance(message, dict):
+        text = message.get('event') or text
+    return f'{stamp} {text}'.strip()[:200]
