@@ -361,9 +361,8 @@ class Engine:
                     odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
                                                          official_at=saved.get('official_at'), status=saved.get('status'),
                                                          bets=sorted(saved.get('odds', {}))),
-                    odds_supported=prediction['region'] == 'central', confidence=self.confidence(prediction))
+                    odds_supported=True, odds_partial=prediction['region'] == 'local',
+                    confidence=self.confidence(prediction))
 
     def fetch_odds(self, region, race_id):
-        if region != 'central':
-            raise ValueError('地方のオッズはまだ取得できません（ページの形式を確認中）。')
         return self.scraper.odds(region, race_id)

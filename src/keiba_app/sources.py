@@ -97,17 +97,22 @@ class SavedRaces:
             return None
         connection = self._connect()
         try:
-            row = connection.execute(
+            rows = connection.execute(
                 'SELECT d.metadata_json,o.retrieved_at FROM odds d JOIN observations o ON o.id=d.snapshot_id '
-                'WHERE d.region=? AND d.race_id=? ORDER BY o.retrieved_at DESC,o.rowid DESC LIMIT 1',
-                (region, race_id)).fetchone()
+                'WHERE d.region=? AND d.race_id=? ORDER BY o.retrieved_at DESC,o.rowid DESC LIMIT 20',
+                (region, race_id)).fetchall()
         except sqlite3.Error:
             return None
         finally:
             connection.close()
-        if row is None:
+        if not rows:
             return None
-        return dict(json.loads(row['metadata_json']), retrieved_at=row['retrieved_at'])
+        latest = json.loads(rows[0]['metadata_json'])
+        merged = dict(latest, odds={}, retrieved_at=rows[0]['retrieved_at'])
+        for row in rows:  # newest first; each bet type from its latest page
+            for bet, table in json.loads(row['metadata_json']).get('odds', {}).items():
+                merged['odds'].setdefault(bet, table)
+        return merged
 
     def races_on(self, day):
         """{(region, race_id): summary} of every saved race page with this race date."""

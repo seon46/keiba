@@ -59,3 +59,32 @@ class OddsParserTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# Same structure as nar.netkeiba.com odds pages (b1: two horse tables, b4: cells with ids), invented numbers.
+NAR_B1 = """<table class="RaceOdds_HorseList_Table"><tr><th>枠</th><th>馬番</th><th>印</th><th>選択</th><th>馬名</th><th>オッズ</th></tr>
+<tr><td class="Waku1">1</td><td class="W31">1</td><td></td><td></td><td class="Horse_Name">A</td><td class="Odds">14.1</td></tr>
+<tr><td class="Waku2">2</td><td class="W31">2</td><td></td><td></td><td class="Horse_Name">B</td><td class="Odds">3.7</td></tr></table>
+<table class="RaceOdds_HorseList_Table"><tr><th>枠</th><th>馬番</th><th>印</th><th>選択</th><th>馬名</th><th>オッズ</th></tr>
+<tr><td class="Waku1">1</td><td>1</td><td></td><td></td><td class="Horse_Name">A</td><td class="Odds">1.7 - 3.7</td></tr>
+<tr><td class="Waku2">2</td><td>2</td><td></td><td></td><td class="Horse_Name">B</td><td class="Odds">1.1 - 2.0</td></tr></table>"""
+NAR_B4 = """<table class="Odds_Table"><tr><th class="Waku1">1</th></tr>
+<tr><td class="Waku_Normal">2</td><td class="Odds" id="chk_a5-47-4_b4_c0_1_2">18.3</td></tr>
+<tr><td class="Waku_Normal">3</td><td class="Odds" id="chk_a5-47-4_b4_c0_1_3">285.0</td></tr></table>"""
+
+
+class LocalOddsTests(unittest.TestCase):
+    def test_win_place_and_quinella(self):
+        from keiba_scraper.parsers import parse_local_odds
+        b1 = parse_local_odds(NAR_B1, race_id='202647110504', kind='b1')['odds']
+        self.assertEqual(b1['win'], {'1': 14.1, '2': 3.7})
+        self.assertEqual(b1['place'], {'1': [1.7, 3.7], '2': [1.1, 2.0]})
+        b4 = parse_local_odds(NAR_B4, race_id='202647110504', kind='b4')['odds']
+        self.assertEqual(b4['quinella'], {'1-2': 18.3, '1-3': 285.0})
+
+    def test_presale_pages_have_no_odds(self):
+        from keiba_scraper.parsers import parse_local_odds
+        import re
+        presale = re.sub(r'(class="Odds">)[^<]*', lambda m: m.group(1) + '0.0 - 0.0' if ' - ' in m.group(0) else
+                         m.group(1) + '0.0', NAR_B1)
+        self.assertEqual(parse_local_odds(presale, race_id='202630110512', kind='b1')['odds'], {})

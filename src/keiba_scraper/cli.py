@@ -323,12 +323,22 @@ def main(argv: list[str] | None = None) -> int:
             client.refresh = True  # odds change until the race starts
             for race_id in dict.fromkeys(args.race_id):
                 if args.region == 'local':
-                    if not args.sample_dir:
-                        raise ValueError('地方のオッズはまだ取得できません（--sample-dir で形式確認用の原本だけ保存できます）。')
-                    for kind in ('b1', 'b4'):
+                    from .parsers import LOCAL_ODDS_PAGES, parse_local_odds
+                    kinds = ('b1', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8') if args.sample_dir else LOCAL_ODDS_PAGES
+                    counts = {}
+                    for kind in kinds:
                         observation, html, _ = client.fetch(urls.odds_page_url(race_id, 'local', kind))
-                        save_sample(args.sample_dir, f'local_{race_id}_{kind}.html', html)
-                        report(race_id=race_id, region='local', sample=kind, retrieved_at=observation.retrieved_at)
+                        if args.sample_dir:
+                            save_sample(args.sample_dir, f'local_{race_id}_{kind}.html', html)
+                        if kind not in LOCAL_ODDS_PAGES:
+                            continue
+                        parsed = parse_local_odds(html, race_id=race_id, kind=kind)
+                        if parsed['odds']:
+                            store.save_odds(observation, parsed)
+                            counts.update({bet: len(table) for bet, table in parsed['odds'].items()})
+                    if not counts:
+                        raise ValueError('まだ発売前で、オッズがありません。発売が始まってから取得してください。')
+                    report(race_id=race_id, region='local', bets=counts, retrieved_at=observation.retrieved_at)
                     continue
                 observation, text, _ = client.fetch(urls.odds_url(race_id, 'central'), json_ok=True)
                 if args.sample_dir:

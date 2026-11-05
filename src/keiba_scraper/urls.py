@@ -33,7 +33,7 @@ def odds_url(identifier: str, region: str) -> str:
     """Every bet type's odds of a central race in one JSON response (the odds page's own data request)."""
     race_id(identifier)
     if region != "central":
-        raise ValueError("地方のオッズはまだ取得できません（ページの形式を確認中）。")
+        raise ValueError("地方のオッズはページ（odds_page_url）から読みます。")
     return f"https://race.netkeiba.com/api/api_get_jra_odds.html?{urlencode({'race_id': identifier, 'type': 'all', 'action': 'init'})}"
 
 

@@ -619,3 +619,51 @@ def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
             odds[bet], popularity[bet] = entries, ranks
     return dict(race_id=race_id, region=region, status=payload.get("status"),
                 official_at=data.get("official_datetime"), odds=odds, popularity=popularity)
+
+
+# Local (NAR) odds pages carry the numbers in the HTML.  Only the page types whose layout has been
+# checked against real pages are read; the other bet types stay without odds.
+LOCAL_ODDS_PAGES = ("b1", "b4")
+
+
+def _range(text):
+    parts = [_odds_number(part) for part in text.replace("‐", "-").split("-")]
+    parts = [part for part in parts if part]
+    return [parts[0], parts[-1]] if parts else None
+
+
+def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
+    """{bet: {ticket key: odds}} from one nar.netkeiba.com odds page (b1: 単勝・複勝, b4: 馬連)."""
+    soup = BeautifulSoup(html, "html.parser")
+    odds = {}
+    if kind == "b1":
+        tables = soup.select("table.RaceOdds_HorseList_Table")
+        if len(tables) < 2:
+            raise ParseError("地方の単勝・複勝の表が見つかりません。")
+        for bet, table in zip(("win", "place"), tables[:2]):
+            entries = {}
+            for row in table.find_all("tr")[1:]:
+                cells = row.find_all("td")
+                odds_cell = row.select_one("td.Odds")
+                if len(cells) < 2 or odds_cell is None:
+                    continue
+                number = _number(_cell_text(cells[1]), integer=True)
+                text = _cell_text(odds_cell)
+                value = _range(text) if bet == "place" else _odds_number(text)
+                if number and value:
+                    entries[str(number)] = value
+            if entries:
+                odds[bet] = entries
+    elif kind == "b4":
+        entries = {}
+        for cell in soup.select("td.Odds[id]"):
+            match = re.search(r"_b4_c\d+_(\d+)_(\d+)$", cell.get("id", ""))
+            value = _odds_number(_cell_text(cell))
+            if match and value:
+                a, b = sorted(int(group) for group in match.groups())
+                entries[f"{a}-{b}"] = value
+        if entries:
+            odds["quinella"] = entries
+    else:
+        raise ParseError(f"未確認の地方オッズのページです: {kind}")
+    return dict(race_id=race_id, region="local", status=None, official_at=None, odds=odds, popularity={})
