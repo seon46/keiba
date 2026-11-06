@@ -41,14 +41,27 @@ class _Lock:
         self.path.unlink(missing_ok=True)
 
 
+_DATASET_INFO = {}
+
+
 def dataset_info(path):
-    connection = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)
+    """Last day and feature revision of a prepared dataset.  Without an index on ``day`` the MAX() reads the
+    whole (multi-GB) table, so the answer is cached until the file changes."""
+    path = Path(path).resolve()
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _DATASET_INFO.get(str(path))
+    if cached and cached[0] == key:
+        return dict(cached[1])
+    connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
     try:
         metadata = dict(connection.execute('SELECT key,value_json FROM ai_metadata'))
         last_day = connection.execute('SELECT MAX(day) FROM features').fetchone()[0]
     finally:
         connection.close()
-    return dict(last_day=last_day, feature_revision=json.loads(metadata['feature_revision']))
+    info = dict(last_day=last_day, feature_revision=json.loads(metadata['feature_revision']))
+    _DATASET_INFO[str(path)] = (key, info)
+    return dict(info)
 
 
 def model_info(model_dir):

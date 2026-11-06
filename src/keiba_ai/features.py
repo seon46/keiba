@@ -586,6 +586,7 @@ def build_features(database: Path, report=None) -> dict:
             config_id TEXT NOT NULL, feature_json TEXT NOT NULL,
             PRIMARY KEY(region,race_id,horse_id,config_id)
         )""")
+        connection.execute("CREATE INDEX IF NOT EXISTS features_day ON features(day)")  # MAX(day) for the app
         connection.execute("CREATE INDEX IF NOT EXISTS bias_variants_config "
                            "ON bias_variants(config_id,region,race_id,horse_id)")
         with connection:

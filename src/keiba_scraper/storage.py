@@ -61,6 +61,8 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS races_identity
                 ON races(region, race_id, page);
+            CREATE INDEX IF NOT EXISTS races_race_date
+                ON races(json_extract(metadata_json, '$.race_date'));
             CREATE TABLE IF NOT EXISTS runners (
                 snapshot_id TEXT NOT NULL REFERENCES races(snapshot_id),
                 row_index INTEGER NOT NULL, horse_id TEXT, payload_json TEXT NOT NULL,
