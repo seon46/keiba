@@ -239,6 +239,8 @@ def run(model_dir, dataset, output, *, groups=('central_flat', 'local_flat'), sa
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     from .cli import emit
     parser = argparse.ArgumentParser(description='自信度の候補と単勝の回収率の検証（v4の評価期間）')
     parser.add_argument('--model-dir', required=True, type=Path, help='--evaluate-until 付きで学習したv4のフォルダー')

@@ -20,6 +20,8 @@ DEFAULT_VARIANTS = ('nn_j', 'nn_sched', 'tabm', 'tabm_noattn', 'tabm_noemb')
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     argv = list(sys.argv[1:] if argv is None else argv)
     if '--variants' not in argv:
         argv += ['--variants', *DEFAULT_VARIANTS]

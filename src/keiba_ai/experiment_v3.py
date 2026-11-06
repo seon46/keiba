@@ -401,6 +401,8 @@ def run_experiment(database, output, *, groups=DEFAULT_GROUPS, validation_years=
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     parser = argparse.ArgumentParser(description='v3実験: 現行の順位モデル（オッズ由来除外, M0）とLightGBM+PL（M1）を時系列foldで比較します。')
     parser.add_argument('--dataset', required=True, type=Path, help='prepare済みのfeatures.sqlite3')
     parser.add_argument('--output-dir', required=True, type=Path, help='新しい出力先（既存は不可）')

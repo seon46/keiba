@@ -396,6 +396,8 @@ def run_experiment(database, race_db, output, cache_dir, *, validation_years=DEF
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     parser = argparse.ArgumentParser(description='v3実験K: ニューラルネットの改善とLightGBMとの混ぜ合わせ。')
     parser.add_argument('--dataset', required=True, type=Path)
     parser.add_argument('--race-db', required=True, type=Path)

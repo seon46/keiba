@@ -295,6 +295,8 @@ def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEAR
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     parser = argparse.ArgumentParser(description='v3実験F: 指数＋騎手θの組み合わせと、レース内の相対化特徴量の効果を測ります。')
     parser.add_argument('--dataset', required=True, type=Path, help='prepare済みのfeatures.sqlite3')
     parser.add_argument('--output-dir', required=True, type=Path, help='新しい出力先（既存は不可）')

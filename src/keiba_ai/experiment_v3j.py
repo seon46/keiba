@@ -323,6 +323,8 @@ def run_experiment(database, race_db, output, *, validation_years=DEFAULT_VALIDA
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     parser = argparse.ArgumentParser(description='v3実験J: 血統の特徴量とニューラルネットの強さモデルを比べます。')
     parser.add_argument('--dataset', required=True, type=Path, help='prepare済みのfeatures.sqlite3')
     parser.add_argument('--race-db', required=True, type=Path, help='血統を収集した data\\keiba.sqlite3')

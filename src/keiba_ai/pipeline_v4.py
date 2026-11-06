@@ -612,6 +612,8 @@ def load_predictor(database, model_dir, race_db, *, threads=2, report=None):
 # --------------------------------------------------------------------------
 
 def main(argv=None):
+    from .priority import background
+    background()
     parser = argparse.ArgumentParser(description='v4順位分布モデル（LightGBM＋血統 と TabM型ニューラルネットの混ぜ合わせ）')
     commands = parser.add_subparsers(dest='command', required=True)
     fitting = commands.add_parser('fit', help='区分ごとのモデルを学習・保存します')

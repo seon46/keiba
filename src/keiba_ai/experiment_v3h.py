@@ -247,6 +247,8 @@ def run_experiment(database, output, *, validation_years=DEFAULT_VALIDATION_YEAR
 
 
 def main(argv=None):
+    from .priority import background
+    background()
     parser = argparse.ArgumentParser(description='v3実験H: 段ごとの温度の推定方法を比べます。')
     parser.add_argument('--dataset', required=True, type=Path, help='prepare済みのfeatures.sqlite3')
     parser.add_argument('--output-dir', required=True, type=Path, help='新しい出力先（既存は不可）')

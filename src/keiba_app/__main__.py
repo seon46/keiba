@@ -63,7 +63,9 @@ def main(argv=None):
             app.require_ready()
             serve(app, host=args.host, port=args.port, allowed_hosts=args.allow_host)
         elif args.command == 'nightly':
+            from keiba_ai.priority import background
             from .nightly import run_nightly
+            background()  # pages of the running app answer first
             result = run_nightly(app, force_fit=args.force_fit, only=args.only, skip=args.skip, log=print)
             emit(event='nightly_done', **result)
             return 0 if result['status'] in ('ok', 'warning') else 2
