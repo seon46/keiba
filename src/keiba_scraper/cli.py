@@ -53,6 +53,7 @@ def parser() -> argparse.ArgumentParser:
     app.add_argument('--timeout', type=positive, default=30, help='通信タイムアウト・秒（既定: 30）')
     app.add_argument('--refresh', action='store_true', help='ページのキャッシュを使わず新しい観測を保存')
     app.add_argument('--offline', action='store_true', help='保存済みHTMLだけを使い、通信しない')
+    app.add_argument('--priority', action='store_true', help='画面で待っている取得として、裏の収集より先に通す（間隔は同じ）')
     commands = app.add_subparsers(dest='command', required=True,
                                   parser_class=lambda **kw: argparse.ArgumentParser(allow_abbrev=False, **kw))
     fetch = commands.add_parser('fetch', help='指定したレースの出馬表・結果を取得')
@@ -285,14 +286,16 @@ def main(argv: list[str] | None = None) -> int:
             report(event='plan', **queue.summary(job_id))
             if args.plan_only:
                 return 0
-            client = Client(store, interval=args.interval, timeout=args.timeout, refresh=args.refresh)
+            client = Client(store, interval=args.interval, timeout=args.timeout, refresh=args.refresh,
+                        priority=args.priority)
             summary = Worker(queue, client, offline=args.offline, report=report).run(
                 job_id, max_tasks=args.max_tasks, max_hours=args.max_hours, min_free_mb=args.min_free_mb)
             report(event='summary', **summary)
             if any(s.get('failed') or s.get('blocked') for s in summary['tasks'].values()):
                 return 2
             return 0
-        client = Client(store, interval=args.interval, timeout=args.timeout, refresh=args.refresh)
+        client = Client(store, interval=args.interval, timeout=args.timeout, refresh=args.refresh,
+                        priority=args.priority)
 
         def load(url: str):
             if args.offline:

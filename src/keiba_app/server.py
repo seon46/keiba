@@ -27,25 +27,33 @@ RUNNER_FIELDS = ('horse_id', 'horse_number', 'frame', 'horse_name', 'sex', 'age'
                  'margin', 'popularity')
 
 
+# Quick lane: one race at a time (odds before predictions); the long whole-day jobs have their own lane,
+# so fetching odds or predicting one race never waits behind "predict the whole day".
+LANES = dict(odds=('quick', 0), race=('quick', 1))
+
+
 class Jobs:
-    """One worker thread; jobs are kept (newest 100) so the page can poll their state."""
+    """Two worker threads (quick / long); jobs are kept (newest 100) so the page can poll their state."""
 
     def __init__(self):
         self.jobs = OrderedDict()
         self.counter = itertools.count(1)
-        self.queue = queue.Queue()
+        self.queues = dict(quick=queue.PriorityQueue(), long=queue.PriorityQueue())
         self.lock = threading.Lock()
-        threading.Thread(target=self._work, daemon=True).start()
+        for lane in self.queues:
+            threading.Thread(target=self._work, args=(lane,), daemon=True).start()
 
     def submit(self, kind, label, function, **context):
-        identifier = str(next(self.counter))
-        job = dict(id=identifier, kind=kind, label=label, status='queued', message='待機中',
+        number = next(self.counter)
+        identifier = str(number)
+        lane, rank = LANES.get(kind, ('long', 0))
+        job = dict(id=identifier, kind=kind, label=label, status='queued', message='待機中', lane=lane, rank=rank,
                    created_at=now().isoformat(timespec='seconds'), result=None, error=None, **context)
         with self.lock:
             self.jobs[identifier] = job
             while len(self.jobs) > 100:
                 self.jobs.popitem(last=False)
-        self.queue.put((identifier, function))
+        self.queues[lane].put((rank, number, identifier, function))
         return dict(job)
 
     def get(self, identifier):
@@ -61,10 +69,11 @@ class Jobs:
         """Newest first; queued jobs carry their place in the line (1 = next)."""
         with self.lock:
             jobs = [dict(job) for job in self.jobs.values()]
-        waiting = [job['id'] for job in jobs if job['status'] == 'queued']
-        for job in jobs:
-            if job['status'] == 'queued':
-                job['position'] = waiting.index(job['id']) + 1
+        for lane in self.queues:
+            waiting = sorted((job for job in jobs if job['status'] == 'queued' and job.get('lane') == lane),
+                             key=lambda job: (job.get('rank', 0), int(job['id'])))
+            for position, job in enumerate(waiting, 1):
+                job['position'] = position
         return list(reversed(jobs))[:limit]
 
     def _update(self, identifier, **changes):
@@ -72,9 +81,9 @@ class Jobs:
             if identifier in self.jobs:
                 self.jobs[identifier].update(changes)
 
-    def _work(self):
+    def _work(self, lane):
         while True:
-            identifier, function = self.queue.get()
+            _, _, identifier, function = self.queues[lane].get()
             self._update(identifier, status='running', message='実行中')
             try:
                 result = function(lambda **message: self._update(identifier, message=message.get('message', '実行中')))

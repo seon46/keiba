@@ -161,18 +161,20 @@ class Scraper:
         self.python = python or sys.executable
         self.interval = interval
 
-    def command(self, *arguments, refresh=False):
+    def command(self, *arguments, refresh=False, priority=False):
         base = [self.python, '-X', 'utf8', '-m', 'keiba_scraper', '--data-dir', str(self.data_dir)]
         if self.interval:
             base += ['--interval', str(self.interval)]
         if refresh:
             base.append('--refresh')
+        if priority:
+            base.append('--priority')
         return base + [str(argument) for argument in arguments]
 
-    def run(self, *arguments, refresh=False, log=None, timeout=None):
+    def run(self, *arguments, refresh=False, log=None, timeout=None, priority=False):
         """Run and return (exit code, parsed JSON lines); a process silent past ``timeout`` seconds is stopped."""
         import threading
-        process = subprocess.Popen(self.command(*arguments, refresh=refresh), stdout=subprocess.PIPE,
+        process = subprocess.Popen(self.command(*arguments, refresh=refresh, priority=priority), stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
         messages = []
         expired = threading.Event()
@@ -211,7 +213,7 @@ class Scraper:
             raise ValueError(f'{"中央" if region == "central" else "地方"}の一覧を読めませんでした（開催がない日の可能性があります）。{detail}')
         return listed[-1]['race_ids']
 
-    def pedigrees(self, horse_ids, *, chunk=200, log=None):
+    def pedigrees(self, horse_ids, *, chunk=200, log=None, priority=False):
         """Fetch the 5-generation pedigrees of ``horse_ids``; returns how many chunks failed."""
         horse_ids = sorted(set(horse_ids))
         failed = 0
@@ -221,27 +223,27 @@ class Scraper:
             for horse in part:
                 arguments += ['--horse-id', horse]
             try:
-                code, _ = self.run(*arguments, log=log, timeout=300 + 30 * len(part))
+                code, _ = self.run(*arguments, log=log, timeout=300 + 30 * len(part), priority=priority)
             except ValueError:
                 code = 1
             failed += code != 0
         return failed
 
     def odds(self, region, race_id):
-        code, messages = self.run('odds', '--region', region, '--race-id', race_id, timeout=180)
+        code, messages = self.run('odds', '--region', region, '--race-id', race_id, timeout=180, priority=True)
         if code != 0:
             detail = ' '.join(message.get('text', '') for message in messages).replace('ERROR: ', '')[-300:]
             raise ValueError(f'オッズを取得できません: {detail}')
         return [message for message in messages if 'bets' in message]
 
-    def fetch(self, region, race_ids, page, *, refresh=True):
+    def fetch(self, region, race_ids, page, *, refresh=True, priority=False):
         race_ids = list(race_ids)
         if not race_ids:
             return []
         arguments = ['fetch', '--region', region, '--page', page]
         for race_id in race_ids:
             arguments += ['--race-id', race_id]
-        code, messages = self.run(*arguments, refresh=refresh, timeout=120 + 60 * len(race_ids))
+        code, messages = self.run(*arguments, refresh=refresh, timeout=120 + 60 * len(race_ids), priority=priority)
         if code != 0:
             detail = ' '.join(message.get('text', '') for message in messages)[-300:]
             raise ValueError(f'出馬表を取得できません: {detail}')

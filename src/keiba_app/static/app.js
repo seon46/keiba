@@ -156,7 +156,7 @@ function renderJobs(data) {
   const recent = data.jobs.filter((job) => job.status === 'done' || job.status === 'error').slice(0, 15);
   const link = (job) => (job.race_id && job.region ? `<a href="#/race/${job.region}/${job.race_id}">開く</a>` : '');
   const row = (job) => `<tr class="job-${job.status}">
-      <td><span class="job-status">${JOB_STATUS[job.status] || job.status}${job.position ? ` ${job.position}番目` : ''}</span></td>
+      <td><span class="job-status">${JOB_STATUS[job.status] || job.status}${job.position ? ` ${job.position}番目` : ''}</span>${job.lane === 'long' ? '<div class="small muted">日単位</div>' : ''}</td>
       <td>${esc(job.label)}<div class="small muted">${esc(job.status === 'error' ? job.error : job.message)}</div></td>
       <td class="num small muted">${timeLabel(job.created_at).slice(-5)}${job.finished_at ? `<br>〜${timeLabel(job.finished_at).slice(-5)}` : ''}</td>
       <td class="num">${link(job)}</td></tr>`;
@@ -170,7 +170,7 @@ function renderJobs(data) {
     <h2>このアプリの処理 ${active.length ? `<span class="small muted">${active.length}件</span>` : ''}</h2>
     ${active.length ? `<div class="list-wrap"><table class="list jobs">${active.map(row).join('')}</table></div>`
       : '<p class="muted">処理中・順番待ちはありません。</p>'}
-    <p class="small muted">処理は1件ずつ、押した順に実行します。</p>
+    <p class="small muted">1レースの処理（オッズの取得が最優先、次に予想）と、日単位の長い処理は別々の列で進みます。netkeibaへの取得も、画面で待っている取得を毎晩の更新より先に通します。</p>
     ${recent.length ? `<h2>最近終わった処理</h2><div class="list-wrap"><table class="list jobs">${recent.map(row).join('')}</table></div>` : ''}`;
 }
 setInterval(() => { if (location.hash.startsWith('#/jobs') && document.visibilityState === 'visible') updateJobBadge(); }, 5000);

@@ -59,14 +59,14 @@ class Engine:
                 self._key = key
             return self._predictor
 
-    def ensure_pedigrees(self, rows):
+    def ensure_pedigrees(self, rows, *, priority=False):
         """Fetch missing pedigrees of the card's horses when the model uses them (failures only lower accuracy)."""
         if not getattr(self.predictor(), 'race_db', None):
             return 0
         missing = self.saved.missing_pedigrees([row.get('horse_id') for row in rows])
         if missing:
             self.report(event='fetching_pedigrees', horses=len(missing))
-            if self.scraper.pedigrees(missing):
+            if self.scraper.pedigrees(missing, priority=priority):
                 self.report(event='pedigree_fetch_failed', horses=len(missing))
         return len(missing)
 
@@ -75,15 +75,15 @@ class Engine:
             self._predictor, self._key = None, None
 
     # -- race cards ----------------------------------------------------
-    def card(self, region, race_id, *, refresh=False):
+    def card(self, region, race_id, *, refresh=False, priority=False):
         """(rows, source) for the race: the latest saved entries, else the results without outcomes."""
         if refresh:
-            self.scraper.fetch(region, [race_id], 'entries', refresh=True)
+            self.scraper.fetch(region, [race_id], 'entries', refresh=True, priority=priority)
         entries = self.saved.snapshot(region, race_id, 'entries')
         if entries is None and not refresh:
             results = self.saved.snapshot(region, race_id, 'results')
             if results is None:
-                self.scraper.fetch(region, [race_id], 'entries', refresh=True)
+                self.scraper.fetch(region, [race_id], 'entries', refresh=True, priority=priority)
                 entries = self.saved.snapshot(region, race_id, 'entries')
             else:
                 return entries_from_results(results), 'results'
@@ -144,14 +144,14 @@ class Engine:
 
     def predict_race(self, region, race_id, *, refresh=False, origin='manual'):
         from keiba_ai.pipeline_v3 import Predictor, entry_races
-        rows, source = self.card(region, race_id, refresh=refresh)
+        rows, source = self.card(region, race_id, refresh=refresh, priority=True)
         races = entry_races(rows)
         if len(races) != 1:
             raise ValueError('出馬表の内容が1レース分ではありません。')
         if not Predictor.supported(races[0][3]):
             raise ValueError(UNSUPPORTED)
         predictor = self.predictor()
-        self.ensure_pedigrees(races[0][3])
+        self.ensure_pedigrees(races[0][3], priority=True)
         results = predictor.predict_races(races, samples=self.samples)
         if not results:
             raise ValueError('予想できる出走馬がいません。')

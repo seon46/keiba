@@ -67,8 +67,8 @@ def retry_seconds(value: str | None) -> float:
 
 class Client:
     def __init__(self, store: Store, *, interval: float = 10, timeout: float = 30,
-                 refresh: bool = False, retries: int = 2):
-        self.store, self.interval, self.timeout = store, interval, timeout
+                 refresh: bool = False, retries: int = 2, priority: bool = False):
+        self.store, self.interval, self.timeout, self.priority = store, interval, timeout, priority
         self.refresh, self.retries = refresh, retries
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "ja,en;q=0.5"})
@@ -95,7 +95,7 @@ class Client:
             host = validate_url(current)
             for attempt in range(self.retries + 1):
                 try:
-                    delay = self.store.reserve_request(host, self.interval)
+                    delay = self.store.reserve_request(host, self.interval, priority=self.priority)
                 except HostBlocked as exc:
                     raise AccessRestricted(str(exc)) from exc
                 if delay:

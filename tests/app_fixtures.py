@@ -54,11 +54,11 @@ class FakeScraper:
             raise ValueError('中央の一覧を読めませんでした（開催がない日の可能性があります）。')
         return self.listing.get((day, region), [])
 
-    def fetch(self, region, race_ids, page, *, refresh=True):
+    def fetch(self, region, race_ids, page, *, refresh=True, priority=False):
         self.fetched.append((region, tuple(race_ids), page))
         return []
 
-    def pedigrees(self, horse_ids, *, chunk=200, log=None):
+    def pedigrees(self, horse_ids, *, chunk=200, log=None, priority=False):
         self.pedigree_requests.append(sorted(horse_ids))
         return 0
 

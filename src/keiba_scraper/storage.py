@@ -358,8 +358,14 @@ class Store:
             start_date=start_date, end_date=end_date,
         ))
 
-    def reserve_request(self, host: str, interval: float) -> float:
-        """Reserve a global slot, including across multiple CLI processes."""
+    def reserve_request(self, host: str, interval: float, *, priority: bool = False) -> float:
+        """Reserve a global slot, including across multiple CLI processes.
+
+        The spacing between any two requests stays ``interval``.  A ``priority`` client (someone waiting
+        at the screen) also keeps a short hold, and ordinary clients start their next request only after
+        the hold, so a priority client's few pages go out back to back instead of alternating with a
+        long background collection.
+        """
         now = time.time()
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -371,9 +377,20 @@ class Store:
                 raise HostBlocked(f"{host} は {deadline} まで取得を停止しています: {blocked['reason']}")
             row = self.db.execute("SELECT next_request FROM request_state WHERE host='*'").fetchone()
             slot = max(now, row[0] if row else now)
+            if priority:
+                # hold ordinary clients back until two intervals after this request
+                self.db.execute(
+                    "INSERT INTO request_state(host,next_request) VALUES ('!',?) "
+                    "ON CONFLICT(host) DO UPDATE SET next_request=max(next_request,excluded.next_request)",
+                    (slot + 2 * interval,))
+            else:
+                hold = self.db.execute("SELECT next_request FROM request_state WHERE host='!'").fetchone()
+                if hold and hold[0] > slot:
+                    slot = hold[0]
             self.db.execute(
                 "INSERT INTO request_state(host,next_request) VALUES ('*',?) "
-                "ON CONFLICT(host) DO UPDATE SET next_request=excluded.next_request", (slot + interval,)
+                "ON CONFLICT(host) DO UPDATE SET next_request=max(next_request,excluded.next_request)",
+                (slot + interval,)
             )
             self.db.commit()
             return slot - now
