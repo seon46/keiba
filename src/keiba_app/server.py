@@ -294,6 +294,15 @@ _DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second server bind the same port while the first one keeps answering,
+    # so a "restarted" app silently keeps running old code.  Take the port exclusively there instead.
+    allow_reuse_address = sys.platform != 'win32'
+
+    def server_bind(self):
+        import socket
+        if sys.platform == 'win32' and hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def handle_error(self, request, client_address):
         if isinstance(sys.exc_info()[1], _DISCONNECTED):
@@ -406,8 +415,13 @@ def make_handler(api: Api, *, allowed_hosts=()):
 
 
 def serve(app: App, *, host='127.0.0.1', port=8765, allowed_hosts=()):
+    try:
+        server = _Server((host, port), lambda *args: None)
+    except OSError as exc:
+        raise ValueError(f'ポート{port}はすでに使われています。前に起動したアプリ（タスクスケジューラの「KeibaApp Server」など）'
+                         f'が動いたままです。止めてから起動してください。（{exc}）') from exc
     api = Api(app)
-    server = _Server((host, port), make_handler(api, allowed_hosts=allowed_hosts))
+    server.RequestHandlerClass = make_handler(api, allowed_hosts=allowed_hosts)
     print(json.dumps(dict(event='serving', url=f'http://{host}:{port}/'), ensure_ascii=False), flush=True)
     try:
         server.serve_forever()

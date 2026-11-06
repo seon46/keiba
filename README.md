@@ -720,6 +720,14 @@ git pull
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.ps1
 ```
 
+登録後の画面はウィンドウなしで動くので、コードを更新したら次のように再起動します（`serve` をもう1つ起動しても、ポートが使用中で止まります）:
+
+```powershell
+Stop-ScheduledTask -TaskName "KeibaApp Server"
+Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" | Where-Object { $_.CommandLine -like '*keiba_app serve*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Start-ScheduledTask -TaskName "KeibaApp Server"
+```
+
 毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 新しい馬の血統の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
 
 外出先の端末から見るには、PCとスマホなどにTailscaleを入れて同じアカウントでログインし、PCで一度だけ次を実行します。表示されたHTTPSのアドレスを、自分の端末から開けます（自分のアカウントの端末以外からは見えません）。
