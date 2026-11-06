@@ -29,6 +29,21 @@ def race_url(identifier: str, region: str, page: str) -> str:
     return f"https://{host}/race/{filename}?{urlencode({'race_id': identifier})}"
 
 
+def odds_url(identifier: str, region: str) -> str:
+    """Every bet type's odds of a central race in one JSON response (the odds page's own data request)."""
+    race_id(identifier)
+    if region != "central":
+        raise ValueError("地方のオッズはページ（odds_page_url）から読みます。")
+    return f"https://race.netkeiba.com/api/api_get_jra_odds.html?{urlencode({'race_id': identifier, 'type': 'all', 'action': 'init'})}"
+
+
+def odds_page_url(identifier: str, region: str, kind: str = "b1") -> str:
+    """The odds page itself (used only to save format samples)."""
+    race_id(identifier)
+    host = "race.netkeiba.com" if region == "central" else "nar.netkeiba.com"
+    return f"https://{host}/odds/index.html?{urlencode({'type': kind, 'race_id': identifier})}"
+
+
 def horse_url(identifier: str) -> str:
     return f"https://db.netkeiba.com/horse/result/{horse_id(identifier)}/"
 

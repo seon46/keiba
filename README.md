@@ -468,6 +468,280 @@ PowerShellで新しい出力先へ学習します。CSV・収集DB・既存モ�
 
 予測CSVにも `day_bias_races`、前・内の傾向値、採用特徴量、`intraday_bias_used`、`bias_prior_only`、設定ID、当日入力CSVのSHA-256を記録します。区分ごとに `auto` が旧特徴量を採用した場合、当日結果は順位予測へ影響しません。
 
+## v3実験：現行の順位モデル（M0）とLightGBM＋Plackett–Luce（M1）の比較
+
+`keiba_ai.experiment_v3` は、prepare済みの `features.sqlite3` をそのまま使い、2つの順位モデルを同じ条件で比較します。既存の学習・予測コマンドは変更しません。
+
+- 特徴量：`context` の96項目から、過去走のオッズ・人気由来の7項目を除いた89項目。当日バイアス（人気基準のv1）も使いません。
+- M0：現行の `train_rank` と同じ方式（順位比の回帰＋温度0.1/0.2/0.4）。
+- M1：LightGBMで、レース内の着順のPlackett–Luce尤度を直接最適化します。木の本数は学習期間の最後の2か月で早期終了して決め、検証年は使いません。完走確率もLightGBMで学習します。段の重みは `all`（全着順）と `top5`（上位5着まで）を比較します。
+- 検証：2022年4月以降で学習し、2023・2024・2025年をそれぞれ検証年にする3つのfoldで評価します（2021年10月〜2022年3月は履歴の構築だけに使います）。2026年以降の最終評価期間は読みません。
+- 指標：各foldの `race_outcome_log_loss`（小さいほど良い）。`summary` にfold平均と、M1がM0より全foldで良いかを記録します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3 --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3_m0_m1 --threads 2
+```
+
+結果は `data\exp_v3_m0_m1\experiment.json` に保存されます。`lightgbm` が必要なので、初回は `scripts\setup-ml.ps1` を実行してください。
+
+## v3実験B：段ごとの温度・中央地方の統合モデル・LightGBMの調整
+
+`keiba_ai.experiment_v3b` は、v3実験のM1（LightGBM＋PL、全着順）を起点に、次の3点を同じ3つの検証foldで比較します。
+
+- 構造：区分ごとのモデル（`separate`）と、中央平地・地方平地をまとめた1つのモデル（`pooled`、`is_central` を特徴量に追加）。
+- ハイパーパラメータ：既定値と、Optunaによる探索（構造も探索の対象）。探索の目的関数は、検証年の着順のPL負の対数尤度の平均です（サンプリング不要で速い）。最初の2試行は既定値です。
+- 温度：1つの温度と、1着・2着・3着・4着以降で別々の温度。どちらも学習期間末尾の早期終了用2か月で最尤推定し、検証年は使いません。
+
+各設定をレース単位で採点し、`separate_default/single_t`（前回のM1に相当）との差を、レース単位の対応のあるブートストラップで95%区間付きで出します。レース単位の損失は `race_losses.csv` に保存します。2026年以降は読みません。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3b --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3b --threads 2 --tuning-trials 20 --tuning-hours 4
+```
+
+`lightgbm` と `optuna` が必要なので、初回は `scripts\setup-ml.ps1` を実行してください。`--tuning-trials 0` にすると調整を省いて温度と構造だけを比較します。
+
+## v3実験C：発走前に公表される今回の馬体重・馬場状態
+
+`keiba_ai.experiment_v3c` は、v3実験Bで最も良かった設定（区分ごとのLightGBM＋PL、調整済みパラメータ、4段の温度）を基準に、発走前に公表される値から作る特徴量の効果を測ります。
+
+- `weight`：今回の馬体重と増減、直近5走の平均との差、普段の増減幅との差、斤量÷馬体重、休み明けでの増減、レース内での馬体重・増減の比較（8項目）。
+- `going`：今回の馬場状態と天候、重・不良かどうか、今回と同じ馬場区分（良・稍重／重・不良）での本人の出走数と3着内率、前走からの馬場の変化（6項目）。
+- `both`：両方。
+
+今回レースの着順・時計・通過順・オッズ・人気・水分量は読みません。発表値が取れない場合に備え、学習期間ではレースごとに5%の確率でこれらの値を欠損にして学習します（`--announce-dropout`）。基準（`base`）との差を、レース単位の対応のあるブートストラップで95%区間付きで出します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3c --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3c --threads 2
+```
+
+## v3実験D：馬の強さから騎手の腕を分離する
+
+`keiba_ai.experiment_v3d` は、これまでで最も良い設定（区分ごとのLightGBM＋PL、調整済みパラメータ、4段の温度、地方は今回の馬体重も使用）を基準に、騎手の扱い方を比べます。
+
+1. 騎手の特徴量を使わない馬の強さモデル `f0` を学習します。
+2. 検証年より前のレースは、四半期ごとに3つに分けたクロスフィッティングで強さを予測し、自分を学習に使ったモデルで自分の強さを予測しないようにします。
+3. その強さをオフセットにしたPL尤度で、騎手ごとの上乗せ θ を日ごとに逐次推定します（半減期365日の長期版と90日の短期版）。各行には、その日より前の状態だけを使います。
+4. 比較する4つの設定：`base`（今の騎手の通算率）、`nojockey`（騎手情報なし）、`theta_feature`（通算率の代わりに θ 由来の特徴量）、`theta_offset`（θ をオフセットとして馬の強さを学習し、予測は f＋γθ）。
+
+温度と γ は早期終了用の期間で推定し、検証年は使いません。基準との差を、レース単位の対応のあるブートストラップで95%区間付きで出します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3d --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3d --threads 2
+```
+
+## v3実験E：馬場差とクラスを補正したスピード指数
+
+`keiba_ai.speed` は、走破時計から因果的なスピード指数を作ります。時計は1000mあたりの秒数（ペース）で扱い、各レースの基準ペースは上位3頭の平均です。
+
+- 基準ペース：競馬場×芝ダ×距離ごと（指数用）と、さらにクラス別（馬場差の測定用）を、指数移動平均で持ちます。
+- 馬場差：その日・その競馬場×芝ダの各レースについて「レースのペース − クラス別基準」を求め、その中央値をレース数で縮小した値です。弱いクラスばかりの日を「遅い馬場」と誤認しないよう、クラス別の基準と比べます。
+- 指数：−（馬のペース − 基準 − 馬場差）＋ 0.12×（斤量 − 55）。単位は秒/km（プラスが速い）。
+- その日の指数は、すべての特徴量を作り終えてから計算するので、翌日以降の特徴量にしか入りません。
+
+特徴量は、前走・直近5走平均・直近5走最高・同じ芝ダ×距離帯での最高・上昇傾向・指数の数・重不良での最高、レース内でのz値（平均・最高）、相手の最高との差、上位3頭の平均（11項目）です。
+
+`keiba_ai.experiment_v3e` は、各区分のこれまでの最良設定（騎手θを除く。地方は今回の馬体重を含む）に指数を加えた場合を比べます。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3e --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3e --threads 2
+```
+
+## v3実験F：指数＋騎手θの組み合わせと、レース内の相対化
+
+`keiba_ai.experiment_v3f` は、実験Eの `speed`（指数あり）を基準に比べます。
+
+- `speed_rel`（両区分）：主要な能力の列（時計差、上がり、4角位置、コース・距離適性、騎手・調教師の3着内率、斤量、年齢、間隔、指数）について、同じレース内でのz値と順位を追加します（32項目）。同じレースの、すでに因果的な列だけを使います。
+- `speed_theta`（地方のみ）：騎手の通算率に加えて、騎手θの特徴量を追加します。θ用の馬の強さは、騎手特徴量なし・指数ありのモデルを四半期ブロックでクロスフィッティングして求めます。
+- `speed_theta_rel`（地方のみ）：両方。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3f --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3f --threads 2
+```
+
+## v3実験G：馬のレーティングと、相手の強さを考慮した成績
+
+`keiba_ai.ratings` は、馬ごとの多人数レーティングを着順から日ごとに更新します（騎手θと同じPLのオンライン推定を、馬に当てはめたもの。半減期240日）。各行には、その日より前のレーティングだけを使います。
+
+- レース前のレーティング、その不確かさ、短期版、レース内のz値、相手の最高との差、上位3頭の平均。
+- 過去走の相手の強さ：その過去走の相手のレーティング平均（直近5走平均・前走）と、今回の相手との差（相手関係の上がり下がり）。
+- 期待以上の走り（surprise）：相手のレーティングから求めた期待着順と実際の着順の差（直近5走平均・前走）。
+
+`keiba_ai.experiment_v3g` は、これまでの最良設定（中央は指数あり、地方は指数＋騎手θ）にこれらを加えて比べます。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3g --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3g --threads 2
+```
+
+## v3実験H：段ごとの温度の推定方法
+
+`keiba_ai.experiment_v3h` は、各区分の現在の最良設定（中央：指数＋レーティング、地方：馬体重＋指数＋騎手θ＋レーティング）を1回だけ学習し、温度の推定方法だけを変えて比べます。
+
+- `stop_single` / `stop_4`（現行）/ `stop_4_shrunk`：学習期間の最後の2か月で、温度1つ・4段・4段（共通の値に強く寄せる）。
+- `stop_power`：同じ2か月で、T_j = T_1 × j^β の2パラメータ。
+- `oof_4` / `oof_6`：学習期間全体を四半期ブロックでクロスフィッティングした予測で、4段・6段。
+
+どれも検証年より前のレースだけを使い、同じ検証予測を同じ乱数で採点します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3h --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3h --threads 2
+```
+
+## v3実験I：馬の強さを基準にしたトラックバイアス（v3）
+
+`keiba_ai.bias_v3` は、レースごとに、馬の強さ（学習に使っていないクロスフィット予測）をオフセットに固定し、4角の位置と馬番の効果 β をPL尤度で推定します。競馬場×芝ダ×距離帯の事前値は前日までだけで更新し、当日の偏差は同じ日・同じ場・同じ馬場の先行レースから精度重み付きで縮小推定します。人気・オッズは使いません。
+
+`keiba_ai.experiment_v3i` は、各区分の最良設定を基準に次を比べます。
+
+- `bias_feature`：当日の偏差、事前値、予想位置・馬番との積（9項目）を特徴量に追加（案B）。
+- `bias_offset`：学習データでは、自レース以外の当日のレースから求めた偏差×実際の位置を init_score にして強さを学び直し、予測は「強さ＋γ×バイアス項」（案A、γは早期終了用の期間で推定）。
+- 温度は `stop_power` と、1着だけ自由で2着以降を関数形にした `stop_hybrid` の両方で採点します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3i --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\exp_v3i --threads 2
+```
+
+## v3実験J：血統の特徴量とニューラルネット
+
+`keiba_ai.experiment_v3j` は、収集した5代血統（`data\keiba.sqlite3`）を使い、同じ検証（2023〜2025年、早期終了は直前2か月）で次を比べます。
+
+- `A_lgbm`：現在の最良設定（LightGBM＋Plackett–Luce）。
+- `B_lgbm_ped`：Aに血統の特徴量（父・母父・母の能力値。馬の強さを差し引いたうえで日ごとに更新。父は芝ダ別・距離帯別も）を追加。
+- `C_nn`：ニューラルネット（PyTorch）。Aと同じ特徴量に、5代62頭の祖先・騎手・調教師の埋め込みと、同じレースの馬どうしの注意機構（Transformer）を加え、同じPlackett–Luceの損失で学習。
+- `D_blend`：BとCの加重平均（重みは早期終了用の期間で推定）。`E_blend`：AとCの加重平均。
+
+GPU版のPyTorchを入れてから実行します（`nvidia-smi` で確認できるNVIDIAのGPUが必要です）。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-nn.ps1
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3j --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\exp_v3j --threads 2
+```
+
+## v3実験K：ニューラルネットの改善
+
+`keiba_ai.experiment_v3k` は、実験JのLightGBM部分（完走モデル・A・B・ニューラルネットの入力）を `--cache-dir` に保存し、2回目以降はそれを再利用してニューラルネットだけを学習し直します。比べるのは、実験Jの設定（`nn_j`）、学習率の山を最後まで下げる設定（`nn_sched`）、正則化を強めた設定（`nn_reg`）、その5本平均（`nn_reg_x5`）、foldごとの設定探索＋5本平均（`nn_search_x5`）と、それぞれのBとの混ぜ合わせ（`D_…`）です。基準はAと、実験Jで最良だった `D_nn_j` です。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3k --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3k --threads 2
+```
+
+## v3実験L：TabM型のニューラルネット
+
+`keiba_ai.experiment_v3l` は、実験Kと同じLightGBMの保存分（`--cache-dir`）を使い、次を比べます。
+
+- `tabm`：TabM型（重みを共有した32個のモデルの平均）＋数値の周期埋め込み（各特徴量を学習された周波数のsin/cosでベクトル化）＋レース内の注意機構。
+- `tabm_noattn`：注意機構なし（各馬を自分の特徴量だけで評価）。`tabm_noemb`：数値の埋め込みなし。
+- 参考に `nn_j`（実験Jの設定）と `nn_sched`。それぞれ単体と、B（LightGBM＋血統）との混ぜ合わせ（`D_…`）で採点します。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3l --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3l --threads 2
+```
+
+## v3実験M：TabMの設定探索と複数モデルの混ぜ合わせ
+
+`keiba_ai.experiment_v3m` は、実験Kの保存分を使い、年ごとにTabMの設定（注意機構の有無、幅・層、正則化、数値の埋め込みの周波数、内部のモデル数など）を `--search-trials` 通り試し、早期終了用の期間で一番良い設定を1回（`tabm_search`）と3本平均（`tabm_search_x3`）で学習します。あわせて、B（LightGBM＋血統）と学習したすべてのネットワークを一度に混ぜる `D_multi` も採点します。GPUのメモリ不足になった設定は飛ばします。
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.experiment_v3m --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --cache-dir data\v3k_cache --output-dir data\exp_v3m --threads 2
+```
+
+## v3パイプライン：最良設定での学習と出馬表の予測（オッズ・トラックバイアス不使用）
+
+`keiba_ai.pipeline_v3` は、v3実験で最良だった設定で、中央平地・地方平地ごとのモデルを学習し、出馬表から各馬の順位分布を出します。
+
+- 中央平地：89項目＋スピード指数＋馬のレーティング（騎手は従来の成績率）。
+- 地方平地：上に加えて、今回の馬体重（学習時は5%のレースで隠す）と騎手θ（騎手特徴量なしの強さを四半期の交差推定で求め、それを基準に算出）。
+- 強さはLightGBM＋Plackett–Luce（調整済みパラメータ）。`train-end` の直前2か月で早期終了し、温度（1着だけ自由、2着以降は a·j^b）も同じ2か月で推定します。
+- 障害・ばんえいは対象外です（出馬表に含まれていれば飛ばします）。
+
+学習（`--train-end` を省くと、データ最終日の翌日まで全部で学習します）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 fit --dataset data\ml_rank_bias_v2\features.sqlite3 --output-dir data\v3_model --threads 2
+```
+
+`--train-end 2025-07-01 --evaluate-until 2026-01-01` のように指定すると、学習期間の後を評価して `model.json` と `evaluation_<区分>.csv` に保存します。2026-01-01以降（最終評価期間）の評価には `--allow-test-period` が必要です。
+
+予測（`train-end` 以降の日付のみ。履歴は予測日より前だけから作り直します）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 predict --dataset data\ml_rank_bias_v2\features.sqlite3 --model-dir data\v3_model --entries data\entries.csv --output data\v3_predictions.csv
+```
+
+学習期間より後の確定結果での採点（新しい成績を含めてprepareし直したfeatures.sqlite3を使います。特徴量の版が同じなら、モデルは学習し直さずに使えます）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v3 evaluate --dataset data\ml_rank_v3_new\features.sqlite3 --model-dir data\v3_model --output-dir data\v3_eval
+```
+
+各レースは前日までの成績だけで予測し（predictと同じ）、`evaluation.json` に全体・週ごとの指標と一様予測との差、`race_losses.csv` にレースごとの損失を保存します。
+
+出力には `rank_k_probability`（k着の確率）、`nonfinish_probability`、`win_probability`、`top3_probability`、`expected_rank_given_finish`、`strength_score` が入ります。地方で馬体重が出馬表にあれば使い、なければ空欄扱いで予測します（`bodyweight_used`）。
+
+## v4パイプライン（本番）：LightGBM＋血統 と TabM型ニューラルネットの混ぜ合わせ
+
+`keiba_ai.pipeline_v4` は、実験Mで最良だった組み合わせ（`D_tabm_search_x3`）を本番用に学習・予測します。
+
+- B：v3パイプラインの特徴量に、血統の特徴量（父・母父・母のθ。芝ダ別・距離帯別。基準の強さはv3モデルの交差推定）を加えたLightGBM＋Plackett–Luce。
+- NN：TabM型ネットワーク（内部16本、数値の周期埋め込み、注意機構なし、祖先62頭・騎手・調教師の埋め込み）。設定は実験Mで2025年に中央・地方とも選ばれたものに固定し、乱数を変えた3本の平均。
+- 強さ = w_B·B + w_NN·NN（重みと温度は直前2か月で推定）。予測にはGPUは不要です（学習はGPU推奨）。
+- 予測時の履歴（指数・レーティング・騎手θ・血統θ）は日付・区分ごとに一度だけ作り、同じ日の2レース目以降は数秒で出ます。
+
+学習（`--race-db` は血統を集めた収集DB）。確認用（2025年を採点し、実験Mの値と比べる）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v4 fit --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\v4_check --train-end 2025-01-01 --evaluate-until 2026-01-01 --threads 2
+```
+
+本番（データ最終日まで全部で学習）:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v4 fit --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --output-dir data\v4_model --threads 2
+.\.venv\Scripts\python.exe -X utf8 -m keiba_ai.pipeline_v4 predict --dataset data\ml_rank_bias_v2\features.sqlite3 --race-db data\keiba.sqlite3 --model-dir data\v4_model --entries data\entries.csv --output data\v4_predictions.csv
+```
+
+出力はv3と同じ列に、`lightgbm_score`（B）と `network_score`（NN）が加わります。アプリに `keiba_app init --model-dir data\v4_model` で登録すると、毎晩の自動処理は新しく出てきた馬（直近60日のレース）の血統を集め、7日ごとにv4で学習し直します。予想するときに血統が未取得の馬がいれば、その場で取得してから予想します（取得に失敗しても、血統なしとして予想します）。
+
+## 競馬AIアプリ（ブラウザで予想・記録・自動更新）
+
+設計は `docs/app_design.md`。開催日 → 競馬場 → R でレースを選び、出馬表の並びで各馬の着順ごとの確率（小さな棒グラフ・クリックで拡大・ヒートマップ）を表示します。予想はすべて記録し、結果が出たら自動で照合します。外部サーバーは使わず、自分のPCで動きます。
+
+初回（既存のDBと本番モデルを登録します。コピーはしません）:
+
+```powershell
+git pull
+.\.venv\Scripts\python.exe -X utf8 -m pip install --no-deps --no-build-isolation -e .
+.\.venv\Scripts\python.exe -X utf8 -m keiba_app init --dataset data\ml_rank_bias_v2\features.sqlite3 --model-dir data\v3_model
+.\.venv\Scripts\python.exe -X utf8 -m keiba_app serve
+```
+
+ブラウザで http://127.0.0.1:8765 を開きます。毎晩の自動処理（2:30）、朝のレース一覧の取得と全レースの予想（7:30。どちらもスリープ解除あり）、ログオン時の画面の起動を登録するには（時刻は `-NightlyTime 03:00 -MorningTime 08:00` のように変えられます）:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.ps1
+```
+
+登録後の画面はウィンドウなしで動くので、コードを更新したら次のコマンドで再起動します（手で `serve` を起動する必要はありません。もう1つ起動しても、ポートが使用中で止まります）:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-app.ps1
+```
+
+毎晩の自動処理・`pipeline_v4`・`experiment_*` は、CPUとディスクの優先度を下げて動きます（画面や1レースの処理が先に進みます。何も動いていなければ速さはほぼ同じです）。通常の優先度で動かすには、先に `$env:KEIBA_PRIORITY = "normal"` を実行します。
+
+毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 新しい馬の血統の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
+
+外出先の端末から見るには、PCとスマホなどにTailscaleを入れて同じアカウントでログインし、PCで一度だけ次を実行します。表示されたHTTPSのアドレスを、自分の端末から開けます（自分のアカウントの端末以外からは見えません）。
+
+```powershell
+tailscale serve --bg 8765
+```
+
+**買い目の提案と自信度**：予想したレースの画面に「買い目の提案」が出ます。順位分布と同じ着順のシミュレーション（2万回）から、全券種（単勝・複勝・枠連・馬連・ワイド・馬単・3連複・3連単）の的中率を計算し、券種ごとに「確率の高い順に上からN点」の買い方のうち、指定した的中率（既定20%以上）・点数（既定10点まで）に合うものを出します。オッズを取得すると、予算（既定1,000円）を「どの買い目が当たっても払戻がほぼ同じ」になるよう100円単位で配分し（オッズの低い買い目ほど多く買う）、当たっても損になる買い方（トリガミ）は出さずに、期待値（確率×払戻÷合計金額。複勝・ワイドは低い方のオッズ）の高い順に並べます。その下の「組み合わせの提案」は、2〜3券種を組み合わせた買い方です。どの買い目が1つだけ当たっても合計金額以上が戻る配分で、複数当たれば払戻は足し算になります（的中率は、どれかが当たる確率）。オッズは予想には使いません。自信度は勝率の偏り（1−エントロピー/log頭数）で、その地域の過去の予想の上位1/3をA・下位1/3をCとし、過去の同じ自信度のレースでの本命の勝率・3着内率を表示します（記録が30レース未満の間は仮の基準）。
+
+オッズの取得（中央は全券種を1回の通信で。地方は単勝・複勝・枠連・馬連・ワイド・馬単の5ページ。地方の3連複・3連単は軸馬ごとにページが分かれ通信が多いため取りません）は画面の「オッズを取得」か、`keiba_scraper odds --region central --race-id 202605050811`（地方は `--region local`）。発走まで変わるので毎回新しく取得します。形式確認用に原本を保存するには `--sample-dir data\odds_samples` を付けます。
+
+コマンドだけで使う場合: `keiba_app predict --region central --race-id 202505050811 --refresh`（1レースを予想して記録）、`keiba_app score`（照合）、`keiba_app nightly --only collect prepare`（段階を指定）。
+
 ## 学習済みモデルで出馬表を予測する
 
 予測対象の出馬表を収集・CSV出力してから、次を実行します。entries CSVは同じスクレイパーの `export --page entries` の出力です。対象日の全頭を含めてください。

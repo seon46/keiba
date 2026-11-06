@@ -554,3 +554,123 @@ def parse_horse_history(html: str, *, horse_id: str) -> dict:
     horse_name = re.sub(r"の(?:競走成績|競走馬データ)$", "", horse_name).strip()
     horse_name = re.sub(r"\s*\([^)]*\)$", "", horse_name).strip()
     return {"horse_id": horse_id, "horse_name": horse_name, "runs": runs}
+
+
+# --------------------------------------------------------------------------
+# Odds (central: the odds page's JSON data)
+# --------------------------------------------------------------------------
+
+ODDS_TYPES = {"1": ("win", 1, False), "2": ("place", 1, False), "3": ("bracket", 2, False), "4": ("quinella", 2, False),
+              "5": ("wide", 2, False), "6": ("exacta", 2, True), "7": ("trio", 3, False), "8": ("trifecta", 3, True)}
+
+
+def _odds_number(value):
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    text = str(value or "").replace(",", "").strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
+    """{race_id, region, status, official_at, odds: {bet: {ticket key: odds | [low, high]}}, popularity}."""
+    import json
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise ParseError(f"オッズの応答がJSONではありません: {text[:120]!r}") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    tables = data.get("odds") if isinstance(data, dict) else None
+    if not isinstance(tables, dict):
+        status = payload.get("status") if isinstance(payload, dict) else None
+        raise ParseError(f"オッズの表がありません（status={status!r}）。発売前か、形式が変わった可能性があります。")
+    if payload.get("status") == "yoso":
+        # Before sales open netkeiba shows only forecast win odds, keyed before the horse numbers are drawn.
+        raise ParseError("まだ発売前で、予想オッズしかありません（馬番の確定前）。発売が始まってから取得してください。")
+    odds, popularity = {}, {}
+    for code, table in tables.items():
+        if str(code) not in ODDS_TYPES or not isinstance(table, dict):
+            continue
+        bet, width, ordered = ODDS_TYPES[str(code)]
+        entries, ranks = {}, {}
+        for raw_key, value in table.items():
+            digits = str(raw_key)
+            if width == 1 and digits.isdigit() and len(digits) <= 2:
+                digits = digits.zfill(2)  # single horses come unpadded ("5")
+            if not digits.isdigit() or len(digits) != 2 * width:
+                raise ParseError(f"オッズの組み合わせの形式が想定と違います: {bet} {raw_key!r}")
+            numbers = [int(digits[index:index + 2]) for index in range(0, len(digits), 2)]
+            key = (">" if ordered else "-").join(str(number) for number in (numbers if ordered else sorted(numbers)))
+            values = value if isinstance(value, list) else [value]
+            if bet in ("place", "wide"):
+                low, high = _odds_number(values[0]), _odds_number(values[1]) if len(values) > 1 else None
+                entry = [low, high or low] if low else None
+            else:
+                entry = _odds_number(values[0])
+            if entry is not None:
+                entries[key] = entry
+                rank = _number(str(values[-1]), integer=True) if len(values) > 1 else None
+                if rank:
+                    ranks[key] = rank
+        if entries:
+            odds[bet], popularity[bet] = entries, ranks
+    return dict(race_id=race_id, region=region, status=payload.get("status"),
+                official_at=data.get("official_datetime"), odds=odds, popularity=popularity)
+
+
+# Local (NAR) odds pages carry the numbers in the HTML.  Only the page types whose layout has been
+# checked against real pages are read; the other bet types stay without odds.
+# 3連複・3連単 pages hold one axis horse each (a dozen requests per race), so they are not read.
+LOCAL_ODDS_PAGES = ("b1", "b3", "b4", "b5", "b6")
+_LOCAL_PAIRS = {"b3": ("bracket", False), "b4": ("quinella", False), "b5": ("wide", False), "b6": ("exacta", True)}
+
+
+def _range(text):
+    parts = [_odds_number(part) for part in text.replace("‐", "-").split("-")]
+    parts = [part for part in parts if part]
+    return [parts[0], parts[-1]] if parts else None
+
+
+def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
+    """{bet: {ticket key: odds}} from one nar.netkeiba.com odds page (b1 単勝・複勝, b3 枠連, b4 馬連, b5 ワイド, b6 馬単)."""
+    soup = BeautifulSoup(html, "html.parser")
+    odds = {}
+    if kind == "b1":
+        tables = soup.select("table.RaceOdds_HorseList_Table")
+        if len(tables) < 2:
+            raise ParseError("地方の単勝・複勝の表が見つかりません。")
+        for bet, table in zip(("win", "place"), tables[:2]):
+            entries = {}
+            for row in table.find_all("tr")[1:]:
+                cells = row.find_all("td")
+                odds_cell = row.select_one("td.Odds")
+                if len(cells) < 2 or odds_cell is None:
+                    continue
+                number = _number(_cell_text(cells[1]), integer=True)
+                text = _cell_text(odds_cell)
+                value = _range(text) if bet == "place" else _odds_number(text)
+                if number and value:
+                    entries[str(number)] = value
+            if entries:
+                odds[bet] = entries
+    elif kind in _LOCAL_PAIRS:
+        bet, ordered = _LOCAL_PAIRS[kind]
+        entries = {}
+        for cell in soup.select("td.Odds[id]"):
+            match = re.search(rf"_{kind}_c\d+_(\d+)_(\d+)$", cell.get("id", ""))
+            if not match:
+                continue
+            text = _cell_text(cell)
+            value = _range(text) if bet == "wide" else _odds_number(text)
+            if not value:
+                continue
+            a, b = (int(group) for group in match.groups())  # 馬単: the first number finishes first
+            entries[f"{a}>{b}" if ordered else f"{min(a, b)}-{max(a, b)}"] = value
+        if entries:
+            odds[bet] = entries
+    else:
+        raise ParseError(f"未確認の地方オッズのページです: {kind}")
+    return dict(race_id=race_id, region="local", status=None, official_at=None, odds=odds, popularity={})

@@ -61,6 +61,8 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS races_identity
                 ON races(region, race_id, page);
+            CREATE INDEX IF NOT EXISTS races_race_date
+                ON races(json_extract(metadata_json, '$.race_date'));
             CREATE TABLE IF NOT EXISTS runners (
                 snapshot_id TEXT NOT NULL REFERENCES races(snapshot_id),
                 row_index INTEGER NOT NULL, horse_id TEXT, payload_json TEXT NOT NULL,
@@ -81,6 +83,11 @@ class Store:
                 horse_id TEXT NOT NULL, metadata_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS pedigrees_identity ON pedigrees(horse_id);
+            CREATE TABLE IF NOT EXISTS odds (
+                snapshot_id TEXT PRIMARY KEY REFERENCES observations(id),
+                race_id TEXT NOT NULL, region TEXT NOT NULL, metadata_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS odds_identity ON odds(region, race_id);
             CREATE TABLE IF NOT EXISTS request_state (
                 host TEXT PRIMARY KEY, next_request REAL NOT NULL DEFAULT 0,
                 blocked_until REAL NOT NULL DEFAULT 0, reason TEXT
@@ -187,6 +194,14 @@ class Store:
                 [(observation.id, i, run.get("race_id"), json.dumps(run, ensure_ascii=False))
                  for i, run in enumerate(runs)],
             )
+
+    def save_odds(self, observation: Observation, parsed: dict) -> None:
+        if observation.status != 200 or not parsed.get("odds"):
+            raise StorageError("オッズが0件のため保存しません。")
+        with self.db:
+            self.db.execute(
+                "INSERT INTO odds VALUES (?,?,?,?) ON CONFLICT(snapshot_id) DO UPDATE SET metadata_json=excluded.metadata_json",
+                (observation.id, parsed["race_id"], parsed["region"], json.dumps(parsed, ensure_ascii=False)))
 
     def save_pedigree(self, observation: Observation, parsed: dict) -> None:
         """Keep the complete path-labelled tree with its original observation."""
@@ -345,8 +360,14 @@ class Store:
             start_date=start_date, end_date=end_date,
         ))
 
-    def reserve_request(self, host: str, interval: float) -> float:
-        """Reserve a global slot, including across multiple CLI processes."""
+    def reserve_request(self, host: str, interval: float, *, priority: bool = False) -> float:
+        """Reserve a global slot, including across multiple CLI processes.
+
+        The spacing between any two requests stays ``interval``.  A ``priority`` client (someone waiting
+        at the screen) also keeps a short hold, and ordinary clients start their next request only after
+        the hold, so a priority client's few pages go out back to back instead of alternating with a
+        long background collection.
+        """
         now = time.time()
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -358,9 +379,20 @@ class Store:
                 raise HostBlocked(f"{host} は {deadline} まで取得を停止しています: {blocked['reason']}")
             row = self.db.execute("SELECT next_request FROM request_state WHERE host='*'").fetchone()
             slot = max(now, row[0] if row else now)
+            if priority:
+                # hold ordinary clients back until two intervals after this request
+                self.db.execute(
+                    "INSERT INTO request_state(host,next_request) VALUES ('!',?) "
+                    "ON CONFLICT(host) DO UPDATE SET next_request=max(next_request,excluded.next_request)",
+                    (slot + 2 * interval,))
+            else:
+                hold = self.db.execute("SELECT next_request FROM request_state WHERE host='!'").fetchone()
+                if hold and hold[0] > slot:
+                    slot = hold[0]
             self.db.execute(
                 "INSERT INTO request_state(host,next_request) VALUES ('*',?) "
-                "ON CONFLICT(host) DO UPDATE SET next_request=excluded.next_request", (slot + interval,)
+                "ON CONFLICT(host) DO UPDATE SET next_request=max(next_request,excluded.next_request)",
+                (slot + interval,)
             )
             self.db.commit()
             return slot - now
