@@ -95,6 +95,22 @@ class Jobs:
                              finished_at=now().isoformat(timespec='seconds'))
 
 
+def _tail(path, count, *, chunk=1 << 16):
+    """The last ``count`` lines of a (possibly huge) text file, reading only its end."""
+    with path.open('rb') as file:
+        file.seek(0, 2)
+        end = position = file.tell()
+        data = b''
+        while position > 0 and data.count(b'\n') <= count:
+            position = max(0, position - chunk)
+            file.seek(position)
+            data = file.read(end - position)
+    lines = data.decode('utf-8', errors='replace').splitlines()
+    if position > 0:
+        lines = lines[1:]  # the first line may be cut
+    return lines[-count:]
+
+
 def _race_label(region, race_id):
     from .sources import course_of, race_number_of
     try:
@@ -214,8 +230,7 @@ class Api:
         run = next((item for item in runs if str(item['id']) == query.get('run')), runs[0] if runs else None)
         if run is None or not run.get('log_path') or not Path(run['log_path']).is_file():
             return dict(run=run, lines=[])
-        lines = Path(run['log_path']).read_text(encoding='utf-8', errors='replace').splitlines()
-        return dict(run=run, lines=lines[-300:])
+        return dict(run=run, lines=_tail(Path(run['log_path']), 300))
 
     # -- POST --------------------------------------------------------------
     def predict_race(self, body):
