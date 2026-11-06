@@ -44,6 +44,20 @@ class _Lock:
 _DATASET_INFO = {}
 
 
+def _index_days(dataset):
+    """Index features by day so the status page's MAX(day) is instant.  Done here rather than in keiba_ai.features:
+    that file's bytes are part of the feature revision, so changing it would invalidate every prepared database."""
+    try:
+        connection = sqlite3.connect(dataset, timeout=60)
+        try:
+            connection.execute('CREATE INDEX IF NOT EXISTS features_day ON features(day)')
+            connection.commit()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        pass
+
+
 def dataset_info(path):
     """Last day and feature revision of a prepared dataset.  Without an index on ``day`` the MAX() reads the
     whole (multi-GB) table, so the answer is cached until the file changes."""
@@ -198,6 +212,7 @@ def run_nightly(app: App, *, force_fit=False, only=None, skip=(), python=None, e
                     csv_path.unlink(missing_ok=True)
                     dataset = output / 'features.sqlite3'
                     if code == 0 and dataset.is_file():
+                        _index_days(dataset)
                         previous = state['dataset']
                         current = dataset_info(dataset)
                         app.write_state(dataset=str(dataset), previous_dataset=previous, prepared_through=target)
