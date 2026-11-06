@@ -61,5 +61,32 @@ class BetTests(unittest.TestCase):
         self.assertTrue(all(ticket['stake'] == 100 for item in plain for ticket in item['tickets']))
 
 
+
+class ConfidenceSummaryTests(unittest.TestCase):
+    def test_tiers_and_roi(self):
+        from keiba_ai.experiment_confidence import summarize
+        rng = np.random.default_rng(1)
+        table = []
+        for i in range(300):
+            top = float(rng.uniform(.1, .6))
+            won = float(rng.random() < top)
+            entry = dict(month=f'2025-{i % 12 + 1:02d}', pick_win=won, pick_top3=float(won or rng.random() < .5),
+                         log_loss=2.0 - top, top_win=top, pick_cost=1.0, pick_return=won * 2.5, favourite_cost=1.0,
+                         favourite_return=0.0)
+            for threshold in (1.0, 1.2, 1.5):
+                entry[f'value{threshold}_cost'] = 2.0
+                entry[f'value{threshold}_return'] = won * 3.0
+            table.append(entry)
+        result = summarize(table, ('top_win',))
+        tiers = result['candidates']['top_win']['tiers']
+        self.assertEqual([tier['tier'] for tier in tiers], ['A', 'B', 'C'])
+        self.assertGreater(tiers[0]['pick_win'], tiers[2]['pick_win'])  # confident tier wins more
+        self.assertGreater(tiers[0]['roi']['pick']['roi'], tiers[2]['roi']['pick']['roi'])
+        roi = result['overall']['roi']['pick']
+        self.assertAlmostEqual(roi['roi'], sum(e['pick_return'] for e in table) / 300, places=3)
+        self.assertLessEqual(roi['ci'][0], roi['roi'])
+        self.assertGreaterEqual(roi['ci'][1], roi['roi'])
+
+
 if __name__ == '__main__':
     unittest.main()

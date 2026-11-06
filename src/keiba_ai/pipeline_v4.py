@@ -248,16 +248,24 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
                     if len(rows):
                         report(event='evaluate', group=group, rows=int(len(rows)))
                         score_b = model_b.predict(ped_matrix(rows), num_iteration=best_b, raw_score=True)
-                        score_nn = np.mean([nn_predict(network, inputs, rows) for network in networks], axis=0)
+                        seed_scores = np.asarray([nn_predict(network, inputs, rows) for network in networks])
+                        score_nn = seed_scores.mean(axis=0)
+                        spread = seed_scores.std(axis=0)
                         score_d = weights[0] * score_b + weights[1] * score_nn
                         completion = (np.full(len(rows), constant) if finisher is None else
                                       finisher.predict(data['x'][np.ix_(rows, columns)], num_iteration=finisher_best))
                         args = (race_ids[rows], data['positions'][rows], data['finished'][rows], data['race_numbers'][rows])
                         evaluation = {}
+                        part_temperatures = dict(model=temperatures,
+                                                 lightgbm_pedigree=fit_hybrid_temperatures(stop_structure, stop_b)[0],
+                                                 network=fit_hybrid_temperatures(stop_structure, stop_nn)[0])
+                        (temporary / f'evaluation_temperatures_{group}.json').write_text(
+                            json.dumps({key: [float(v) for v in value] for key, value in part_temperatures.items()}),
+                            encoding='utf-8')
                         for name, scores, temps in (
                                 ('model', score_d, temperatures),
-                                ('lightgbm_pedigree', score_b, fit_hybrid_temperatures(stop_structure, stop_b)[0]),
-                                ('network', score_nn, fit_hybrid_temperatures(stop_structure, stop_nn)[0]),
+                                ('lightgbm_pedigree', score_b, part_temperatures['lightgbm_pedigree']),
+                                ('network', score_nn, part_temperatures['network']),
                                 ('uniform', np.zeros(len(rows)), [1.0])):
                             evaluation[name] = score_races(*args, scores, completion, temps, samples=evaluation_samples,
                                                            seed=settings['seed'])['metrics']
@@ -265,11 +273,13 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
                         with (temporary / f'evaluation_{group}.csv').open('w', encoding='utf-8', newline='') as file:
                             writer = csv.writer(file)
                             writer.writerow(['race_date', 'race_id', 'horse_id', 'finish_position', 'strength_score',
-                                             'finish_probability'])
-                            for row, score, probability in zip(rows, score_d, completion):
+                                             'finish_probability', 'lightgbm_score', 'network_score', 'network_spread'])
+                            for row, score, probability, b, nn, sd in zip(rows, score_d, completion, score_b, score_nn,
+                                                                          spread):
                                 writer.writerow([days[row], race_ids[row], horses[row],
                                                  int(data['positions'][row]) if data['finished'][row] else '',
-                                                 f'{score:.6f}', f'{probability:.6f}'])
+                                                 f'{score:.6f}', f'{probability:.6f}', f'{b:.6f}', f'{nn:.6f}',
+                                                 f'{sd:.6f}'])
                 networks.clear()
             joblib.dump(bundle, temporary / f'{group}.joblib', compress=3)
             summary['groups'][group] = group_result

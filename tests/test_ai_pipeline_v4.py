@@ -42,6 +42,18 @@ class PipelineV4Tests(unittest.TestCase):
                 self.assertLess(evaluation['model']['race_outcome_log_loss'],
                                 evaluation['uniform']['race_outcome_log_loss'] + .05)
             self.assertEqual(type(load_predictor(database, root / 'model', race_db)).__module__, 'keiba_ai.pipeline_v4')
+            with (root / 'model' / 'evaluation_central_flat.csv').open(encoding='utf-8') as file:
+                self.assertIn('network_spread', next(csv.DictReader(file)))
+
+            from keiba_ai.experiment_confidence import run as confidence
+            result = confidence(root / 'model', database, root / 'confidence', samples=256)
+            for group in ('central_flat', 'local_flat'):
+                table = result['groups'][group]
+                self.assertGreater(table['overall']['races'], 10)
+                self.assertIn('concentration', table['candidates'])
+                self.assertIn('learned_top3', table['candidates'])
+                self.assertEqual([tier['tier'] for tier in table['candidates']['concentration']['tiers']], ['A', 'B', 'C'])
+            self.assertTrue((root / 'confidence' / 'races_local_flat.csv').is_file())
 
             with (root / 'model' / 'evaluation_local_flat.csv').open(encoding='utf-8') as file:
                 evaluated = list(csv.DictReader(file))
