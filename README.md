@@ -714,7 +714,7 @@ git pull
 .\.venv\Scripts\python.exe -X utf8 -m keiba_app serve
 ```
 
-ブラウザで http://127.0.0.1:8765 を開きます。毎晩の自動処理（2:30、スリープ解除あり）と、ログオン時の画面の起動を登録するには:
+ブラウザで http://127.0.0.1:8765 を開きます。毎晩の自動処理（2:30）、朝のレース一覧の取得と全レースの予想（7:30。どちらもスリープ解除あり）、ログオン時の画面の起動を登録するには（時刻は `-NightlyTime 03:00 -MorningTime 08:00` のように変えられます）:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.ps1
