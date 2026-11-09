@@ -309,56 +309,51 @@ class Engine:
             self._bets.popitem(last=False)
         return bets
 
-    def confidence_scale(self, region):
-        """(tier function, thresholds, basis, history) for a region; refreshed at most once a minute."""
+    def confidence_history(self, region):
+        """[(top pick's win probability, pick_won, pick_top3)] of this region's logged predictions; cached a minute."""
         import time
-        from keiba_ai.bets import concentration
+        from keiba_ai.bets import top_win
         cached = self._confidence.get(region)
         if cached is None or time.time() - cached[0] > 60:
-            history = [(concentration(wins), won, top3) for wins, won, top3 in self.logbook.confidence_history(region)]
-            history = [item for item in history if item[0] is not None]
-            values = sorted(item[0] for item in history)
-            if len(values) >= 30:
-                low, high, basis = values[len(values) // 3], values[2 * len(values) // 3], 'history'
-            else:
-                low, high, basis = .10, .20, 'default'
-            cached = self._confidence[region] = (time.time(), history, low, high, basis)
-        _, history, low, high, basis = cached
-        return (lambda c: 'A' if c >= high else 'B' if c >= low else 'C'), [low, high], basis, history
+            history = [(top_win(wins), won, top3) for wins, won, top3 in self.logbook.confidence_history(region)]
+            cached = self._confidence[region] = (time.time(), [item for item in history if item[0] is not None])
+        return cached[1]
 
     def day_confidence(self, day):
         """{race_id: dict(tier, value)} from the latest prediction of each race of the day."""
-        from keiba_ai.bets import concentration
+        from keiba_ai.bets import confidence_tier, top_win
         result = {}
         for race_id, (region, wins) in self.logbook.day_win_probabilities(day).items():
-            value = concentration(wins)
+            value = top_win(wins)
             if value is not None:
-                tier_of = self.confidence_scale(region)[0]
-                result[race_id] = dict(tier=tier_of(value), value=value)
+                result[race_id] = dict(tier=confidence_tier(region, value), value=value)
         return result
 
     def confidence(self, prediction):
-        """Concentration of the win probabilities, its tier (A/B/C among this region's races) and the past record."""
-        from keiba_ai.bets import concentration
-        tier_of, (low, high), basis, history = self.confidence_scale(prediction['region'])
-        value = concentration([runner.get('win_probability') for runner in prediction['runners']
-                               if runner.get('distribution') is not None])
+        """The top pick's win probability, its tier (fixed thresholds from the v4 evaluation year), what that tier's
+        picks did in that year, and what they did in this app's own scored predictions."""
+        from keiba_ai.bets import CONFIDENCE_TIERS, confidence_tier, top_win
+        region = prediction['region']
+        runners = [runner for runner in prediction['runners'] if runner.get('distribution') is not None]
+        value = top_win([runner.get('win_probability') for runner in runners])
         if value is None:
             return None
         tiers = {}
-        for c, won, top3 in history:
+        for c, won, top3 in self.confidence_history(region):
             if won is None:
                 continue
-            entry = tiers.setdefault(tier_of(c), dict(races=0, pick_wins=0, pick_top3=0))
+            entry = tiers.setdefault(confidence_tier(region, c), dict(races=0, pick_wins=0, pick_top3=0))
             entry['races'] += 1
             entry['pick_wins'] += bool(won)
             entry['pick_top3'] += bool(top3)
         record = {tier: dict(races=entry['races'], pick_win_rate=entry['pick_wins'] / entry['races'],
                              pick_top3_rate=entry['pick_top3'] / entry['races'])
                   for tier, entry in tiers.items()}
-        pick = max((runner for runner in prediction['runners'] if runner.get('distribution') is not None),
-                   key=lambda runner: runner.get('win_probability') or 0)
-        return dict(value=value, tier=tier_of(value), thresholds=[low, high], basis=basis, record=record,
+        scale = CONFIDENCE_TIERS['central' if region == 'central' else 'local']
+        tier = confidence_tier(region, value)
+        pick = max(runners, key=lambda runner: runner.get('win_probability') or 0)
+        return dict(value=value, tier=tier, thresholds=list(scale['thresholds']), basis='evaluation',
+                    expected=dict(races=scale['races'], **scale['rates'][tier]), record=record,
                     pick_horse_number=pick['horse_number'], pick_win_probability=pick.get('win_probability'),
                     pick_top3_probability=pick.get('top3_probability'))
 
