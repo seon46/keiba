@@ -329,6 +329,35 @@ def combine(bets: RaceBets, odds, *, min_hit=.2, max_points=10, budget=1000, lim
     return chosen
 
 
+# Race confidence = the top pick's win probability.  On the v4 evaluation year (2025, experiment_confidence with
+# data/v4_check2) it sorted races by "the pick finishes in the top 3" better than the concentration of all win
+# probabilities (Spearman .278/.288 vs .258/.274 for central/local) and better than model disagreement, seed spread,
+# unknown pedigree or field size.  The thresholds are the year's tertiles; A/B/C are equal thirds of that year and the
+# rates are what the picks did there.  None of the tiers made money on 単勝 at the final odds: confidence is how
+# likely the pick is to hit, not a betting edge.
+CONFIDENCE_TIERS = {
+    'central': dict(thresholds=(.2483, .3757), races=3243, rates={
+        'A': dict(pick_win_rate=.417, pick_top3_rate=.777), 'B': dict(pick_win_rate=.285, pick_top3_rate=.618),
+        'C': dict(pick_win_rate=.175, pick_top3_rate=.461)}),
+    'local': dict(thresholds=(.3110, .4684), races=12958, rates={
+        'A': dict(pick_win_rate=.589, pick_top3_rate=.882), 'B': dict(pick_win_rate=.367, pick_top3_rate=.751),
+        'C': dict(pick_win_rate=.266, pick_top3_rate=.598)}),
+}
+
+
+def top_win(win_probabilities):
+    """The largest win probability (renormalised over the known runners); None for fewer than two runners."""
+    values = [value for value in win_probabilities if value is not None]
+    if len(values) < 2 or sum(values) <= 0:
+        return None
+    return float(max(values) / sum(values))
+
+
+def confidence_tier(region, value):
+    low, high = CONFIDENCE_TIERS['central' if region == 'central' else 'local']['thresholds']
+    return 'A' if value >= high else 'B' if value >= low else 'C'
+
+
 def concentration(win_probabilities):
     """0 (all horses equal) .. 1 (one certain winner): 1 - entropy / log(starters)."""
     values = np.asarray([value for value in win_probabilities if value is not None and value > 0], dtype=float)

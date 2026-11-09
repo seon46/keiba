@@ -269,7 +269,7 @@ function markStarts() {
 }
 setInterval(() => { if (view.querySelector('.venue li[data-start]')) markStarts(); }, 30000);
 
-// Predicted races of the shown region with confidence A, most concentrated first.
+// Predicted races of the shown region with confidence A, most likely pick first.
 function confidentPanel(races) {
   const predicted = races.filter((race) => race.confidence);
   if (!predicted.length) return '';
@@ -282,7 +282,7 @@ function confidentPanel(races) {
           <span class="where">${esc(race.course)} ${race.race_number}R</span>
           <span class="time">${esc(race.start_time || '')}</span>
           <span class="name">${esc(race.race_name || '')}</span>
-          <span class="score small muted">偏り ${(race.confidence.value * 100).toFixed(0)}</span></a></li>`).join('')}</ol>`
+          <span class="score small muted">本命勝率 ${pct(race.confidence.value, 0)}</span></a></li>`).join('')}</ol>`
         : '<p class="muted small">自信度Aのレースはありません。</p>'}
       <p class="small muted">自信度は予想済みのレースだけに付きます。全レースに付けるには「この日の全レースを予想」を押してください。</p>
     </section>`;
@@ -480,17 +480,19 @@ function oddsLabel(value) {
 
 function confidenceBadge(c) {
   if (!c) return '';
-  return `<span class="conf conf-${c.tier}" title="勝率の偏り ${(c.value * 100).toFixed(0)}（0〜100）">自信度 ${c.tier}</span>`;
+  return `<span class="conf conf-${c.tier}" title="本命の勝率 ${pct(c.value)}">自信度 ${c.tier}</span>`;
 }
 
 function confidenceText(c) {
   if (!c) return '';
+  const e = c.expected;
   const rec = c.record[c.tier];
-  const basis = c.basis === 'history' ? 'この地域の過去の予想の上位1/3がA・下位1/3がC' : '予想の記録が30レース未満のため仮の基準';
-  const past = rec ? `過去の自信度${c.tier}のレース（${rec.races}R）では、本命の勝率${pct(rec.pick_win_rate, 0)}・3着内率${pct(rec.pick_top3_rate, 0)}でした。`
-    : `自信度${c.tier}のレースの結果はまだありません。`;
-  return `<p class="conf-line">${confidenceBadge(c)} 本命 ${c.pick_horse_number}番（勝率${pct(c.pick_win_probability)}・3着内${pct(c.pick_top3_probability)}）。${past}
-    <span class="muted small">（勝率の偏り ${(c.value * 100).toFixed(0)}。${basis}）</span></p>`;
+  const past = rec ? `この画面での記録では${rec.races}Rで勝率${pct(rec.pick_win_rate, 0)}・3着内率${pct(rec.pick_top3_rate, 0)}。`
+    : '';
+  return `<p class="conf-line">${confidenceBadge(c)} 本命 ${c.pick_horse_number}番（勝率${pct(c.pick_win_probability)}・3着内${pct(c.pick_top3_probability)}）。
+    2025年の検証では、自信度${c.tier}のレースの本命は勝率${pct(e.pick_win_rate, 0)}・3着内率${pct(e.pick_top3_rate, 0)}。${past}
+    <span class="muted small">（本命の勝率が${pct(c.thresholds[1], 0)}以上でA、${pct(c.thresholds[0], 0)}未満でC。
+    当たりやすさの目安で、回収率が高いという意味ではありません）</span></p>`;
 }
 
 function ticketChip(t) {

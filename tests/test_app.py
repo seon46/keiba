@@ -67,7 +67,8 @@ class AppTests(unittest.TestCase):
         for number, probability in win.items():
             self.assertAlmostEqual(single.get(str(number), 0), probability, delta=.1)  # the card used 256 samples
         self.assertIn(bets['confidence']['tier'], 'ABC')
-        self.assertEqual(bets['confidence']['basis'], 'default')
+        self.assertEqual(bets['confidence']['basis'], 'evaluation')
+        self.assertIn('pick_top3_rate', bets['confidence']['expected'])
         marks = engine.day_confidence(day)
         self.assertEqual(set(marks), {race_id})
         self.assertEqual(marks[race_id]['tier'], bets['confidence']['tier'])
