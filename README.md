@@ -726,6 +726,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-app.ps1
 ```
 
+学習に使う期間の始まりは `pipeline_v4 fit --train-start 日付`（既定: 2022-04-01）で変えられます。毎晩の学習し直しで使う開始日は `keiba_app init ... --train-start 日付 --data-start 日付` で設定します。データを過去に足したときは、DBの最初の日から半年ほど後を学習開始日にします（過去の成績から作る特徴量が揃うまでの期間）。
+
 毎晩の自動処理・`pipeline_v4`・`experiment_*` は、CPUとディスクの優先度を下げて動きます（画面や1レースの処理が先に進みます。何も動いていなければ速さはほぼ同じです）。通常の優先度で動かすには、先に `$env:KEIBA_PRIORITY = "normal"` を実行します。
 
 毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 新しい馬の血統の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
