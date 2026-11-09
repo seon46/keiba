@@ -38,6 +38,11 @@ def main(argv=None):
     predict.add_argument('--race-id', required=True)
     predict.add_argument('--refresh', action='store_true', help='出馬表を取り直します')
     commands.add_parser('score', help='結果が出たレースの予想を照合します')
+    day = commands.add_parser('day', help='その日の全レースを予想して記録します（画面の「この日の全レースを予想」）')
+    day.add_argument('--date', required=True)
+    day.add_argument('--no-refresh', action='store_true', help='保存済みの出馬表を使います')
+    discover = commands.add_parser('discover', help='その日のレース一覧を取得します')
+    discover.add_argument('--date', required=True)
     args = parser.parse_args(argv)
     app = App(args.data_dir)
     try:
@@ -79,6 +84,19 @@ def main(argv=None):
                      win=runner.get('win_probability'), top3=runner.get('top3_probability'),
                      expected_rank=runner.get('expected_rank'))
             emit(event='predicted', prediction_id=identifier)
+        elif args.command in ('day', 'discover'):
+            from keiba_ai.priority import background
+            from .engine import Engine
+            background()  # the app that started this job answers first
+            engine = Engine(app)
+            if args.command == 'day':
+                result = engine.predict_day(args.date, refresh=not args.no_refresh,
+                                            progress=lambda **message: emit(event='progress', **message))
+                emit(event='result', result=dict(predicted=len(result['predicted']), skipped=result['skipped']))
+            else:
+                races = engine.discover(args.date)
+                counts = {region: sum(race['region'] == region for race in races) for region in ('central', 'local')}
+                emit(event='result', result=dict(races=len(races), counts=counts, errors=engine.discover_errors))
         elif args.command == 'score':
             from .engine import Engine
             emit(event='scored', counts=Engine(app).score_pending())

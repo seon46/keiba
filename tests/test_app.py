@@ -250,3 +250,40 @@ class AppTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ChildJobTests(unittest.TestCase):
+    """Whole-day jobs run as ``python -m keiba_app ...``; the job follows its progress / result / error lines."""
+
+    def _api(self, directory, lines, code=0):
+        import os
+        import sys
+        from keiba_app.server import Api
+        from keiba_app.state import App
+        stub = Path(directory) / 'stub.py'
+        stub.write_text('import sys\n' + ''.join(f'print({line!r}, flush=True)\n' for line in lines)
+                        + f'sys.exit({code})\n', encoding='utf-8')
+        python = Path(directory) / ('python.cmd' if os.name == 'nt' else 'python')
+        if os.name == 'nt':
+            python.write_text(f'@"{sys.executable}" "{stub}"\r\n', encoding='utf-8')
+        else:
+            python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{stub}"\n', encoding='utf-8')
+            python.chmod(0o755)
+        return Api(App(Path(directory) / 'data', home=Path(directory) / 'home'), engine=object(), python=str(python),
+                   separate=True)
+
+    def test_progress_and_result(self):
+        with TemporaryDirectory() as directory:
+            api = self._api(directory, ['not json', json.dumps({'event': 'progress', 'message': '出馬表を取得中 1/2'}),
+                                        json.dumps({'event': 'result', 'result': {'predicted': 2, 'skipped': []}})])
+            seen = []
+            self.assertEqual(api._child(['day', '--date', '2026-11-09'], lambda **m: seen.append(m['message'])),
+                             {'predicted': 2, 'skipped': []})
+            self.assertEqual(seen, ['出馬表を取得中 1/2'])
+
+    def test_error_message_is_raised(self):
+        with TemporaryDirectory() as directory:
+            api = self._api(directory, [json.dumps({'event': 'error', 'message': 'レース一覧を読めません'}, ensure_ascii=False)],
+                            code=2)
+            with self.assertRaisesRegex(ValueError, 'レース一覧を読めません'):
+                api._child(['discover', '--date', '2026-11-09'], lambda **m: None)

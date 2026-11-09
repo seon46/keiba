@@ -726,6 +726,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-app.ps1
 ```
 
+画面の「この日の全レースを予想」と「レース一覧を取得」は、アプリとは別のプロセス（`keiba_app day --date 日付`・`keiba_app discover --date 日付`、手でも実行できます）で、低い優先度で動きます。
+
 毎晩の自動処理・`pipeline_v4`・`experiment_*` は、CPUとディスクの優先度を下げて動きます（画面や1レースの処理が先に進みます。何も動いていなければ速さはほぼ同じです）。通常の優先度で動かすには、先に `$env:KEIBA_PRIORITY = "normal"` を実行します。
 
 毎晩の自動処理（`keiba_app nightly`）は、前回の続きから昨日までの成績の収集 → 新しい馬の血統の収集 → 全期間のCSV出力とprepare（新しいフォルダーに作成してから切り替え） → 予想の照合 → 7日ごとの学習し直し（健全性を確認してから切り替え） → 当日の全レースの先行予想、の順に実行します。画面の「状態」から手動でも実行できます。データは `data\app\` に保存します（`state.json`、予想の記録 `app.sqlite3`、DB・モデルの世代、ログ）。
