@@ -621,6 +621,7 @@ def main(argv=None):
     fitting.add_argument('--race-db', required=True, type=Path, help='血統を収集した data\\keiba.sqlite3')
     fitting.add_argument('--output-dir', required=True, type=Path)
     fitting.add_argument('--train-end', help='この日より前で学習（既定: データ最終日の翌日）')
+    fitting.add_argument('--train-start', help='この日以降で学習（既定: 2022-04-01。DBの最初の日から半年ほど後にします）')
     fitting.add_argument('--evaluate-until', help='train-end以降、この日より前を評価')
     fitting.add_argument('--allow-test-period', action='store_true')
     fitting.add_argument('--groups', nargs='+', default=list(GROUPS), choices=list(GROUPS))
@@ -650,7 +651,8 @@ def main(argv=None):
             summary = fit(args.dataset, args.race_db, args.output_dir, train_end=args.train_end,
                           evaluate_until=args.evaluate_until, allow_test_period=args.allow_test_period,
                           groups=args.groups, threads=args.threads, device=args.device, rounds=args.rounds,
-                          patience=args.patience, evaluation_samples=args.evaluation_samples, report=emit)
+                          patience=args.patience, evaluation_samples=args.evaluation_samples, report=emit,
+                          **({'train_start': args.train_start} if args.train_start else {}))
             emit(event='fit_complete', model=str(args.output_dir / 'model.json'), train_end=summary['train_end'],
                  seconds=summary['seconds'])
         else:

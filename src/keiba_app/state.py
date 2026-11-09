@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 
 JST = timezone(timedelta(hours=9))
-DEFAULTS = dict(dataset=None, model_dir=None, collected_through=None, data_start='2021-10-11',
+DEFAULTS = dict(dataset=None, model_dir=None, collected_through=None, data_start='2021-10-11', train_start=None,
                 last_fit=None, retrain_days=7, threads=2, keep_databases=2, keep_models=3)
 
 

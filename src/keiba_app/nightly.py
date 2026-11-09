@@ -241,6 +241,8 @@ def run_nightly(app: App, *, force_fit=False, only=None, skip=(), python=None, e
                     output = app.home / 'models' / stamp
                     if (model or {}).get('pipeline') == 'v4-pipeline-1':
                         command = ['keiba_ai.pipeline_v4', 'fit', '--race-db', app.scraper_db]
+                        if state.get('train_start'):
+                            command += ['--train-start', state['train_start']]
                     else:
                         command = ['keiba_ai.pipeline_v3', 'fit']
                     code = subprocess_run([python, '-X', 'utf8', '-m', *command, '--dataset', state['dataset'],
