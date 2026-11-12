@@ -52,6 +52,10 @@ class PipelineV4Tests(unittest.TestCase):
                 self.assertGreater(table['overall']['races'], 10)
                 self.assertIn('concentration', table['candidates'])
                 self.assertIn('learned_top3', table['candidates'])
+                for name in ('order_certainty', 'trio_certainty', 'pick_top3_prob', 'learned_overall_internal'):
+                    self.assertIn(name, table['candidates'])
+                    self.assertIn('spearman_order_skill', table['candidates'][name])
+                self.assertIsNotNone(table['overall']['order_skill'])
                 self.assertEqual([tier['tier'] for tier in table['candidates']['concentration']['tiers']], ['A', 'B', 'C'])
             self.assertTrue((root / 'confidence' / 'races_local_flat.csv').is_file())
 
