@@ -124,12 +124,40 @@ def _pick(row, fields):
 
 
 class Api:
-    def __init__(self, app: App, engine: Engine | None = None, python=None):
+    def __init__(self, app: App, engine: Engine | None = None, python=None, separate=None):
         self.app = app
+        # Whole-day jobs run in their own low-priority process (``keiba_app day`` / ``discover``) so pages and
+        # one-race jobs keep the CPU and disk; with an injected engine (tests) they run in this process instead.
+        self.separate = engine is None if separate is None else separate
         self.engine = engine or Engine(app)
         self.jobs = Jobs()
         self.python = python or sys.executable
         self.nightly_process = None
+
+    def _child(self, arguments, progress):
+        """Run ``python -m keiba_app <arguments>``; its {"event": "progress"} lines update the job, and its
+        {"event": "result"} line is returned.  A failure raises with the child's own error message."""
+        command = [self.python, '-X', 'utf8', '-m', 'keiba_app', '--data-dir', str(self.app.data_dir), *arguments]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                   text=True, encoding='utf-8', errors='replace')
+        result, error = None, None
+        for line in process.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            if message.get('event') == 'progress':
+                progress(message=str(message.get('message') or '実行中'))
+            elif message.get('event') == 'result':
+                result = message.get('result')
+            elif message.get('event') == 'error':
+                error = str(message.get('message') or '')
+        code = process.wait()
+        if code != 0 or result is None:
+            raise ValueError(error or f'処理が終了コード{code}で止まりました。')
+        return result
 
     # -- GET ---------------------------------------------------------------
     def status(self, _query):
@@ -260,6 +288,8 @@ class Api:
 
         def work(progress):
             progress(message='レース一覧を取得中')
+            if self.separate:
+                return self._child(['discover', '--date', day], progress)
             races = self.engine.discover(day)
             counts = {region: sum(race['region'] == region for race in races) for region in ('central', 'local')}
             return dict(races=len(races), counts=counts, errors=self.engine.discover_errors)
@@ -269,7 +299,10 @@ class Api:
         day = body.get('date') or today()
 
         def work(progress):
-            result = self.engine.predict_day(day, refresh=bool(body.get('refresh', True)), progress=progress)
+            refresh = bool(body.get('refresh', True))
+            if self.separate:
+                return self._child(['day', '--date', day] + ([] if refresh else ['--no-refresh']), progress)
+            result = self.engine.predict_day(day, refresh=refresh, progress=progress)
             return dict(predicted=len(result['predicted']), skipped=result['skipped'])
         return self.jobs.submit('day', f'{day}の全レース', work, date=day)
 
