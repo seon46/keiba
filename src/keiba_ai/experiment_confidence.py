@@ -19,8 +19,20 @@ Candidates (computed per race, all available before the start when odds are fetc
   market_agree    the model's pick is the favourite (0/1)
   edge_max        highest win probability x odds in the race
   learned_*       cross-fitted (by month) models over all of the above
+  pick_top3_prob  the pick's top-3 probability from the rank distribution
+  order_certainty 1 - entropy(top-3 finishing order) / log(n(n-1)(n-2)): the model's own expected order skill
+  trio_certainty  the same for the unordered top-3 set (三連複)
+  few_starts_share share of starters with at most two previous starts
+  learned_overall_internal / learned_top3_internal  cross-fitted models over the candidates that need no odds
 Outcomes: pick wins, pick top 3, race log loss, and 単勝 returns of: the model's pick, the
 favourite, and every horse with probability x odds >= 1.0 / 1.2 / 1.5.
+Whole-race outcomes ("how good was the prediction of the race", independent of the field size):
+  order_skill     1 - (-log P(actual 1st-2nd-3rd)) / log(n(n-1)(n-2))   (1 = certain and right, 0 = no better
+                  than equal chances, negative = worse)
+  trio_skill      the same for the actual top-3 set and log C(n, 3)
+  top3_hits       how many of the predicted top three (by top-3 probability) finished in the top three
+The top-3 order probabilities are exact for the staged Plackett-Luce model the rank distribution samples
+(score / temperature of each position); non-finishing is ignored there.
 """
 from __future__ import annotations
 
@@ -34,11 +46,16 @@ import time
 import numpy as np
 
 CANDIDATES = ('concentration', 'top_win', 'margin', 'disagree_rank', 'disagree_pick', 'disagree_kl', 'spread',
-              'unknown_share', 'field_size', 'market_kl', 'market_agree', 'edge_max')
+              'unknown_share', 'field_size', 'market_kl', 'market_agree', 'edge_max', 'pick_top3_prob',
+              'order_certainty', 'trio_certainty', 'few_starts_share')
+MARKET = ('market_kl', 'market_agree', 'edge_max')
+INTERNAL = tuple(name for name in CANDIDATES if name not in MARKET)
+LEARNED = ('learned_top3', 'learned_value', 'learned_top3_internal', 'learned_overall_internal')
 # The direction in which the candidate is expected to mean "more confident" (the tier table is ordered by it).
 CONFIDENT_WHEN_HIGH = dict(concentration=True, top_win=True, margin=True, disagree_rank=False, disagree_pick=False,
                            disagree_kl=False, spread=False, unknown_share=False, field_size=False, market_kl=True,
-                           market_agree=True, edge_max=True)
+                           market_agree=True, edge_max=True, pick_top3_prob=True, order_certainty=True,
+                           trio_certainty=True, few_starts_share=False)
 THRESHOLDS = (1.0, 1.2, 1.5)
 
 
@@ -46,6 +63,55 @@ def _kl(p, q):
     p, q = np.clip(p, 1e-9, 1), np.clip(q, 1e-9, 1)
     p, q = p / p.sum(), q / q.sum()
     return float((p * np.log(p / q)).sum())
+
+
+def top3_orders(scores, temperatures):
+    """P[i, j, k] that i, j, k finish 1st, 2nd, 3rd under the staged Plackett-Luce model (zero on repeats)."""
+    from .ranking_v3 import stage_temperatures
+    scores = np.asarray(scores, dtype=float)
+    n = len(scores)
+    t = stage_temperatures(temperatures, n)
+    scores = scores - scores.max()
+
+    def weights(position):
+        return np.exp(scores / t[position])
+    w1, w2, w3 = weights(0), weights(1), weights(2)
+    eye = np.eye(n, dtype=bool)
+    first = w1 / w1.sum()
+    second = np.where(eye, 0.0, w2[None, :]) / (w2.sum() - w2)[:, None]       # [i, j]
+    rest3 = w3.sum() - w3[:, None] - w3[None, :]                               # [i, j]
+    third = w3[None, None, :] / np.where(eye, np.inf, rest3)[:, :, None]       # [i, j, k]
+    distinct = ~(eye[:, :, None] | eye[:, None, :] | eye[None, :, :])
+    return first[:, None, None] * second[:, :, None] * np.where(distinct, third, 0.0)
+
+
+def _entropy(p):
+    p = p[p > 0]
+    return float(-(p * np.log(p)).sum())
+
+
+def order_measures(scores, temperatures, positions):
+    """(order_certainty, trio_certainty, order_skill, trio_skill) of one race; skills are None without a clean
+    1st-2nd-3rd."""
+    n = len(scores)
+    orders = top3_orders(scores, temperatures)
+    log_orders = math.log(n * (n - 1) * (n - 2))
+    log_trios = math.log(n * (n - 1) * (n - 2) / 6)
+    trios = {}
+    i, j, k = np.nonzero(orders)
+    for a, b, c, value in zip(i, j, k, orders[i, j, k]):
+        key = tuple(sorted((a, b, c)))
+        trios[key] = trios.get(key, 0.0) + value
+    trio_values = np.fromiter(trios.values(), dtype=float)
+    order_certainty = 1 - _entropy(orders.ravel()) / log_orders
+    trio_certainty = 1 - _entropy(trio_values) / log_trios
+    placed = [np.flatnonzero(positions == place) for place in (1, 2, 3)]
+    if any(len(horses) != 1 for horses in placed):
+        return order_certainty, trio_certainty, None, None
+    a, b, c = (int(horses[0]) for horses in placed)
+    order_skill = 1 + math.log(max(orders[a, b, c], 1e-300)) / log_orders
+    trio_skill = 1 + math.log(max(trios.get(tuple(sorted((a, b, c))), 0.0), 1e-300)) / log_trios
+    return order_certainty, trio_certainty, order_skill, trio_skill
 
 
 def _spearman(a, b):
@@ -109,6 +175,9 @@ def race_table(model_dir, dataset, group, *, samples=2048, seed=42, report=None)
         log_loss = float(-np.log(np.clip(dist[np.arange(n), np.minimum(outcome, dist.shape[1] - 1)], 1e-12, 1)).mean())
         pick = int(np.argmax(win))
         ordered = np.sort(win)[::-1]
+        top3_probability = dist[:, :3].sum(axis=1)
+        predicted = np.argsort(-top3_probability, kind='stable')[:3]
+        order_certainty, trio_certainty, order_skill, trio_skill = order_measures(d, temperatures['model'], positions)
         normalized = win / win.sum()
         entry = dict(group=group, race_id=race_id, race_date=members[0]['race_date'], month=members[0]['race_date'][:7],
                      starters=n, log_loss=log_loss,
@@ -118,7 +187,11 @@ def race_table(model_dir, dataset, group, *, samples=2048, seed=42, report=None)
                      disagree_rank=1 - _spearman(b, nn), disagree_pick=float(np.argmax(b) != np.argmax(nn)),
                      disagree_kl=(_kl(win_b, win_nn) + _kl(win_nn, win_b)) / 2,
                      spread=float(sd.mean() / max(np.std(d), 1e-6)),
-                     unknown_share=float(np.mean(~(known > 0))), field_size=float(n))
+                     unknown_share=float(np.mean(~(known > 0))), field_size=float(n),
+                     pick_top3_prob=float(top3_probability[pick]), order_certainty=order_certainty,
+                     trio_certainty=trio_certainty, few_starts_share=float(np.mean(~(known > 2))),
+                     order_skill=order_skill, trio_skill=trio_skill,
+                     top3_hits=float(sum(0 < positions[horse] <= 3 for horse in predicted)))
         priced = np.isfinite(race_odds) & (race_odds > 0)
         if priced.all():
             market = (1 / race_odds) / (1 / race_odds).sum()
@@ -140,11 +213,30 @@ def race_table(model_dir, dataset, group, *, samples=2048, seed=42, report=None)
 
 def _learned(table, rng_seed=42):
     """Cross-fitted (leave one month out) scores: probability that the pick finishes top 3, and
-    the expected 単勝 value-bet profit of the race."""
+    the expected 単勝 value-bet profit of the race; plus, from the candidates that need no odds, the pick's
+    top-3 chance and the expected whole-race order skill."""
     from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
     features = np.asarray([[entry.get(name, np.nan) for name in CANDIDATES] for entry in table], dtype=float)
+    internal = np.asarray([[entry.get(name, np.nan) for name in INTERNAL] for entry in table], dtype=float)
     months = np.asarray([entry['month'] for entry in table])
     top3 = np.asarray([entry['pick_top3'] for entry in table])
+    skill = np.asarray([np.nan if entry.get('order_skill') is None else entry['order_skill'] for entry in table])
+    top3_internal = np.full(len(table), np.nan)
+    overall_internal = np.full(len(table), np.nan)
+    for month in sorted(set(months.tolist())):
+        test, train = months == month, months != month
+        classifier = HistGradientBoostingClassifier(max_iter=200, learning_rate=.05, max_leaf_nodes=15,
+                                                    l2_regularization=1.0, random_state=rng_seed)
+        classifier.fit(internal[train], top3[train])
+        top3_internal[test] = classifier.predict_proba(internal[test])[:, 1]
+        usable = train & np.isfinite(skill)
+        regressor = HistGradientBoostingRegressor(max_iter=200, learning_rate=.05, max_leaf_nodes=15,
+                                                  l2_regularization=1.0, random_state=rng_seed)
+        regressor.fit(internal[usable], skill[usable])
+        overall_internal[test] = regressor.predict(internal[test])
+    for entry, a, b in zip(table, top3_internal, overall_internal):
+        entry['learned_top3_internal'] = float(a)
+        entry['learned_overall_internal'] = float(b)
     profit = np.asarray([entry.get('value1.2_return', np.nan) - entry.get('value1.2_cost', np.nan) for entry in table])
     learned_top3 = np.full(len(table), np.nan)
     learned_value = np.full(len(table), np.nan)
@@ -181,6 +273,24 @@ def _roi(entries, name, rng, boot=400):
                 ci=[round(float(np.quantile(draws, .025)), 4), round(float(np.quantile(draws, .975)), 4)])
 
 
+def _whole_race(entries):
+    """Means of the whole-race outcomes (races without a clean 1st-2nd-3rd are left out of the skills)."""
+    result = {}
+    for key in ('order_skill', 'trio_skill', 'top3_hits'):
+        values = [e[key] for e in entries if e.get(key) is not None]
+        result[key] = round(float(np.mean(values)), 4) if values else None
+    return result
+
+
+def _signed_spearman(values, entries, key, sign):
+    from scipy.stats import spearmanr
+    outcome = np.asarray([np.nan if e.get(key) is None else e[key] for e in entries], dtype=float)
+    keep = np.isfinite(outcome)
+    if keep.sum() < 3 or np.std(values[keep]) == 0 or np.std(outcome[keep]) == 0:
+        return None
+    return round(float(sign * spearmanr(values[keep], outcome[keep]).statistic), 4)
+
+
 def summarize(table, candidates, *, tiers=3, seed=42):
     from scipy.stats import spearmanr
     rng = np.random.default_rng(seed)
@@ -188,6 +298,7 @@ def summarize(table, candidates, *, tiers=3, seed=42):
     overall = dict(races=len(table), pick_win=float(np.mean([e['pick_win'] for e in table])),
                    pick_top3=float(np.mean([e['pick_top3'] for e in table])),
                    log_loss=float(np.mean([e['log_loss'] for e in table])),
+                   **_whole_race(table),
                    roi={name: _roi(table, name, rng) for name in bets})
     result = dict(overall=overall, candidates={})
     for name in candidates:
@@ -208,6 +319,7 @@ def summarize(table, candidates, *, tiers=3, seed=42):
                              pick_win=round(float(np.mean([e['pick_win'] for e in part])), 4),
                              pick_top3=round(float(np.mean([e['pick_top3'] for e in part])), 4),
                              log_loss=round(float(np.mean([e['log_loss'] for e in part])), 4),
+                             value_mean=round(float(values[chunk].mean()), 4), **_whole_race(part),
                              roi={bet: _roi(part, bet, rng) for bet in bets}))
         sign = 1 if high else -1
         outcome = [e['pick_top3'] for e in entries]
@@ -215,6 +327,9 @@ def summarize(table, candidates, *, tiers=3, seed=42):
                        if np.std(values) > 0 and np.std(outcome) > 0 else None)
         result['candidates'][name] = dict(confident_when_high=high,
                                           spearman_pick_top3=None if correlation is None else round(correlation, 4),
+                                          spearman_order_skill=_signed_spearman(values, entries, 'order_skill', sign),
+                                          spearman_trio_skill=_signed_spearman(values, entries, 'trio_skill', sign),
+                                          spearman_top3_hits=_signed_spearman(values, entries, 'top3_hits', sign),
                                           tiers=rows)
     return result
 
@@ -229,7 +344,7 @@ def run(model_dir, dataset, output, *, groups=('central_flat', 'local_flat'), sa
         report(event='group', group=group)
         table = race_table(model_dir, dataset, group, samples=samples, report=report)
         _learned(table)
-        summary['groups'][group] = summarize(table, CANDIDATES + ('learned_top3', 'learned_value'))
+        summary['groups'][group] = summarize(table, CANDIDATES + LEARNED)
         with (output / f'races_{group}.csv').open('w', encoding='utf-8', newline='') as file:
             writer = csv.DictWriter(file, fieldnames=sorted({key for entry in table for key in entry}))
             writer.writeheader()
