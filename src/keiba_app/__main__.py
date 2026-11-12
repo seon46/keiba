@@ -24,6 +24,7 @@ def main(argv=None):
     init.add_argument('--collected-through', help='収集済みの最終日（既定: DBのデータ最終日）')
     init.add_argument('--data-start', help='学習データの開始日（既定: 2021-10-11）')
     init.add_argument('--threads', type=int)
+    init.add_argument('--train-start', help='毎晩の学習し直しで使う学習開始日（既定: 2022-04-01）')
     serve = commands.add_parser('serve', help='ブラウザ用の画面を起動します')
     serve.add_argument('--host', default='127.0.0.1')
     serve.add_argument('--port', type=int, default=8765)
@@ -61,6 +62,8 @@ def main(argv=None):
                 changes['data_start'] = args.data_start
             if args.threads:
                 changes['threads'] = args.threads
+            if args.train_start:
+                changes['train_start'] = args.train_start
             state = app.write_state(**changes)
             emit(event='initialized', state=state, data_last_day=info['last_day'], model_train_end=summary.get('train_end'))
         elif args.command == 'serve':
