@@ -59,6 +59,19 @@ class PipelineV4Tests(unittest.TestCase):
                 self.assertEqual([tier['tier'] for tier in table['candidates']['concentration']['tiers']], ['A', 'B', 'C'])
             self.assertTrue((root / 'confidence' / 'races_local_flat.csv').is_file())
 
+            import sqlite3
+            from keiba_ai.experiment_uncertainty import evaluate_group
+            connection = sqlite3.connect(database)  # the fixture has no odds: give every runner some
+            connection.execute("UPDATE input_rows SET payload_json=json_set(payload_json,'$.odds',"
+                               "1.5 + (abs(random()) % 300) / 10.0)")
+            connection.commit()
+            connection.close()
+            result = evaluate_group(root / 'model', database, 'local_flat')
+            self.assertGreater(result['races'], 10)
+            self.assertEqual(set(result['full_year']), {'model', 'market', 'blend', 'model_uncertain', 'full'})
+            self.assertGreaterEqual(result['full_year']['full']['log_likelihood'],
+                                    result['full_year']['model']['log_likelihood'] - 1e-6)
+
             with (root / 'model' / 'evaluation_local_flat.csv').open(encoding='utf-8') as file:
                 evaluated = list(csv.DictReader(file))
             day = sorted({row['race_date'] for row in evaluated})[3]
