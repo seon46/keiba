@@ -136,3 +136,10 @@ class SegmentTests(unittest.TestCase):
                 with (root / 'model' / f'evaluation_{group}.csv').open(encoding='utf-8') as file:
                     rows = list(csv.DictReader(file))
                 self.assertTrue(all(row['segment'] and row['segmented_score'] for row in rows))
+
+    def test_finisher_rows_of_an_empty_period(self):
+        import numpy as np
+        from keiba_ai.experiment_v3b import _finisher_rows
+        data = dict(finished=np.array([True, True, False]), race_ids=np.array(['a', 'a', 'b']))
+        self.assertEqual(len(_finisher_rows(data, np.zeros(3, dtype=bool))), 0)
+        self.assertEqual(_finisher_rows(data, np.ones(3, dtype=bool)).tolist(), [0, 1])
