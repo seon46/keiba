@@ -642,7 +642,8 @@ async function loadBets(region, raceId, prediction) {
   const holder = walletUser(me);
   const bankrollChoice = store.get('bankroll', holder ? 'wallet' : '50000') === 'wallet' && holder ? 'wallet' : String(betsSettings.bankroll || 50000);
   const linked = bankrollChoice === 'wallet';
-  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}|${bankrollChoice}|${holder ? holder.login + ':' + holder.balance + ':' + holder.kelly_fraction : ''}`;
+  const blend = store.get('blend', '1') !== '0';
+  const key = `${prediction.id}|${blend}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}|${bankrollChoice}|${holder ? holder.login + ':' + holder.balance + ':' + holder.kelly_fraction : ''}`;
   let data = betsCache.get(key);
   const box = () => view.querySelector('#bets');
   const select = (id, values, current, label) => `<label class="small">${label}
@@ -652,6 +653,7 @@ async function loadBets(region, raceId, prediction) {
       ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
       ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '1レースの上限')}
       ${select('bankroll', [...(holder ? [['wallet', `${holder.name}さんの残高に連動`]] : []), [10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], bankrollChoice, '資金')}
+      <label class="small" title="モデルの確率と単勝オッズを、2025年の検証で最もよく当たった重みで合わせます"><input type="checkbox" id="blend" ${blend ? 'checked' : ''}> オッズと合わせる</label>
       <span class="spacer"></span>
       ${partial ? '<span class="small muted">地方の3連複・3連単は、予想してからオッズを取得すると、確率の高い軸3頭の分を取ります</span>' : ''}
       <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
@@ -662,6 +664,7 @@ async function loadBets(region, raceId, prediction) {
     box().querySelector('#max-points').addEventListener('change', reload('maxPoints'));
     box().querySelector('#budget').addEventListener('change', reload('budget'));
     box().querySelector('#bankroll').addEventListener('change', reload('bankroll'));
+    box().querySelector('#blend').addEventListener('change', (e) => { store.set('blend', e.target.checked ? '1' : '0'); loadBets(region, raceId, prediction); });
     box().querySelector('#odds')?.addEventListener('click', async (event) => {
       event.target.disabled = true;
       try {
@@ -671,7 +674,7 @@ async function loadBets(region, raceId, prediction) {
   };
   if (!data) {
     try {
-      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}&bankroll=${linked ? 50000 : bankrollChoice}${linked ? `&wallet=1&user=${encodeURIComponent(holder.login)}` : ''}`);
+      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}&blend=${blend ? 1 : 0}&bankroll=${linked ? 50000 : bankrollChoice}${linked ? `&wallet=1&user=${encodeURIComponent(holder.login)}` : ''}`);
       betsCache.set(key, data);
     } catch (e) {
       if (box()) {
@@ -693,6 +696,7 @@ async function loadBets(region, raceId, prediction) {
     ${controls(odds, data.odds_partial)}
     ${data.budget_capped ? '<p class="small notice-text">1レースの上限が資金以上なので、資金までの金額で計算しています。</p>' : ''}
     ${bankrollText(data.bankroll_source, data.bankroll)}
+    ${blendText(data.blend, !!odds)}
     <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
       ${hasEv ? '「資金の伸び」は、同じような買い方を続けたときに1レースあたり資金が平均で何%増えるか（対数成長率）で、高い順に並べています。合計金額は、資金がいちばん速く増える額（ケリー基準）を1レースの上限までで選んでいます。どれが当たっても払戻がほぼ同じになる配分で、当たっても損になる買い方は出しません。マイナスは、モデルの確率では買わない方が良いという意味です。資金は、競馬に使うと決めているお金の全体額です。金額は資金に比例します。モデルの確率は高めに出やすいので、資金を実際より少なめ（例：半分）にすると控えめな金額になります。資金のページで残高を記録していれば、「残高に連動」で残高×ケリー係数を資金にします。' : odds ? '' : 'オッズを取得すると、資金の伸びが一番大きい買い方と金額を出します。'}
       ${data.approximate ? 'この予想は温度の記録がない古い予想のため、確率は近似です。' : ''}</p>
@@ -713,6 +717,12 @@ async function loadBets(region, raceId, prediction) {
     ${holder ? manualBetForm(holder) : ''}`;
   wire();
   if (holder) wireRecording(box(), prediction, data, holder);
+}
+
+function blendText(b, hasOdds) {
+  if (!b || !b.requested) return hasOdds ? '<p class="small notice-text">モデルの確率だけで計算しています。2025年の検証では、モデルだけでケリー基準どおりに単勝を買うと1レースあたり資金が約3.5%ずつ減りました。</p>' : '';
+  if (!b.applied) return hasOdds ? '<p class="small muted">単勝オッズがそろっていない馬がいるため、モデルの確率だけで計算しています。</p>' : '';
+  return `<p class="small muted">確率は、モデルと単勝オッズを合わせたものです（強さ＝${b.a}×モデル＋${b.b}×log オッズの勝率）。2025年の検証では、モデルだけ・オッズだけより1〜3着の並びをよく当て、単勝をケリー基準で買ったときの損も、モデルだけより大幅に小さくなりました（中央で約1/100、地方で約1/20）。ただし、どの設定でも長期的にプラスにはなっていないため、「資金の伸び」がプラスの買い目はまれです。</p>`;
 }
 
 function bankrollText(source, bankroll) {

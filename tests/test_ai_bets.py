@@ -115,5 +115,18 @@ class ConfidenceSummaryTests(unittest.TestCase):
         self.assertGreaterEqual(roi['ci'][1], roi['roi'])
 
 
+
+class MarketBlendTests(unittest.TestCase):
+    def test_blend_uses_relative_temperatures_and_needs_every_runners_odds(self):
+        from keiba_ai.bets import MARKET_BLEND, blend_with_market
+        scores, temperatures = [1.0, 0.0, -1.0], [2.0, 3.0, 4.0]
+        blended, stages = blend_with_market('local', scores, temperatures, [2.0, 4.0, [8.0, 9.0]])
+        inverse = np.asarray([1 / 2, 1 / 4, 1 / 8])
+        expected = MARKET_BLEND['local']['a'] * np.asarray(scores) + MARKET_BLEND['local']['b'] * np.log(inverse / inverse.sum())
+        np.testing.assert_allclose(blended, expected)
+        self.assertEqual(stages, [1.0, 1.5, 2.0])
+        self.assertIsNone(blend_with_market('central', scores, temperatures, [2.0, None, 5.0]))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -282,7 +282,8 @@ class Api:
                     budget = max(100, min(budget, balance // 100 * 100))
                 else:
                     source['too_small'] = True
-        result = self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
+        result = self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll,
+                                  blend=query.get('blend', '1') != '0')
         result['bankroll_source'] = source
         return result
 

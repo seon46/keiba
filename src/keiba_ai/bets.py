@@ -31,6 +31,31 @@ MAX_POINTS = dict(win=2, place=2, bracket=6, quinella=6, wide=5, exacta=8, trio=
 CANDIDATES = 40  # combinations per type considered for proposals
 
 
+# Betting strength = a * model strength + b * log(market win probability), with the model's stage temperatures
+# relative to the first stage (experiment_uncertainty, v4 evaluation year 2025, full-year fit).  The blend beat
+# both the model alone and the market alone on the 1st-2nd-3rd order out of sample in both half-year splits
+# (test log likelihood central -5.910/-6.107 vs model -6.312/-6.445 and market -5.920/-6.122; local -5.011/-5.105
+# vs -5.244/-5.347 and -5.075/-5.157).  Adding noise for the probabilities' uncertainty (constant or NN seed
+# spread) did not improve it, so it is left out.  In the 単勝 Kelly back-test at the final odds the model alone
+# lost about 3.5% of the bankroll per race at full Kelly; the blend lost 0.03% (central) / 0.2% (local): it bets
+# far less, but no setting had a positive edge.
+MARKET_BLEND = {'central': dict(a=.2942, b=.8899), 'local': dict(a=.4991, b=.6561)}
+
+
+def blend_with_market(region, scores, temperatures, win_odds):
+    """(betting strengths, stage temperatures) blending the model with the win odds, or None when any runner's
+    win odds are missing.  ``win_odds`` lines up with ``scores``."""
+    values = [_odds_value(value) for value in win_odds]
+    if not values or any(value is None or value <= 1 for value in values):
+        return None
+    weights = MARKET_BLEND['central' if region == 'central' else 'local']
+    inverse = np.asarray([1 / value for value in values])
+    market = np.log(inverse / inverse.sum())
+    blended = weights['a'] * np.asarray(scores, dtype=float) + weights['b'] * market
+    stages = np.asarray([float(value) for value in temperatures])
+    return blended, list(stages / stages[0])
+
+
 def place_slots(starters):
     """How many places pay for 複勝 (JRA/NAR rule): 3 with 8+ starters, 2 with 5-7, none with 4 or fewer."""
     return 3 if starters >= 8 else 2 if starters >= 5 else 0
