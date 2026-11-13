@@ -316,3 +316,20 @@ pre.log { background: var(--surface); border: 1px solid var(--line); border-radi
 }
 .confident .tiers { white-space: nowrap; }
 .notice-text { color: var(--muted); background: var(--soft); padding: 4px 8px; border-radius: 4px; display: inline-block; }
+
+/* funds */
+.plus { color: var(--turf); } .minus { color: var(--error-ink); }
+:root[data-theme="dark"] .plus, .figure .value.plus { color: var(--bar); }
+svg .balance-area { fill: var(--bar); opacity: .12; }
+svg .dot { fill: var(--bar); }
+button.small-btn { padding: 2px 8px; font-size: 12px; margin: 1px 2px; }
+button.record { padding: 3px 10px; font-size: 13px; white-space: nowrap; }
+button.record.confirm, button.small-btn.confirm { background: var(--hit); border-color: var(--hit); color: #fff; }
+button.link { border: 0; background: none; padding: 0 0 0 4px; color: var(--muted); }
+.ticket.r-hit { outline: 2px solid var(--hit); }
+.ticket.r-refund { opacity: .7; }
+.manual-bet { margin-top: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+.manual-bet summary { cursor: pointer; font-weight: 700; }
+.notice-box { background: var(--warn-bg); color: var(--warn-ink); border-radius: 8px; padding: 4px 14px; }
+input[type="text"], input[type="number"] { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--ink); }

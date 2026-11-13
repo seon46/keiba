@@ -691,3 +691,40 @@ def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
     else:
         raise ParseError(f"未確認の地方オッズのページです: {kind}")
     return dict(race_id=race_id, region="local", status=None, official_at=None, odds=odds, popularity={})
+
+
+_PAYOUT_ROWS = {"Tansho": "win", "Fukusho": "place", "Wakuren": "bracket", "Umaren": "quinella", "Wide": "wide",
+                "Umatan": "exacta", "Fuku3": "trio", "Tan3": "trifecta"}
+_ORDERED_PAYOUTS = {"exacta", "trifecta"}
+
+
+def parse_payouts(html: str) -> dict:
+    """{bet: {ticket key: yen paid per 100 yen}} from a results page's 払戻 tables (central and local alike).
+
+    Keys follow ``keiba_ai.bets.combo_key``: '5', '3-7' (unordered, ascending), '7>3' (ordered).  Each ticket
+    is one ``<ul>`` of horse (or bracket) numbers, or one ``<div>`` slot for 単勝・複勝; the amounts are listed
+    in the same order.  A row whose tickets and amounts do not pair up is left out."""
+    soup = BeautifulSoup(html, "html.parser")
+    payouts = {}
+    for row in soup.select("table.Payout_Detail_Table tr"):
+        bet = next((_PAYOUT_ROWS[name] for name in row.get("class", []) if name in _PAYOUT_ROWS), None)
+        result, paid = row.select_one("td.Result"), row.select_one("td.Payout")
+        if bet is None or result is None or paid is None:
+            continue
+        groups = result.find_all("ul")
+        if groups:
+            tickets = [[span.get_text(strip=True) for span in group.find_all("span")] for group in groups]
+        else:
+            tickets = [[span.get_text(strip=True)] for span in result.find_all("span")]
+        tickets = [[number for number in ticket if number.isdigit()] for ticket in tickets]
+        tickets = [ticket for ticket in tickets if ticket]
+        amounts = [int(value.replace(",", "")) for value in re.findall(r"([\d,]+)円", paid.get_text(" "))]
+        if not tickets or len(tickets) != len(amounts):
+            continue
+        table = payouts.setdefault(bet, {})
+        for ticket, amount in zip(tickets, amounts):
+            numbers = [int(number) for number in ticket]
+            key = (">" if bet in _ORDERED_PAYOUTS else "-").join(
+                str(number) for number in (numbers if bet in _ORDERED_PAYOUTS else sorted(numbers)))
+            table[key] = amount
+    return payouts

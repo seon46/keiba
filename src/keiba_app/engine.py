@@ -10,6 +10,7 @@ import threading
 from .logbook import Logbook
 from .sources import SavedRaces, Scraper, course_of, entries_from_results, race_number_of
 from .state import JST, App, now, today
+from .wallet import Wallet
 
 UNSUPPORTED = 'このレースは対象外です（中央・地方の平地のみ予想します）。'
 
@@ -38,6 +39,7 @@ class Engine:
     def __init__(self, app: App, *, scraper=None, samples=4096, report=None):
         self.app = app
         self.logbook = Logbook(app.logbook_path)
+        self.wallet = Wallet(app.logbook_path)
         self.saved = SavedRaces(app.scraper_db)
         self.scraper = scraper or Scraper(app.data_dir)
         self.samples = samples
@@ -278,6 +280,9 @@ class Engine:
         # outcomes scored before the final win odds were kept: score them again so the records can show returns
         for identifier in self.logbook.scored_without_odds():
             self.score(identifier)
+        settled = self.wallet.settle(self.saved)  # users' recorded bets of races with saved payouts
+        if settled:
+            counts['bets_settled'] = settled
         return counts
 
 

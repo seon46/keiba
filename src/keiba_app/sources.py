@@ -91,6 +91,31 @@ class SavedRaces:
             connection.close()
         return sorted(candidates - known)
 
+    def payouts(self, region, race_id):
+        """({bet: {ticket key: yen per 100}}, race metadata) from the latest saved results page, or (None, None).
+
+        Read from the saved page itself, so results saved before payouts were read work too."""
+        import gzip
+        from keiba_scraper.parsers import parse_payouts
+        if not self.database.exists():
+            return None, None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                'SELECT r.metadata_json,o.raw_path,o.encoding FROM races r JOIN observations o ON o.id=r.snapshot_id '
+                "WHERE r.region=? AND r.race_id=? AND r.page='results' ORDER BY o.retrieved_at DESC,o.rowid DESC LIMIT 1",
+                (region, race_id)).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None, None
+        try:
+            html = gzip.decompress((self.database.parent / row['raw_path']).read_bytes()).decode(
+                row['encoding'] or 'utf-8', errors='replace')
+        except OSError:
+            return None, json.loads(row['metadata_json'])
+        return parse_payouts(html), json.loads(row['metadata_json'])
+
     def odds(self, region, race_id):
         """The latest saved odds of the race ({odds: {bet: {key: value}}, retrieved_at, status, official_at}) or None."""
         if not self.database.exists():

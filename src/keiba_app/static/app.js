@@ -152,6 +152,7 @@ async function route() {
     if (page === 'race') await raceView(parts[1], parts[2]);
     else if (page === 'records') await recordsView();
     else if (page === 'status') await statusView();
+    else if (page === 'funds') await fundsView();
     else if (page === 'jobs') await jobsView();
     else await dayView(parts[1] || store.get('day', todayJst()));
   } catch (error) {
@@ -552,6 +553,24 @@ const betsSettings = {
   get bankroll() { return Number(store.get('bankroll', '50000')); },
 };
 
+// ---------------------------------------------------------------- users
+// Who is using the page (Tailscale login, or this PC = administrator) and whose bankroll the bets use.
+let meInfo = null;
+async function getMe(force) {
+  if (!force && meInfo && Date.now() - meInfo.at < 30000) return meInfo.data;
+  const data = await api('me');
+  meInfo = {at: Date.now(), data};
+  return data;
+}
+function walletUser(me) {
+  if (!me || !me.users.length) return null;
+  if (me.admin) return me.users.find((u) => u.login === store.get('walletUser', '')) || me.users.find((u) => u.login === me.login) || me.users[0];
+  return me.users.find((u) => u.login === me.login) || null;
+}
+const yen = (v) => (v == null ? '–' : `${Math.round(v).toLocaleString()}円`);
+const signedYen = (v) => (v == null ? '–' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(Math.round(v)).toLocaleString()}円`);
+const BET_NAMES = {win: '単勝', place: '複勝', bracket: '枠連', quinella: '馬連', wide: 'ワイド', exacta: '馬単', trio: '3連複', trifecta: '3連単'};
+
 function ticketLabel(key) {
   return key.replace(/>/g, '→');
 }
@@ -599,34 +618,40 @@ function growthText(rate) {
 }
 
 // Mixes of two or three bet types: any ticket that hits alone still covers the total.
-function mixesTable(mixes, hasOdds) {
+function mixesTable(mixes, hasOdds, recordable) {
   if (!hasOdds) return '';
   if (!mixes.length) return '<h3 class="mix-title">組み合わせの提案</h3><p class="muted small">この条件で、当たっても損にならない組み合わせはありません。</p>';
   return `<h3 class="mix-title">組み合わせの提案</h3>
     <p class="small muted">券種をまたいで買う提案です。当たりやすい券種と、当たりにくいが配当の大きい券種も組み合わせます。どの買い目が1つだけ当たっても合計金額以上が戻る配分で、複数当たれば払戻は足し算になります。的中率は「どれかが当たる確率」で、資金の伸びの高い順です。</p>
     <div class="list-wrap"><table class="list bets-table mixes">
-      <thead><tr><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num" title="1レースあたりの資金の対数成長率">資金の伸び</th><th class="num opt">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
-      <tbody>${mixes.map((m) => `<tr class="${m.growth > 0 ? 'good' : ''}">
+      <thead><tr><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num" title="1レースあたりの資金の対数成長率">資金の伸び</th><th class="num opt">期待値</th><th class="num opt">的中時の払戻</th>${recordable ? '<th class="nosort"></th>' : ''}</tr></thead>
+      <tbody>${mixes.map((m, index) => `<tr class="${m.growth > 0 ? 'good' : ''}">
         <td>${m.parts.map((part) => `<div class="mix-part"><span class="bet-name">${esc(part.name)}</span><div class="tickets">${part.tickets.map(ticketChip).join('')}</div></div>`).join('')}</td>
         <td class="num opt">${m.cost.toLocaleString()}円<div class="small muted">${m.points}点</div></td>
         <td class="num prob">${pct(m.hit_rate)}</td>
         <td class="num" data-value="${m.growth}">${growthText(m.growth_rate)}</td>
         <td class="num opt">${pct(m.expected_return, 0)}</td>
         <td class="num opt">${m.min_payout.toLocaleString()}〜${m.max_payout.toLocaleString()}円<div class="small muted">+${(m.min_payout - m.cost).toLocaleString()}円〜</div></td>
+        ${recordable ? `<td><button type="button" class="record" data-kind="mix" data-index="${index}">買った</button></td>` : ''}
       </tr>`).join('')}</tbody></table></div>`;
 }
 
 async function loadBets(region, raceId, prediction) {
-  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}|${betsSettings.bankroll}`;
+  let me = null;
+  try { me = await getMe(); } catch (e) { /* proposals work without users */ }
+  const holder = walletUser(me);
+  const bankrollChoice = store.get('bankroll', holder ? 'wallet' : '50000') === 'wallet' && holder ? 'wallet' : String(betsSettings.bankroll || 50000);
+  const linked = bankrollChoice === 'wallet';
+  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}|${bankrollChoice}|${holder ? holder.login + ':' + holder.balance + ':' + holder.kelly_fraction : ''}`;
   let data = betsCache.get(key);
   const box = () => view.querySelector('#bets');
   const select = (id, values, current, label) => `<label class="small">${label}
-    <select id="${id}">${values.map(([v, t]) => `<option value="${v}" ${Number(v) === current ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
+    <select id="${id}">${values.map(([v, t]) => `<option value="${v}" ${String(v) === String(current) ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
   const controls = (odds, partial) => `<div class="controls">
       ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
       ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
       ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '1レースの上限')}
-      ${select('bankroll', [[10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], betsSettings.bankroll, '資金')}
+      ${select('bankroll', [...(holder ? [['wallet', `${holder.name}さんの残高に連動`]] : []), [10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], bankrollChoice, '資金')}
       <span class="spacer"></span>
       ${partial ? '<span class="small muted">地方の3連複・3連単は、予想してからオッズを取得すると、確率の高い軸3頭の分を取ります</span>' : ''}
       <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
@@ -646,7 +671,7 @@ async function loadBets(region, raceId, prediction) {
   };
   if (!data) {
     try {
-      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}&bankroll=${betsSettings.bankroll}`);
+      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}&bankroll=${linked ? 50000 : bankrollChoice}${linked ? `&wallet=1&user=${encodeURIComponent(holder.login)}` : ''}`);
       betsCache.set(key, data);
     } catch (e) {
       if (box()) {
@@ -667,12 +692,13 @@ async function loadBets(region, raceId, prediction) {
     ${overallText(data.confidence?.overall)}
     ${controls(odds, data.odds_partial)}
     ${data.budget_capped ? '<p class="small notice-text">1レースの上限が資金以上なので、資金までの金額で計算しています。</p>' : ''}
+    ${bankrollText(data.bankroll_source, data.bankroll)}
     <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
-      ${hasEv ? '「資金の伸び」は、同じような買い方を続けたときに1レースあたり資金が平均で何%増えるか（対数成長率）で、高い順に並べています。合計金額は、資金がいちばん速く増える額（ケリー基準）を1レースの上限までで選んでいます。どれが当たっても払戻がほぼ同じになる配分で、当たっても損になる買い方は出しません。マイナスは、モデルの確率では買わない方が良いという意味です。資金は、競馬に使うと決めているお金の全体額です（アプリは残高を管理しません）。金額は資金に比例するので、モデルの確率が高めに出やすいことを考えると、資金を実際より少なめ（例：半分）に設定すると控えめな金額になります。' : odds ? '' : 'オッズを取得すると、資金の伸びが一番大きい買い方と金額を出します。'}
+      ${hasEv ? '「資金の伸び」は、同じような買い方を続けたときに1レースあたり資金が平均で何%増えるか（対数成長率）で、高い順に並べています。合計金額は、資金がいちばん速く増える額（ケリー基準）を1レースの上限までで選んでいます。どれが当たっても払戻がほぼ同じになる配分で、当たっても損になる買い方は出しません。マイナスは、モデルの確率では買わない方が良いという意味です。資金は、競馬に使うと決めているお金の全体額です。金額は資金に比例します。モデルの確率は高めに出やすいので、資金を実際より少なめ（例：半分）にすると控えめな金額になります。資金のページで残高を記録していれば、「残高に連動」で残高×ケリー係数を資金にします。' : odds ? '' : 'オッズを取得すると、資金の伸びが一番大きい買い方と金額を出します。'}
       ${data.approximate ? 'この予想は温度の記録がない古い予想のため、確率は近似です。' : ''}</p>
     ${data.proposals.length ? `<div class="list-wrap"><table class="list bets-table">
-      <thead><tr><th>券種</th><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num" title="1レースあたりの資金の対数成長率">資金の伸び</th><th class="num opt">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
-      <tbody>${data.proposals.map((p) => `<tr class="${p.growth != null && p.growth > 0 ? 'good' : ''}">
+      <thead><tr><th>券種</th><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num" title="1レースあたりの資金の対数成長率">資金の伸び</th><th class="num opt">期待値</th><th class="num opt">的中時の払戻</th>${holder ? '<th class="nosort"></th>' : ''}</tr></thead>
+      <tbody>${data.proposals.map((p, index) => `<tr class="${p.growth != null && p.growth > 0 ? 'good' : ''}">
         <td class="bet-name">${esc(p.name)}</td>
         <td><div class="tickets">${p.tickets.map((t) => `<span class="ticket">${esc(ticketLabel(t.key))}${p.priced ? `<b class="stake">${t.stake.toLocaleString()}円</b>` : ''}<small>${t.odds != null ? `${oddsLabel(t.odds)}倍` : ''}<span class="detail">${t.odds != null ? ' · ' : ''}${pct(t.probability)}</span></small></span>`).join('')}</div></td>
         <td class="num opt">${p.cost.toLocaleString()}円<div class="small muted">${p.points}点</div></td>
@@ -680,10 +706,77 @@ async function loadBets(region, raceId, prediction) {
         <td class="num" data-value="${p.growth ?? ''}">${growthText(p.growth_rate)}</td>
         <td class="num opt">${p.expected_return != null ? pct(p.expected_return, 0) : '–'}</td>
         <td class="num opt">${p.min_payout != null ? `${p.min_payout.toLocaleString()}${p.max_payout > p.min_payout ? `〜${p.max_payout.toLocaleString()}` : ''}円<div class="small muted">+${(p.min_payout - p.cost).toLocaleString()}円〜</div>` : '–'}</td>
+        ${holder ? `<td><button type="button" class="record" data-kind="proposal" data-index="${index}">買った</button></td>` : ''}
       </tr>`).join('')}</tbody></table></div>`
     : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}
-    ${mixesTable(data.mixes || [], !!odds)}`;
+    ${mixesTable(data.mixes || [], !!odds, !!holder)}
+    ${holder ? manualBetForm(holder) : ''}`;
   wire();
+  if (holder) wireRecording(box(), prediction, data, holder);
+}
+
+function bankrollText(source, bankroll) {
+  if (!source || source.kind !== 'wallet') return '';
+  if (source.too_small) return `<p class="small notice-text">${esc(source.name)}さんの残高が${yen(source.balance)}で少ないため、資金は設定の金額で計算しています。</p>`;
+  return `<p class="small muted">資金：${esc(source.name)}さんの残高 ${yen(source.balance)} × ケリー係数 ${source.kelly_fraction} ＝ ${yen(bankroll)}で計算しています（係数は<a href="#/funds">資金</a>のページで変えられます）。</p>`;
+}
+
+function manualBetForm(holder) {
+  return `<details class="manual-bet"><summary>提案以外の馬券を記録する（${esc(holder.name)}さん）</summary>
+    <div class="controls">
+      <select id="manual-bet" aria-label="券種">${Object.entries(BET_NAMES).map(([k, n]) => `<option value="${k}">${n}</option>`).join('')}</select>
+      <input id="manual-key" type="text" inputmode="numeric" placeholder="例：5 / 3-7 / 7>3>1" aria-label="買い目" size="14">
+      <input id="manual-stake" type="number" min="100" step="100" value="100" aria-label="金額（円）" style="width:7em">
+      <button type="button" id="manual-add">追加</button>
+    </div>
+    <div class="tickets" id="manual-list"></div>
+    <div class="controls"><button type="button" class="primary" id="manual-save" disabled>記録する</button><span class="small muted" id="manual-msg"></span></div>
+    <p class="small muted">馬単・3連単は着順の順に「>」でつなぎます（例：7>3>1）。精算は結果と払戻が取れたあとに自動で行います。</p>
+  </details>`;
+}
+
+// "買った": first click asks, second click records the tickets with the shown stakes for the user.
+function wireRecording(root, prediction, data, holder) {
+  const save = async (button, tickets, label, done) => {
+    button.disabled = true;
+    try {
+      const result = await api('wallet/bet', {prediction_id: prediction.id, user: holder.login, tickets, label});
+      meInfo = null;
+      done(`記録しました（残高 ${yen(result.balance)}）`);
+    } catch (e) { button.disabled = false; alertJob(e); }
+  };
+  root.querySelectorAll('button.record').forEach((button) => button.addEventListener('click', () => {
+    const item = button.dataset.kind === 'mix' ? data.mixes[Number(button.dataset.index)] : data.proposals[Number(button.dataset.index)];
+    const parts = item.parts || [item];
+    const tickets = parts.flatMap((part) => part.tickets.map((t) => ({bet: part.bet, key: t.key, stake: t.stake})));
+    if (!button.classList.contains('confirm')) {
+      button.classList.add('confirm');
+      button.textContent = `${item.cost.toLocaleString()}円を記録`;
+      setTimeout(() => { if (button.classList.contains('confirm') && !button.disabled) { button.classList.remove('confirm'); button.textContent = '買った'; } }, 5000);
+      return;
+    }
+    const label = parts.map((part) => part.name).join('＋');
+    save(button, tickets, label, (message) => { button.classList.remove('confirm'); button.textContent = '記録済み'; button.title = message; });
+  }));
+  const list = [];
+  const draw = () => {
+    root.querySelector('#manual-list').innerHTML = list.map((t, i) => `<span class="ticket">${BET_NAMES[t.bet]} ${esc(ticketLabel(t.key))}<b class="stake">${t.stake.toLocaleString()}円</b><button type="button" class="link" data-remove="${i}" aria-label="外す">×</button></span>`).join('');
+    root.querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', () => { list.splice(Number(b.dataset.remove), 1); draw(); }));
+    root.querySelector('#manual-save').disabled = !list.length;
+    root.querySelector('#manual-save').textContent = list.length ? `記録する（${list.reduce((a, t) => a + t.stake, 0).toLocaleString()}円）` : '記録する';
+  };
+  root.querySelector('#manual-add')?.addEventListener('click', () => {
+    const key = root.querySelector('#manual-key').value.trim().replace(/[→＞]/g, '>').replace(/[ー－]/g, '-');
+    const stake = Number(root.querySelector('#manual-stake').value);
+    if (!key || !(stake >= 100) || stake % 100) { root.querySelector('#manual-msg').textContent = '買い目と100円単位の金額を入れてください。'; return; }
+    list.push({bet: root.querySelector('#manual-bet').value, key, stake});
+    root.querySelector('#manual-key').value = '';
+    root.querySelector('#manual-msg').textContent = '';
+    draw();
+  });
+  root.querySelector('#manual-save')?.addEventListener('click', (event) => {
+    save(event.target, list.slice(), '手入力', (message) => { list.length = 0; draw(); root.querySelector('#manual-msg').textContent = message; });
+  });
 }
 
 async function predict(region, raceId, refresh) {
@@ -977,6 +1070,185 @@ async function statusView() {
   };
   view.querySelector('#update').addEventListener('click', () => start({}));
   view.querySelector('#refit').addEventListener('click', () => start({force_fit: true}));
+}
+
+// ---------------------------------------------------------------- funds
+const BET_STATUS = {open: '未精算', settled: '精算済み', void: '返還'};
+const KELLY_CHOICES = [[0.25, '1/4（かなり控えめ）'], [0.33, '1/3'], [0.5, '1/2（おすすめ）'], [0.67, '2/3'], [1, '1（フルケリー）']];
+
+function balanceChart(series) {
+  const w = Math.max(300, Math.min(1150, view.clientWidth - 58)), h = 220, left = 64, right = 20, top = 12, bottom = 24;
+  const points = series.length === 1 ? [{...series[0]}, {...series[0]}] : series;
+  const values = points.map((d) => d.balance);
+  let lo = Math.min(0, ...values), hi = Math.max(...values);
+  if (hi === lo) hi = lo + 1000;
+  const pad = (hi - lo) * 0.08; hi += pad; if (lo < 0) lo -= pad;
+  const x = (i) => left + (points.length === 1 ? 0 : (i / (points.length - 1)) * (w - left - right));
+  const y = (v) => top + (1 - (v - lo) / (hi - lo)) * (h - top - bottom);
+  const path = points.map((d, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(d.balance).toFixed(1)}`).join('');
+  const area = `${path}L${x(points.length - 1).toFixed(1)},${y(Math.max(lo, 0)).toFixed(1)}L${x(0).toFixed(1)},${y(Math.max(lo, 0)).toFixed(1)}Z`;
+  const ticks = [lo < 0 ? lo + pad : 0, (lo + hi) / 2, hi - pad].map((v) => `<line class="axis" x1="${left}" x2="${w - right}" y1="${y(v)}" y2="${y(v)}"/>
+    <text x="${left - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11">${Math.round(v).toLocaleString()}</text>`).join('');
+  const labels = [0, Math.floor((series.length - 1) / 2), series.length - 1].filter((v, i, a) => a.indexOf(v) === i)
+    .map((i) => `<text x="${x(series.length === 1 ? 0 : i)}" y="${h - 6}" text-anchor="${series.length === 1 ? 'start' : 'middle'}" font-size="11">${Number(series[i].day.slice(5, 7))}/${Number(series[i].day.slice(8, 10))}</text>`).join('');
+  const dots = series.length <= 60 ? series.map((d, i) => `<circle class="dot" cx="${x(i)}" cy="${y(d.balance)}" r="3"><title>${esc(dateLabel(d.day))}：${yen(d.balance)}（${signedYen(d.change)}）</title></circle>`).join('') : '';
+  return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="残高の推移">${ticks}${labels}
+    <path class="balance-area" d="${area}"/><path class="line" d="${path}"/>${dots}</svg>`;
+}
+
+function ticketsText(bet) {
+  const byType = {};
+  bet.tickets.forEach((t) => (byType[t.bet] = byType[t.bet] || []).push(t));
+  const result = Object.fromEntries((bet.details || []).map((d) => [`${d.bet}|${d.key}`, d]));
+  return Object.entries(byType).map(([type, tickets]) => `<div class="mix-part"><span class="bet-name">${BET_NAMES[type] || type}</span><div class="tickets">${tickets.map((t) => {
+    const r = result[`${t.bet}|${t.key}`];
+    return `<span class="ticket ${r ? 'r-' + r.result : ''}">${esc(ticketLabel(t.key))}<b class="stake">${t.stake.toLocaleString()}円</b>${r && r.result !== 'miss' ? `<small>${r.result === 'hit' ? '的中 ' : '返還 '}${r.amount.toLocaleString()}円</small>` : ''}</span>`;
+  }).join('')}</div></div>`).join('');
+}
+
+async function fundsView() {
+  const me0 = await getMe(true);
+  const chosen = me0.admin ? walletUser(me0) : null;
+  const data = await api('wallet' + (chosen ? `?user=${encodeURIComponent(chosen.login)}` : ''));
+  const me = data.me, user = data.user;
+  const head = `<h1>資金</h1>
+    <p class="small muted">${me.local ? 'このPCから開いているため管理者として表示しています。' : me.login ? `${esc(me.name || me.login)}（${esc(me.login)}）としてログイン中${me.admin ? '・管理者' : ''}。` : 'Tailscale経由ではないため、ユーザーがわかりません。'}</p>`;
+  if (!user) {
+    view.innerHTML = head + (me.admin
+      ? `<p>まだユーザーがいません。使う人を追加してください（Tailscaleでログインしている人は、そのアカウント名で自動的に見分けます）。</p>${adminPanel(data)}`
+      : me.login ? `<div class="notice-box"><p>${esc(me.login)} はまだ登録されていません。管理者にこのアカウント名を伝えて、資金のページで追加してもらってください。</p></div>`
+        : '<p class="muted">資金のページはTailscaleのアドレス（…ts.net）から開いてください。</p>');
+    wireFunds(data);
+    return;
+  }
+  const s = data.summary;
+  const open = data.bets.filter((b) => b.status === 'open');
+  view.innerHTML = `${head}
+    ${me.admin && data.users.length > 1 ? `<div class="filters"><label class="small">表示するユーザー
+      <select id="funds-user">${data.users.map((u) => `<option value="${esc(u.login)}" ${u.login === user.login ? 'selected' : ''}>${esc(u.name)}（${yen(u.balance)}）</option>`).join('')}</select></label></div>` : ''}
+    <h2>${esc(user.name)}さん</h2>
+    <div class="figures">
+      <div class="figure"><div class="value">${yen(s.balance)}</div><div class="label">残高</div><div class="compare">${open.length ? `未精算 ${open.length}件（${yen(s.open_cost)}）を除く` : '未精算の馬券はありません'}</div></div>
+      <div class="figure"><div class="value ${s.profit > 0 ? 'plus' : s.profit < 0 ? 'minus' : ''}">${signedYen(s.profit)}</div><div class="label">収支（入出金を除く）</div><div class="compare">入金の合計 ${yen(s.net_deposit)}</div></div>
+      <div class="figure"><div class="value">${s.roi == null ? '–' : pct(s.roi, 0)}</div><div class="label">回収率</div><div class="compare">払戻 ${yen(s.returned)} ／ 購入 ${yen(s.staked)}</div></div>
+      <div class="figure"><div class="value">${s.settled_bets ? `${s.hit_bets}/${s.settled_bets}` : '–'}</div><div class="label">的中した記録</div><div class="compare">${s.settled_bets ? `的中率 ${pct(s.hit_bets / s.settled_bets, 0)}` : '精算済みの馬券はまだありません'}</div></div>
+      <div class="figure"><div class="value">${yen(Math.floor(Math.max(s.balance, 0) * user.kelly_fraction))}</div><div class="label">買い目の計算に使う資金</div><div class="compare">残高 × ケリー係数 ${user.kelly_fraction}</div></div>
+    </div>
+    ${data.series.length ? `<div class="chart-box"><div class="legend"><span>残高（日ごとの終わりの額。払戻は精算した日に計上）</span></div>${balanceChart(data.series)}</div>` : ''}
+    <h2>入金・出金</h2>
+    <div class="controls">
+      <select id="move-kind" aria-label="種類"><option value="deposit">入金</option><option value="withdraw">出金</option><option value="adjust">調整（±）</option></select>
+      <input id="move-amount" type="number" step="100" placeholder="金額（円）" aria-label="金額（円）" style="width:9em">
+      <input id="move-note" type="text" placeholder="メモ（任意）" aria-label="メモ" size="16">
+      <button type="button" class="primary" id="move-save">記録</button>
+      <span class="small muted" id="move-msg"></span>
+    </div>
+    <p class="small muted">競馬に使うお金を入れたときは入金、引き出したときは出金に記録します。収支と回収率は入出金を除いて計算します。調整は残高を実際の額に合わせるためのもので、マイナスも入れられます。</p>
+    <h2>馬券</h2>
+    <p class="small muted">レース画面の「買った」で記録した馬券です。結果と払戻が取れると自動で精算します（取消・除外の馬を含む買い目は返還）。未精算のうちは取り消せます。レースの中止などで全額戻ったときは「返還にする」を使います。</p>
+    ${data.bets.length ? `<div class="list-wrap"><table class="list funds-bets" data-sort-key="funds-bets">
+      <thead><tr><th>日付</th><th>レース</th><th>買い目</th><th class="num">購入</th><th class="num">払戻</th><th class="num">収支</th><th>状態</th><th></th></tr></thead>
+      <tbody>${data.bets.map((b) => {
+        const back = (b.payout || 0) + (b.refund || 0);
+        const net = b.status === 'open' ? null : back - b.cost;
+        return `<tr class="${b.status === 'settled' && b.payout > 0 ? 'good' : ''}">
+          <td data-value="${esc(b.race_date)}">${esc(dateLabel(b.race_date))}</td>
+          <td><a href="#/race/${b.region}/${b.race_id}">${esc(b.course || '')}${b.race_number || ''}R</a><div class="small muted">${esc(b.race_name || '')}${b.label ? ` · ${esc(b.label)}` : ''}</div></td>
+          <td>${ticketsText(b)}</td>
+          <td class="num" data-value="${b.cost}">${yen(b.cost)}</td>
+          <td class="num" data-value="${b.status === 'open' ? '' : back}">${b.status === 'open' ? '–' : yen(back)}${b.refund ? `<div class="small muted">うち返還 ${yen(b.refund)}</div>` : ''}</td>
+          <td class="num ${net > 0 ? 'plus' : net < 0 ? 'minus' : ''}" data-value="${net ?? ''}">${net == null ? '–' : signedYen(net)}</td>
+          <td>${BET_STATUS[b.status] || esc(b.status)}</td>
+          <td>${b.status === 'open' ? `<button type="button" class="small-btn" data-cancel="${b.id}">取り消し</button>` : ''}${b.status !== 'void' ? `<button type="button" class="small-btn" data-void="${b.id}">返還にする</button>` : ''}</td>
+        </tr>`;
+      }).join('')}</tbody></table></div>` : '<p class="muted">まだ馬券の記録はありません。レース画面の買い目の提案から「買った」で記録できます。</p>'}
+    <h2>入出金の履歴</h2>
+    ${data.entries.length ? `<div class="list-wrap"><table class="list" data-sort-key="funds-ledger">
+      <thead><tr><th>日時</th><th>種類</th><th>内容</th><th class="num">金額</th><th class="num">残高</th><th></th></tr></thead>
+      <tbody>${data.entries.map((e) => `<tr>
+        <td data-value="${esc(e.at)}">${timeLabel(e.at)}</td>
+        <td>${esc(e.kind_name)}</td>
+        <td>${e.bet_id ? `${esc(e.course || '')}${e.race_number || ''}R${e.label ? ` · ${esc(e.label)}` : ''}` : ''}${e.note ? `<span class="small muted"> ${esc(e.note)}</span>` : ''}</td>
+        <td class="num ${e.amount > 0 ? 'plus' : 'minus'}" data-value="${e.amount}">${signedYen(e.amount)}</td>
+        <td class="num" data-value="${e.balance}">${yen(e.balance)}</td>
+        <td>${['deposit', 'withdraw', 'adjust'].includes(e.kind) ? `<button type="button" class="small-btn" data-entry="${e.id}">削除</button>` : ''}</td>
+      </tr>`).join('')}</tbody></table></div>` : '<p class="muted">まだ記録がありません。</p>'}
+    <h2>設定</h2>
+    <div class="controls">
+      <label class="small">ケリー係数 <select id="kelly">${KELLY_CHOICES.map(([v, t]) => `<option value="${v}" ${Math.abs(v - user.kelly_fraction) < 0.005 ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+      <label class="small">表示名 <input id="user-name" type="text" value="${esc(user.name)}" size="12"></label>
+      <button type="button" id="user-save">保存</button>
+      <span class="small muted" id="user-msg"></span>
+    </div>
+    <p class="small muted">買い目の提案で「残高に連動」を選ぶと、残高×ケリー係数を資金として金額を決めます。ケリー基準どおり（係数1）に賭けると資金の増え方は理論上いちばん速いですが、上下の振れがとても大きく、モデルの確率が少しでも高めに出ていると逆に減っていきます。1/2にすると増え方は約3/4のまま、振れはおよそ半分になります。</p>
+    ${me.admin ? adminPanel(data) : ''}`;
+  wireFunds(data);
+}
+
+function adminPanel(data) {
+  return `<h2>ユーザー（管理者）</h2>
+    ${data.users.length ? `<div class="list-wrap"><table class="list"><thead><tr><th>名前</th><th>アカウント</th><th class="num">残高</th><th class="num">未精算</th><th>権限</th><th></th></tr></thead>
+      <tbody>${data.users.map((u) => `<tr><td>${esc(u.name)}</td><td class="small">${esc(u.login)}</td><td class="num" data-value="${u.balance}">${yen(u.balance)}</td><td class="num">${u.open_bets}</td>
+        <td><label class="small"><input type="checkbox" data-admin="${esc(u.login)}" ${u.admin ? 'checked' : ''}> 管理者</label></td>
+        <td><button type="button" class="small-btn" data-show="${esc(u.login)}">表示</button>${u.login !== data.me.login ? `<button type="button" class="small-btn" data-remove-user="${esc(u.login)}">削除</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : ''}
+    <h3>ユーザーを追加</h3>
+    <div class="controls">
+      <input id="new-login" type="text" placeholder="Tailscaleのアカウント（例：name@gmail.com）" aria-label="Tailscaleのアカウント" size="30">
+      <input id="new-name" type="text" placeholder="表示名" aria-label="表示名" size="10">
+      <input id="new-deposit" type="number" step="1000" min="0" placeholder="初期資金（円）" aria-label="初期資金（円）" style="width:9em">
+      <label class="small"><input type="checkbox" id="new-admin"> 管理者</label>
+      <button type="button" class="primary" id="new-save">追加</button>
+      <span class="small muted" id="new-msg"></span>
+    </div>
+    <p class="small muted">アカウントは、その人がTailscaleにログインしているもの（招待を受けたメールアドレスなど）です。その人が資金のページを開くと、未登録の場合は自分のアカウント名が表示されます。このPCから開いたときは、上で選んだユーザーの資金を操作します。</p>`;
+}
+
+function wireFunds(data) {
+  const subject = data.user ? data.user.login : undefined;
+  const redraw = () => { meInfo = null; betsCache.clear(); fundsView(); };
+  const act = async (button, path, body, message) => {
+    if (button) button.disabled = true;
+    try { await api(path, {...body, user: subject}); redraw(); } catch (e) {
+      if (button) button.disabled = false;
+      const box = message && view.querySelector(message);
+      if (box) box.textContent = e.message; else alertJob(e);
+    }
+  };
+  view.querySelector('#funds-user')?.addEventListener('change', (e) => { store.set('walletUser', e.target.value); redraw(); });
+  view.querySelectorAll('[data-show]').forEach((b) => b.addEventListener('click', () => { store.set('walletUser', b.dataset.show); redraw(); window.scrollTo(0, 0); }));
+  view.querySelector('#move-save')?.addEventListener('click', (e) => act(e.target, 'wallet/move', {
+    kind: view.querySelector('#move-kind').value, amount: Number(view.querySelector('#move-amount').value), note: view.querySelector('#move-note').value}, '#move-msg'));
+  view.querySelector('#user-save')?.addEventListener('click', (e) => act(e.target, 'wallet/user/update', {
+    kelly_fraction: Number(view.querySelector('#kelly').value), name: view.querySelector('#user-name').value}, '#user-msg'));
+  view.querySelectorAll('[data-cancel]').forEach((b) => b.addEventListener('click', () => {
+    if (!b.classList.contains('confirm')) { b.classList.add('confirm'); b.textContent = '本当に取り消す'; return; }
+    act(b, 'wallet/bet/cancel', {id: Number(b.dataset.cancel)});
+  }));
+  view.querySelectorAll('[data-void]').forEach((b) => b.addEventListener('click', () => {
+    if (!b.classList.contains('confirm')) { b.classList.add('confirm'); b.textContent = '全額返還にする'; return; }
+    act(b, 'wallet/bet/void', {id: Number(b.dataset.void)});
+  }));
+  view.querySelectorAll('[data-entry]').forEach((b) => b.addEventListener('click', () => {
+    if (!b.classList.contains('confirm')) { b.classList.add('confirm'); b.textContent = '本当に削除'; return; }
+    act(b, 'wallet/entry/delete', {id: Number(b.dataset.entry)});
+  }));
+  view.querySelectorAll('[data-admin]').forEach((c) => c.addEventListener('change', async () => {
+    try { await api('wallet/user/update', {user: c.dataset.admin, admin: c.checked}); redraw(); } catch (e) { c.checked = !c.checked; alertJob(e); }
+  }));
+  view.querySelectorAll('[data-remove-user]').forEach((b) => b.addEventListener('click', async () => {
+    if (!b.classList.contains('confirm')) { b.classList.add('confirm'); b.textContent = '記録ごと削除'; return; }
+    b.disabled = true;
+    try { await api('wallet/user/remove', {user: b.dataset.removeUser}); redraw(); } catch (e) { b.disabled = false; alertJob(e); }
+  }));
+  view.querySelector('#new-save')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      const added = await api('wallet/user', {login: view.querySelector('#new-login').value, name: view.querySelector('#new-name').value,
+        deposit: Number(view.querySelector('#new-deposit').value) || 0, admin: view.querySelector('#new-admin').checked});
+      store.set('walletUser', added.login);
+      redraw();
+    } catch (error) { e.target.disabled = false; view.querySelector('#new-msg').textContent = error.message; }
+  });
 }
 
 route();
