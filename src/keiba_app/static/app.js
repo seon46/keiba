@@ -282,7 +282,7 @@ async function dayView(day) {
             <span class="rno">${race.race_number}R</span>
             <span class="time">${esc(race.start_time || '')}<span class="until"></span></span>
             <span class="name">${esc(race.race_name || (race.supported ? '' : '対象外'))}</span>
-            <span class="mark">${race.confidence ? `<span class="conf-mini conf-${race.confidence.tier}" title="自信度">${race.confidence.tier}</span>` : race.predictions ? '予想済' : ''}</span>
+            <span class="mark">${race.confidence ? `<span class="conf-mini conf-${race.confidence.tier}" title="本命の自信度">${race.confidence.tier}</span>${race.confidence.overall ? `<span class="conf-mini whole conf-${race.confidence.overall}" title="予想全体の自信度">${race.confidence.overall}</span>` : ''}` : race.predictions ? '予想済' : ''}</span>
           </a></li>`).join('')}</ol></section>`).join('')}</div>`
         : `<p class="empty">${data.races.length ? `この日の${regionName(region)}のレースはありません。` : 'この日のレースはまだ取得していません。「レース一覧を取得」を押すと、netkeibaの日別一覧から取得します。'}</p>`}
       ${confidentPanel(races)}`;
@@ -343,15 +343,15 @@ function confidentPanel(races) {
   const top = predicted.filter((race) => race.confidence.tier === 'A')
     .sort((a, b) => b.confidence.value - a.confidence.value);
   return `<section class="confident">
-      <h2>自信度の高いレース <span class="small muted">予想済み${predicted.length}レース中 A ${top.length}レース</span></h2>
+      <h2>本命の自信度が高いレース <span class="small muted">予想済み${predicted.length}レース中 A ${top.length}レース</span></h2>
       ${top.length ? `<ol>${top.map((race) => `<li><a href="#/race/${race.region}/${race.race_id}">
-          <span class="conf-mini conf-A">A</span>
+          <span class="tiers"><span class="conf-mini conf-A" title="本命の自信度">A</span>${race.confidence.overall ? `<span class="conf-mini whole conf-${race.confidence.overall}" title="予想全体の自信度">${race.confidence.overall}</span>` : ''}</span>
           <span class="where">${esc(race.course)} ${race.race_number}R</span>
           <span class="time">${esc(race.start_time || '')}</span>
           <span class="name">${esc(race.race_name || '')}</span>
           <span class="score small muted">本命勝率 ${pct(race.confidence.value, 0)}</span></a></li>`).join('')}</ol>`
         : '<p class="muted small">自信度Aのレースはありません。</p>'}
-      <p class="small muted">自信度は予想済みのレースだけに付きます。全レースに付けるには「この日の全レースを予想」を押してください。</p>
+      <p class="small muted">左が本命の自信度、枠付きが予想全体の自信度です。自信度は予想済みのレースだけに付きます。全レースに付けるには「この日の全レースを予想」を押してください。</p>
     </section>`;
 }
 
@@ -563,7 +563,17 @@ function oddsLabel(value) {
 
 function confidenceBadge(c) {
   if (!c) return '';
-  return `<span class="conf conf-${c.tier}" title="本命の勝率 ${pct(c.value)}">自信度 ${c.tier}</span>`;
+  return `<span class="conf conf-${c.tier}" title="本命の勝率 ${pct(c.value)}">本命 ${c.tier}</span>${c.overall
+    ? `<span class="conf whole conf-${c.overall.tier}" title="上位3着の並びの当てやすさ">全体 ${c.overall.tier}</span>` : ''}`;
+}
+
+function overallText(o) {
+  if (!o) return '';
+  const hits = (tier) => o.rates[tier].top3_hits.toFixed(1);
+  return `<p class="conf-line"><span class="conf whole conf-${o.tier}">全体 ${o.tier}</span>
+    予想全体の自信度です。1〜3着の並び方がどれだけ絞れているかで決めていて、本命以外の馬も含みます。
+    2025年の検証では、3着内に来る確率の高い3頭のうち実際に3着内に来たのは、全体Aのレースで平均${hits('A')}頭、Bで${hits('B')}頭、Cで${hits('C')}頭でした。
+    ${o.approximate ? '<span class="muted small">（古い予想のため、今のモデルの温度で近似しています）</span>' : ''}</p>`;
 }
 
 function confidenceText(c) {
@@ -622,6 +632,7 @@ async function loadBets(region, raceId, prediction) {
   box().innerHTML = `
     <h2>買い目の提案</h2>
     ${confidenceText(data.confidence)}
+    ${overallText(data.confidence?.overall)}
     <div class="controls">
       ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
       ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
@@ -795,7 +806,7 @@ function outcomeBox(o) {
 // ---------------------------------------------------------------- records
 const recordState = {days: store.get('records-days', '30'), day: 'latest', region: '', after: false,
                      breakdown: store.get('records-breakdown', 'course'), split: store.get('records-split', '0') === '1'};
-const BREAKDOWN_TABS = [['course', '競馬場'], ['confidence', '自信度'], ['surface', '芝・ダート'], ['distance', '距離'],
+const BREAKDOWN_TABS = [['course', '競馬場'], ['confidence', '本命の自信度'], ['overall', '全体の自信度'], ['surface', '芝・ダート'], ['distance', '距離'],
                         ['race_number', 'R番号']];
 
 function skillText(v) {
@@ -810,7 +821,7 @@ function breakdownTable(rows, label, key, split) {
       <th class="num" title="全馬同じ確率と比べて、着順全体の対数損失がどれだけ小さいか">予想の良さ</th>
       <th class="num" title="本命の単勝を毎レース100円ずつ買った場合（確定オッズ）">本命単勝回収率</th></tr></thead>
     <tbody>${rows.map((r) => `<tr class="${r.races < 10 ? 'few' : ''}">
-      <td data-value="${r.order}">${key === 'confidence' ? badge(r.name) : esc(r.name)}</td>
+      <td data-value="${r.order}">${key === 'confidence' || key === 'overall' ? badge(r.name) : esc(r.name)}</td>
       ${split ? `<td>${badge(r.confidence)}</td>` : ''}
       <td class="num">${r.races}</td>
       <td class="num">${pct(r.favourite_win_rate, 0)}</td>
@@ -862,7 +873,7 @@ async function recordsView() {
     <h2>条件ごとの成績</h2>
     <div class="segments tabs" role="group" aria-label="分け方">${BREAKDOWN_TABS.map(([key, label]) =>
       `<button type="button" data-breakdown="${key}" aria-pressed="${key === tab[0]}">${label}</button>`).join('')}</div>
-    ${tab[0] !== 'confidence' ? `<label class="small split"><input type="checkbox" id="split" ${recordState.split ? 'checked' : ''}> 自信度（A・B・C）ごとに分ける</label>` : ''}
+    ${tab[0] !== 'confidence' ? `<label class="small split"><input type="checkbox" id="split" ${recordState.split ? 'checked' : ''}> 本命の自信度（A・B・C）ごとに分ける</label>` : ''}
     ${(() => {
       const split = recordState.split && tab[0] !== 'confidence';
       const rows = (split ? data.breakdowns_by_confidence[tab[0]] : data.breakdowns[tab[0]]) || [];
@@ -871,11 +882,12 @@ async function recordsView() {
     })()}
     <h2>レースごと</h2>
     <div class="list-wrap"><table class="list" data-sort-key="records-races">
-      <thead><tr><th>日付</th><th>レース</th><th>自信度</th><th>本命</th><th class="num">着順</th><th class="num">単勝</th><th>3着内率1位の馬</th><th class="num">着順</th><th class="num">予想の良さ</th></tr></thead>
+      <thead><tr><th>日付</th><th>レース</th><th title="本命の自信度">自信度</th><th title="予想全体の自信度">全体</th><th>本命</th><th class="num">着順</th><th class="num">単勝</th><th>3着内率1位の馬</th><th class="num">着順</th><th class="num">予想の良さ</th></tr></thead>
       <tbody>${data.races.map((r) => `<tr>
         <td data-value="${r.race_date}${r.start_time ? ' ' + esc(r.start_time) : ''}">${dateLabel(r.race_date)}</td>
         <td><a href="#/race/${r.region}/${r.race_id}">${esc(r.course)} ${r.race_number}R</a> <span class="muted small">${esc(r.race_name || '')}</span></td>
         <td>${r.confidence ? `<span class="conf-mini conf-${r.confidence}">${r.confidence}</span>` : ''}</td>
+        <td>${r.overall ? `<span class="conf-mini whole conf-${r.overall}">${r.overall}</span>` : ''}</td>
         <td>${r.favourite_horse_number ?? ''}</td>
         <td class="num">${r.favourite_position ?? '–'}</td>
         <td class="num">${r.favourite_odds != null ? num(r.favourite_odds, 1) : '–'}</td>

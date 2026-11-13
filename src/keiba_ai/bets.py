@@ -345,6 +345,58 @@ CONFIDENCE_TIERS = {
 }
 
 
+# Whole-race confidence = how predictable the top-3 finishing order is to the model itself:
+# 1 - entropy(1st-2nd-3rd order) / log(n(n-1)(n-2)).  When the model is calibrated this is the expected "order skill"
+# of the race, and on the v4 evaluation year (2025, data/v4_check2) it was: Spearman with the realised order skill
+# .375 central / .435 local, ahead of the win-probability concentration (.356/.415), the pick's win probability
+# (.283/.342) and odds-free models combining all candidates (.318/.429).  The tier means matched the realised skill
+# (central A .270 expected vs .237 realised, B .154/.147, C .079/.086).  Thresholds are that year's tertiles; the rates
+# are what those races did: how many of the three most likely top-3 finishers ran in the top three, and the pick.
+OVERALL_TIERS = {
+    'central': dict(thresholds=(.1182, .1948), races=3243, rates={
+        'A': dict(top3_hits=1.77, order_skill=.237, pick_top3_rate=.756, pick_win_rate=.402),
+        'B': dict(top3_hits=1.49, order_skill=.147, pick_top3_rate=.614, pick_win_rate=.276),
+        'C': dict(top3_hits=1.22, order_skill=.086, pick_top3_rate=.486, pick_win_rate=.200)}),
+    'local': dict(thresholds=(.1500, .2449), races=12958, rates={
+        'A': dict(top3_hits=2.05, order_skill=.303, pick_top3_rate=.869, pick_win_rate=.558),
+        'B': dict(top3_hits=1.78, order_skill=.194, pick_top3_rate=.749, pick_win_rate=.384),
+        'C': dict(top3_hits=1.51, order_skill=.106, pick_top3_rate=.614, pick_win_rate=.281)}),
+}
+
+
+def top3_orders(scores, temperatures):
+    """P[i, j, k] that i, j, k finish 1st, 2nd, 3rd under the staged Plackett-Luce model the rank distribution
+    samples (score / temperature of each position; non-finishing ignored).  Zero on repeated horses."""
+    from .ranking_v3 import stage_temperatures
+    scores = np.asarray(scores, dtype=float)
+    n = len(scores)
+    t = stage_temperatures(temperatures, n)
+    scores = scores - scores.max()
+    w1, w2, w3 = (np.exp(scores / t[position]) for position in range(3))
+    eye = np.eye(n, dtype=bool)
+    first = w1 / w1.sum()
+    second = np.where(eye, 0.0, w2[None, :]) / (w2.sum() - w2)[:, None]
+    rest3 = w3.sum() - w3[:, None] - w3[None, :]
+    third = w3[None, None, :] / np.where(eye, np.inf, rest3)[:, :, None]
+    distinct = ~(eye[:, :, None] | eye[:, None, :] | eye[None, :, :])
+    return first[:, None, None] * second[:, :, None] * np.where(distinct, third, 0.0)
+
+
+def order_certainty(scores, temperatures):
+    """1 - entropy(top-3 order) / log(n(n-1)(n-2)); None for fewer than three runners."""
+    if len(scores) < 3:
+        return None
+    n = len(scores)
+    p = top3_orders(scores, temperatures).ravel()
+    p = p[p > 0]
+    return float(1 + (p * np.log(p)).sum() / math.log(n * (n - 1) * (n - 2)))
+
+
+def overall_tier(region, value):
+    low, high = OVERALL_TIERS['central' if region == 'central' else 'local']['thresholds']
+    return 'A' if value >= high else 'B' if value >= low else 'C'
+
+
 def top_win(win_probabilities):
     """The largest win probability (renormalised over the known runners); None for fewer than two runners."""
     values = [value for value in win_probabilities if value is not None]

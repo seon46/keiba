@@ -65,24 +65,7 @@ def _kl(p, q):
     return float((p * np.log(p / q)).sum())
 
 
-def top3_orders(scores, temperatures):
-    """P[i, j, k] that i, j, k finish 1st, 2nd, 3rd under the staged Plackett-Luce model (zero on repeats)."""
-    from .ranking_v3 import stage_temperatures
-    scores = np.asarray(scores, dtype=float)
-    n = len(scores)
-    t = stage_temperatures(temperatures, n)
-    scores = scores - scores.max()
-
-    def weights(position):
-        return np.exp(scores / t[position])
-    w1, w2, w3 = weights(0), weights(1), weights(2)
-    eye = np.eye(n, dtype=bool)
-    first = w1 / w1.sum()
-    second = np.where(eye, 0.0, w2[None, :]) / (w2.sum() - w2)[:, None]       # [i, j]
-    rest3 = w3.sum() - w3[:, None] - w3[None, :]                               # [i, j]
-    third = w3[None, None, :] / np.where(eye, np.inf, rest3)[:, :, None]       # [i, j, k]
-    distinct = ~(eye[:, :, None] | eye[:, None, :] | eye[None, :, :])
-    return first[:, None, None] * second[:, :, None] * np.where(distinct, third, 0.0)
+from .bets import top3_orders  # noqa: E402  (shared with the app)
 
 
 def _entropy(p):
