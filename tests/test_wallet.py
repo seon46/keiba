@@ -156,8 +156,17 @@ class IdentityTests(unittest.TestCase):
         self.as_('b@example.com', loopback=False)
         self.assertIsNone(self.api.identity()['login'])
         self.assertFalse(self.api.identity()['admin'])
-        self.as_('stranger@example.com')
+        self.api.request.value = dict(loopback=True, login='stranger@example.com', name='Stranger')
+        self.api.note_visitor()
         self.assertFalse(self.api.wallet({})['me']['registered'])
+        self.as_()
+        self.assertEqual([(v['login'], v['name']) for v in self.api.wallet({})['visitors']],
+                         [('stranger@example.com', 'Stranger')])
+        self.api.add_user(dict(login='stranger@example.com', name='S'))
+        self.assertEqual(self.api.wallet({})['visitors'], [])
+        self.as_('stranger@example.com')  # now a user
+        self.assertEqual(self.api.move_money(dict(kind='deposit', amount=100))['balance'], 100)
+        self.as_('nobody@example.com')
         with self.assertRaises(ValueError):
             self.api.move_money(dict(kind='deposit', amount=100))
 

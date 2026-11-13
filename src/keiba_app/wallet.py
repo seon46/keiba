@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS user_bets (
 );
 CREATE INDEX IF NOT EXISTS user_bets_user ON user_bets(login, race_date);
 CREATE INDEX IF NOT EXISTS user_bets_open ON user_bets(status, race_date);
+CREATE TABLE IF NOT EXISTS visitors (
+    login TEXT PRIMARY KEY, name TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
+);
 """
 
 BET_KINDS = ('win', 'place', 'bracket', 'quinella', 'wide', 'exacta', 'trio', 'trifecta')
@@ -127,7 +130,8 @@ class Wallet:
             row = connection.execute(
                 "SELECT (SELECT COALESCE(MAX(id),0)||':'||COUNT(*)||':'||COALESCE(SUM(amount),0) FROM ledger),"
                 "(SELECT COUNT(*)||':'||COALESCE(GROUP_CONCAT(name||admin||kelly_fraction),'') FROM users),"
-                "(SELECT COUNT(*) FROM user_bets WHERE status='open')").fetchone()
+                "(SELECT COUNT(*) FROM user_bets WHERE status='open'),"
+                "(SELECT COUNT(*) FROM visitors WHERE login NOT IN (SELECT login FROM users))").fetchone()
         return '|'.join(str(value) for value in row)
 
     # -- users ---------------------------------------------------------
@@ -188,6 +192,27 @@ class Wallet:
         with self._connect() as connection:
             if connection.execute('DELETE FROM users WHERE login=?', (login,)).rowcount == 0:
                 raise KeyError('ユーザーがいません。')
+
+    def seen(self, login, name=None):
+        """Note a Tailscale login that opened the app, so the administrator can add it without typing it."""
+        if not login or len(login) > 200:
+            return
+        at = now().isoformat(timespec='seconds')
+        with self._connect() as connection:
+            connection.execute('INSERT INTO visitors (login,name,first_seen,last_seen) VALUES (?,?,?,?) '
+                               'ON CONFLICT(login) DO UPDATE SET name=COALESCE(excluded.name,name),last_seen=excluded.last_seen',
+                               (login, (name or '')[:100] or None, at, at))
+
+    def visitors(self, limit=20):
+        """Logins that opened the app and are not users yet, most recent first."""
+        with self._connect() as connection:
+            rows = connection.execute('SELECT * FROM visitors WHERE login NOT IN (SELECT login FROM users) '
+                                      'ORDER BY last_seen DESC LIMIT ?', (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def forget_visitor(self, login):
+        with self._connect() as connection:
+            connection.execute('DELETE FROM visitors WHERE login=?', (login,))
 
     def balance(self, login):
         with self._connect() as connection:

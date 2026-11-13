@@ -1125,8 +1125,8 @@ async function fundsView() {
     <p class="small muted">${me.local ? 'このPCから開いているため管理者として表示しています。' : me.login ? `${esc(me.name || me.login)}（${esc(me.login)}）としてログイン中${me.admin ? '・管理者' : ''}。` : 'Tailscale経由ではないため、ユーザーがわかりません。'}</p>`;
   if (!user) {
     view.innerHTML = head + (me.admin
-      ? `<p>まだユーザーがいません。使う人を追加してください（Tailscaleでログインしている人は、そのアカウント名で自動的に見分けます）。</p>${adminPanel(data)}`
-      : me.login ? `<div class="notice-box"><p>${esc(me.login)} はまだ登録されていません。管理者にこのアカウント名を伝えて、資金のページで追加してもらってください。</p></div>`
+      ? `<p>まだユーザーがいません。使う人を追加してください。招待した人がTailscale経由で一度このアプリを開くと、下の「最近開いた未登録の人」に出てくるので、ボタンで追加できます。</p>${adminPanel(data)}`
+      : me.login ? `<div class="notice-box"><p>まだ登録されていません。管理者の資金ページに「最近開いた未登録の人」として表示されているので、管理者に追加してもらってください（${esc(me.login)}）。</p></div>`
         : '<p class="muted">資金のページはTailscaleのアドレス（…ts.net）から開いてください。</p>');
     wireFunds(data);
     return;
@@ -1201,7 +1201,13 @@ function adminPanel(data) {
       <tbody>${data.users.map((u) => `<tr><td>${esc(u.name)}</td><td class="small">${esc(u.login)}</td><td class="num" data-value="${u.balance}">${yen(u.balance)}</td><td class="num">${u.open_bets}</td>
         <td><label class="small"><input type="checkbox" data-admin="${esc(u.login)}" ${u.admin ? 'checked' : ''}> 管理者</label></td>
         <td><button type="button" class="small-btn" data-show="${esc(u.login)}">表示</button>${u.login !== data.me.login ? `<button type="button" class="small-btn" data-remove-user="${esc(u.login)}">削除</button>` : ''}</td></tr>`).join('')}</tbody></table></div>` : ''}
-    <h3>ユーザーを追加</h3>
+    ${(data.visitors || []).length ? `<h3>最近開いた未登録の人</h3>
+    <div class="list-wrap"><table class="list visitors"><thead><tr><th>Tailscaleの名前</th><th>アカウント</th><th>最後に開いた</th><th></th></tr></thead>
+      <tbody>${data.visitors.map((v, i) => `<tr><td><input type="text" data-visitor-name="${i}" value="${esc(v.name || v.login.split('@')[0])}" size="10" aria-label="表示名"></td>
+        <td class="small">${esc(v.login)}</td><td data-value="${esc(v.last_seen)}">${timeLabel(v.last_seen)}</td>
+        <td><input type="number" data-visitor-deposit="${i}" step="1000" min="0" placeholder="初期資金（円）" aria-label="初期資金（円）" style="width:8em">
+          <button type="button" class="small-btn primary" data-visitor-add="${i}">追加</button><button type="button" class="small-btn" data-visitor-forget="${i}">無視</button></td></tr>`).join('')}</tbody></table></div>` : ''}
+    <details class="manual-bet"><summary>アカウントを入力して追加</summary>
     <div class="controls">
       <input id="new-login" type="text" placeholder="Tailscaleのアカウント（例：name@gmail.com）" aria-label="Tailscaleのアカウント" size="30">
       <input id="new-name" type="text" placeholder="表示名" aria-label="表示名" size="10">
@@ -1209,8 +1215,8 @@ function adminPanel(data) {
       <label class="small"><input type="checkbox" id="new-admin"> 管理者</label>
       <button type="button" class="primary" id="new-save">追加</button>
       <span class="small muted" id="new-msg"></span>
-    </div>
-    <p class="small muted">アカウントは、その人がTailscaleにログインしているもの（招待を受けたメールアドレスなど）です。その人が資金のページを開くと、未登録の場合は自分のアカウント名が表示されます。このPCから開いたときは、上で選んだユーザーの資金を操作します。</p>`;
+    </div></details>
+    <p class="small muted">招待した人がTailscale経由でこのアプリを一度開くと「最近開いた未登録の人」に出ます。名前と初期資金を入れて「追加」を押すだけで登録できます。このPCから開いたときは、上で選んだユーザーの資金を操作します。</p>`;
 }
 
 function wireFunds(data) {
@@ -1249,6 +1255,20 @@ function wireFunds(data) {
     if (!b.classList.contains('confirm')) { b.classList.add('confirm'); b.textContent = '記録ごと削除'; return; }
     b.disabled = true;
     try { await api('wallet/user/remove', {user: b.dataset.removeUser}); redraw(); } catch (e) { b.disabled = false; alertJob(e); }
+  }));
+  view.querySelectorAll('[data-visitor-add]').forEach((b) => b.addEventListener('click', async () => {
+    const i = b.dataset.visitorAdd, v = data.visitors[Number(i)];
+    b.disabled = true;
+    try {
+      const added = await api('wallet/user', {login: v.login, name: view.querySelector(`[data-visitor-name="${i}"]`).value,
+        deposit: Number(view.querySelector(`[data-visitor-deposit="${i}"]`).value) || 0});
+      store.set('walletUser', added.login);
+      redraw();
+    } catch (e) { b.disabled = false; alertJob(e); }
+  }));
+  view.querySelectorAll('[data-visitor-forget]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    try { await api('wallet/visitor/forget', {login: data.visitors[Number(b.dataset.visitorForget)].login}); redraw(); } catch (e) { b.disabled = false; alertJob(e); }
   }));
   view.querySelector('#new-save')?.addEventListener('click', async (e) => {
     e.target.disabled = true;

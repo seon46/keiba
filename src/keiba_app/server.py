@@ -134,6 +134,7 @@ class Api:
         self.python = python or sys.executable
         self.nightly_process = None
         self.request = threading.local()  # who sent the request being handled (set by the handler)
+        self._seen = {}  # login -> last time noted as a visitor
 
     # -- users -------------------------------------------------------------
     def identity(self):
@@ -148,6 +149,17 @@ class Api:
         user = self.engine.wallet.user(login) if login else None
         return dict(login=login, name=(user or {}).get('name') or request.get('name') or login, local=local,
                     admin=local or bool(user and user['admin']), user=user)
+
+    def note_visitor(self):
+        """Remember an unregistered Tailscale login (at most every ten minutes) for the administrator's list."""
+        import time
+        request = getattr(self.request, 'value', None) or {}
+        login = request.get('login') if request.get('loopback') else None
+        if not login or time.time() - self._seen.get(login, 0) < 600:
+            return
+        self._seen[login] = time.time()
+        if self.engine.wallet.user(login) is None:
+            self.engine.wallet.seen(login, request.get('name'))
 
     def _subject(self, values, *, require=True):
         """The user whose wallet a request is about: yourself, or (administrator) the one named by ``user``."""
@@ -302,7 +314,8 @@ class Api:
             login = users[0]['login'] if users else None
         users = self.engine.wallet.users() if me['admin'] else ([me['user']] if me['user'] else [])
         result = dict(me=dict(login=me['login'], name=me['name'], admin=me['admin'], local=me['local'],
-                              registered=bool(me['user'])), users=users, user=None)
+                              registered=bool(me['user'])), users=users, user=None,
+                      visitors=self.engine.wallet.visitors() if me['admin'] else [])
         if login:
             result.update(user=self.engine.wallet.user(login), bets=self.engine.wallet.bets(login),
                           **self.engine.wallet.history(login))
@@ -412,6 +425,12 @@ class Api:
         return self.engine.wallet.add_user(body.get('login'), body.get('name'), deposit=body.get('deposit') or 0,
                                            admin=bool(body.get('admin')))
 
+    def forget_visitor(self, body):
+        if not self.identity()['admin']:
+            raise ValueError('管理者だけが操作できます。')
+        self.engine.wallet.forget_visitor(body.get('login'))
+        return dict(forgotten=body.get('login'))
+
     def update_user(self, body):
         login, me = self._subject(body)
         admin = body.get('admin')
@@ -497,7 +516,7 @@ class Api:
                changes=changes, me=me, wallet=wallet)
     POST = {'race/predict': predict_race, 'race/odds': fetch_odds, 'day/discover': discover, 'day/predict': predict_day,
             'nightly': nightly, 'wallet/user': add_user, 'wallet/user/update': update_user,
-            'wallet/user/remove': remove_user, 'wallet/move': move_money, 'wallet/entry/delete': delete_entry,
+            'wallet/user/remove': remove_user, 'wallet/visitor/forget': forget_visitor, 'wallet/move': move_money, 'wallet/entry/delete': delete_entry,
             'wallet/bet': record_bet, 'wallet/bet/cancel': cancel_bet, 'wallet/bet/void': void_bet}
 
 
@@ -609,6 +628,10 @@ def make_handler(api: Api, *, allowed_hosts=()):
             api.request.value = dict(loopback=_loopback(self.client_address[0]),
                                      login=_header_text(self.headers.get('Tailscale-User-Login')),
                                      name=_header_text(self.headers.get('Tailscale-User-Name')))
+            try:
+                api.note_visitor()
+            except Exception:  # never stop a request over the visitor list
+                traceback.print_exc()
             try:
                 return self._send(200, function(api, argument))
             except (ValueError, KeyError) as exc:
