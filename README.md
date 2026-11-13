@@ -726,6 +726,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-app-tasks.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart-app.ps1
 ```
 
+`pipeline_v4 fit --segments` を付けると、区分（中央：芝ダート×年齢×クラス、地方：年齢×クラス）ごとの補正も学習し、`--evaluate-until` の期間で区分なしのモデルと比べます（`model.json` の `segments` と `evaluation.segmented`）。補正は、全レースで学習したモデルを出発点に、その区分のレースだけでLightGBM＋血統の続きの木と各シードのNNの追加学習を行い、どちらもその区分の早期終了期間で止めます。良くならない区分は全体のモデルのままです。早期終了期間に50レース未満、学習期間に300レース未満の区分は作りません。保存するモデルは今までと同じです。
+
 学習に使う期間の始まりは `pipeline_v4 fit --train-start 日付`（既定: 2022-04-01）で変えられます。毎晩の学習し直しで使う開始日は `keiba_app init ... --train-start 日付 --data-start 日付` で設定します。データを過去に足したときは、DBの最初の日から半年ほど後を学習開始日にします（過去の成績から作る特徴量が揃うまでの期間）。
 
 画面の「この日の全レースを予想」と「レース一覧を取得」は、アプリとは別のプロセス（`keiba_app day --date 日付`・`keiba_app discover --date 日付`、手でも実行できます）で、低い優先度で動きます。

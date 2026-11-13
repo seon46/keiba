@@ -98,3 +98,41 @@ class PipelineV4Tests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SegmentTests(unittest.TestCase):
+    def test_segment_corrections_are_fitted_and_compared(self):
+        from dataclasses import replace
+        from unittest import mock
+        from keiba_ai import segments
+        from keiba_ai.cli import prepare
+        from keiba_ai.pipeline_v4 import NN_CONFIG, fit
+        from test_ai_experiment_v3d import jockey_csv
+        from test_ai_experiment_v3j import pedigree_store
+        with TemporaryDirectory() as name:
+            root = Path(name)
+            jockey_csv(root / 'source.csv', years=(2021, 2022, 2023, 2024, 2025))
+            with (root / 'source.csv').open(encoding='utf-8') as file:
+                horses = sorted({row['horse_id'] for row in csv.DictReader(file)})
+            pedigree_store(root / 'data', horses)
+            with redirect_stdout(io.StringIO()):
+                database = prepare(root / 'source.csv', root / 'prepared')
+            small = replace(NN_CONFIG, width=32, ensemble=4, max_epochs=2, batch_races=32, n_frequencies=8,
+                            numeric_dim=4, embedding=4, pedigree_dim=4, entity_min_count=2, ancestor_min_count=1)
+            with mock.patch.object(segments, 'MIN_FIT_RACES', 5), mock.patch.object(segments, 'MIN_STOP_RACES', 2):
+                summary = fit(database, root / 'data' / 'keiba.sqlite3', root / 'model', train_end='2025-07-01',
+                              evaluate_until='2025-12-31', threads=1, device='cpu', seeds=(42,), nn_config=small,
+                              rounds=200, patience=20, evaluation_samples=64, segments=True)
+            self.assertTrue(summary['segments'])
+            for group in ('central_flat', 'local_flat'):
+                result = summary['groups'][group]
+                used = [item for item in result['segments'] if item['used']]
+                self.assertTrue(used)
+                for item in used:
+                    self.assertGreaterEqual(item['lgbm_rounds'], 0)
+                    self.assertEqual(len(item['nn_best_epochs']), 1)
+                    self.assertEqual(set(item['evaluation']), {'model', 'segmented'})
+                self.assertIn('segmented', result['evaluation'])
+                with (root / 'model' / f'evaluation_{group}.csv').open(encoding='utf-8') as file:
+                    rows = list(csv.DictReader(file))
+                self.assertTrue(all(row['segment'] and row['segmented_score'] for row in rows))

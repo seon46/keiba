@@ -406,8 +406,10 @@ def pl_loss(scores, batch):
 # Training / prediction
 # --------------------------------------------------------------------------
 
-def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', report=None, time_limit=None):
-    """``time_limit`` (seconds): stop with TrialTooSlow as soon as the projected run time exceeds it."""
+def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', report=None, time_limit=None,
+          init_state=None):
+    """``time_limit`` (seconds): stop with TrialTooSlow as soon as the projected run time exceeds it.
+    ``init_state``: start from these weights (fine-tuning); they are kept unless an epoch lowers the stop loss."""
     import numpy as np
     import torch
     report = report or (lambda **message: None)
@@ -418,6 +420,8 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
     if not len(fit_races) or not len(stop_races):
         raise ValueError('ニューラルネットの学習または早期終了用のレースが不足しています。')
     model = build_model(inputs, config).to(device)
+    if init_state is not None:
+        model.load_state_dict(init_state)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
                                   betas=(.9, config.beta2))
     steps = math.ceil(len(fit_races) / config.batch_races) * config.max_epochs
@@ -425,6 +429,9 @@ def train(inputs, fit_rows, stop_rows, config: NeuralConfig, *, device='auto', r
                                                      pct_start=.1) if steps >= 50 else None)
     use_amp = device == 'cuda'
     best, best_state, best_epoch, waited = math.inf, None, 0, 0
+    if init_state is not None:  # epoch 0 = the starting weights
+        best = evaluate_loss(model, inputs, stop_races, device, config.batch_races * 4)
+        best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
     started = time.time()
     for epoch in range(1, config.max_epochs + 1):
         model.train()
