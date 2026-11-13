@@ -41,6 +41,73 @@ function surfaceName(surface) {
   return ({'芝': '芝', 'ダ': 'ダート'})[surface] || surface || '';
 }
 
+// ---------------------------------------------------------------- sortable tables
+// Every table with a header sorts by a column when its header is clicked (again: the other direction). A cell's
+// data-value is used when present; otherwise the number at the start of its text (%, 円, 倍, + and commas allowed),
+// else the text itself. Empty cells and "–" go last in both directions. A table with data-sort-key keeps its order
+// when the page is drawn again. The race card (table.card) sorts its runners itself.
+function compareValues(a, b, dir) {
+  const missing = (v) => v == null || v === '' || (typeof v === 'number' && !Number.isFinite(v));
+  if (missing(a) || missing(b)) return missing(a) - missing(b);
+  if (typeof a === 'number' && typeof b === 'number') return (a - b) * dir;
+  return String(a).localeCompare(String(b), 'ja', {numeric: true}) * dir;
+}
+
+function cellValue(cell) {
+  if (!cell) return null;
+  if (cell.dataset.value !== undefined) {
+    if (cell.dataset.value === '') return null;
+    const n = Number(cell.dataset.value);
+    return Number.isFinite(n) ? n : cell.dataset.value;
+  }
+  const text = cell.textContent.trim();
+  if (!text || text === '–' || text === '-') return null;
+  const match = text.replace(/,/g, '').match(/^[+＋]?(-?\d+(?:\.\d+)?)/);
+  return match ? Number(match[1]) : text;
+}
+
+const tableSorts = new Map();  // data-sort-key -> {column, dir}
+
+function sortTable(table, column, dir) {
+  const body = table.tBodies[0];
+  if (!body) return;
+  const rows = [...body.rows];
+  rows.forEach((row, index) => { if (row.dataset.order === undefined) row.dataset.order = index; });
+  rows.sort((a, b) => compareValues(cellValue(a.cells[column]), cellValue(b.cells[column]), dir)
+    || a.dataset.order - b.dataset.order);
+  rows.forEach((row) => body.appendChild(row));
+  [...table.tHead.rows[0].cells].forEach((th, index) => {
+    if (th.classList.contains('sortable')) th.setAttribute('aria-sort', index === column ? (dir > 0 ? 'ascending' : 'descending') : 'none');
+  });
+  if (table.dataset.sortKey) tableSorts.set(table.dataset.sortKey, {column, dir});
+}
+
+function prepareTables(root) {
+  root.querySelectorAll('table:not(.card)').forEach((table) => {
+    if (!table.tHead || !table.tBodies[0] || table.dataset.sortReady) return;
+    table.dataset.sortReady = '1';
+    [...table.tHead.rows[0].cells].forEach((th) => {
+      if (th.textContent.trim()) { th.classList.add('sortable'); th.setAttribute('aria-sort', 'none'); }
+    });
+    const saved = table.dataset.sortKey && tableSorts.get(table.dataset.sortKey);
+    if (saved) sortTable(table, saved.column, saved.dir);
+  });
+}
+
+document.addEventListener('click', (event) => {
+  const th = event.target.closest('thead th.sortable');
+  const table = th?.closest('table');
+  if (!th || !table || table.classList.contains('card')) return;
+  const column = th.cellIndex;
+  const current = th.getAttribute('aria-sort');
+  // numbers start from the largest, text from the start of the order
+  const first = [...table.tBodies[0].rows].map((row) => cellValue(row.cells[column])).find((v) => v != null);
+  const dir = current === 'descending' ? 1 : current === 'ascending' ? -1 : (typeof first === 'number' ? -1 : 1);
+  sortTable(table, column, dir);
+});
+
+new MutationObserver(() => prepareTables(view)).observe(view, {childList: true, subtree: true});
+
 // ---------------------------------------------------------------- jobs
 const watched = new Map();
 
@@ -293,7 +360,17 @@ function alertJob(error) {
 }
 
 // ---------------------------------------------------------------- race
-const raceState = {sort: 'number', open: new Set(), selectedId: null};
+const raceState = {sort: 'number', dir: 1, open: new Set(), selectedId: null};
+// Values the race card sorts by; null goes last in either direction.
+const CARD_SORT = {
+  frame: (r) => r.frame, number: (r) => r.horse_number, name: (r) => r.horse_name || r.horse_id,
+  jockey: (r) => r.jockey_name, weight: (r) => r.weight_kg, odds: (r, odds) => odds?.win[r.horse_number],
+  place: (r, odds) => { const v = odds?.place[r.horse_number]; return Array.isArray(v) ? v[0] : v; },
+  win: (r) => r.win_probability, top3: (r) => r.top3_probability, expected: (r) => r.expected_rank,
+  finish: (r) => (r.result?.finish_status === 'finished' ? r.result.finish_position : r.result ? 99 : null),
+};
+// Descending first for probabilities, ascending for numbers, names and odds.
+const CARD_DESC_FIRST = new Set(['win', 'top3']);
 
 // Race lists of a day, shared by the race pages (cleared whenever the live-refresh token changes).
 const dayCache = new Map();
@@ -387,12 +464,13 @@ async function raceView(region, raceId) {
     }
     if (region === 'local' && !prediction.bodyweight_known) notices.push('馬体重が発表される前の出馬表で予想しています。');
   }
-  const sorted = [...runners].sort(raceState.sort === 'win'
-    ? (a, b) => (b.win_probability ?? -1) - (a.win_probability ?? -1) || a.horse_number - b.horse_number
-    : (a, b) => a.horse_number - b.horse_number);
   const leader = Math.max(...runners.map((r) => r.win_probability ?? 0));
   const hasResults = !!data.results;
   const odds = data.odds && Object.keys(data.odds.win || {}).length ? data.odds : null;
+  const key = CARD_SORT[raceState.sort] ? raceState.sort : 'number';
+  const sorted = [...runners].sort((a, b) => compareValues(CARD_SORT[key](a, odds), CARD_SORT[key](b, odds), raceState.dir)
+    || a.horse_number - b.horse_number);
+  const th = (sortKey, label, cls = '') => `<th class="${cls} sortable" data-sort="${sortKey}" aria-sort="${key === sortKey ? (raceState.dir > 0 ? 'ascending' : 'descending') : 'none'}">${label}</th>`;
   if (odds) {  // 人気 from the win odds (ties share a rank)
     const values = Object.values(odds.win).sort((a, b) => a - b);
     odds.rank = (number) => (odds.win[number] == null ? null : values.indexOf(odds.win[number]) + 1);
@@ -419,10 +497,10 @@ async function raceView(region, raceId) {
     ${runners.length ? `
     <div class="card-wrap"><table class="card">
       <thead><tr>
-        <th class="opt">枠</th><th class="num sortable" data-sort="number">馬番</th><th>馬名</th><th class="opt">騎手・厩舎</th><th class="num opt">馬体重</th>
-        ${odds ? '<th class="num">単勝</th><th class="num opt">複勝</th>' : ''}
-        <th class="num sortable" data-sort="win">勝率</th><th class="num">3着内</th><th class="num opt">期待着順</th>
-        <th>着順の確率</th>${hasResults ? '<th>着順</th>' : ''}
+        ${th('frame', '枠', 'opt')}${th('number', '馬番', 'num')}${th('name', '馬名')}${th('jockey', '騎手・厩舎', 'opt')}${th('weight', '馬体重', 'num opt')}
+        ${odds ? `${th('odds', '単勝', 'num')}${th('place', '複勝', 'num opt')}` : ''}
+        ${th('win', '勝率', 'num')}${th('top3', '3着内', 'num')}${th('expected', '期待着順', 'num opt')}
+        <th>着順の確率</th>${hasResults ? th('finish', '着順') : ''}
       </tr></thead>
       <tbody>${sorted.map((r) => runnerRow(r, yMax, leader, hasResults, odds)).join('')}</tbody>
     </table></div>
@@ -452,7 +530,12 @@ async function raceView(region, raceId) {
     } catch (e) { alertJob(e); event.target.disabled = false; }
   });
   view.querySelector('#history')?.addEventListener('change', (e) => { const id = Number(e.target.value); raceState.selectedId = id === predictions[0].id ? null : id; raceView(region, raceId); });
-  view.querySelectorAll('[data-sort]').forEach((th) => th.addEventListener('click', () => { raceState.sort = th.dataset.sort; raceView(region, raceId); }));
+  view.querySelectorAll('table.card [data-sort]').forEach((th) => th.addEventListener('click', () => {
+    const next = th.dataset.sort;
+    raceState.dir = raceState.sort === next ? -raceState.dir : (CARD_DESC_FIRST.has(next) ? -1 : 1);
+    raceState.sort = next;
+    raceView(region, raceId);
+  }));
   view.querySelectorAll('tr.runner').forEach((tr) => tr.addEventListener('click', () => {
     const id = tr.dataset.horse;
     raceState.open.has(id) ? raceState.open.delete(id) : raceState.open.add(id);
@@ -711,7 +794,7 @@ function outcomeBox(o) {
 
 // ---------------------------------------------------------------- records
 const recordState = {days: store.get('records-days', '30'), day: 'latest', region: '', after: false,
-                     breakdown: store.get('records-breakdown', 'course')};
+                     breakdown: store.get('records-breakdown', 'course'), split: store.get('records-split', '0') === '1'};
 const BREAKDOWN_TABS = [['course', '競馬場'], ['confidence', '自信度'], ['surface', '芝・ダート'], ['distance', '距離'],
                         ['race_number', 'R番号']];
 
@@ -719,14 +802,16 @@ function skillText(v) {
   return v == null ? '–' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`;
 }
 
-function breakdownTable(rows, label) {
+function breakdownTable(rows, label, key, split) {
   if (!rows || !rows.length) return '<p class="empty small">この条件ではまだありません。</p>';
-  return `<div class="list-wrap"><table class="list breakdown">
-    <thead><tr><th>${label}</th><th class="num">レース</th><th class="num">本命1着</th><th class="num">本命3着内</th>
+  const badge = (tier) => `<span class="conf-mini conf-${tier}">${tier}</span>`;
+  return `<div class="list-wrap"><table class="list breakdown" data-sort-key="records-${key}${split ? '-split' : ''}">
+    <thead><tr><th>${label}</th>${split ? '<th>自信度</th>' : ''}<th class="num">レース</th><th class="num">本命1着</th><th class="num">本命3着内</th>
       <th class="num" title="全馬同じ確率と比べて、着順全体の対数損失がどれだけ小さいか">予想の良さ</th>
       <th class="num" title="本命の単勝を毎レース100円ずつ買った場合（確定オッズ）">本命単勝回収率</th></tr></thead>
     <tbody>${rows.map((r) => `<tr class="${r.races < 10 ? 'few' : ''}">
-      <td>${label === '自信度' ? `<span class="conf-mini conf-${r.name}">${r.name}</span>` : esc(r.name)}</td>
+      <td data-value="${r.order}">${key === 'confidence' ? badge(r.name) : esc(r.name)}</td>
+      ${split ? `<td>${badge(r.confidence)}</td>` : ''}
       <td class="num">${r.races}</td>
       <td class="num">${pct(r.favourite_win_rate, 0)}</td>
       <td class="num">${pct(r.favourite_top3_rate, 0)}</td>
@@ -777,12 +862,18 @@ async function recordsView() {
     <h2>条件ごとの成績</h2>
     <div class="segments tabs" role="group" aria-label="分け方">${BREAKDOWN_TABS.map(([key, label]) =>
       `<button type="button" data-breakdown="${key}" aria-pressed="${key === tab[0]}">${label}</button>`).join('')}</div>
-    ${breakdownTable(data.breakdowns[tab[0]], tab[1])}
+    ${tab[0] !== 'confidence' ? `<label class="small split"><input type="checkbox" id="split" ${recordState.split ? 'checked' : ''}> 自信度（A・B・C）ごとに分ける</label>` : ''}
+    ${(() => {
+      const split = recordState.split && tab[0] !== 'confidence';
+      const rows = (split ? data.breakdowns_by_confidence[tab[0]] : data.breakdowns[tab[0]]) || [];
+      const order = [...new Set(rows.map((r) => r.name))];  // the server's order: fixed bands, or most races first
+      return breakdownTable(rows.map((r) => ({...r, order: order.indexOf(r.name)})), tab[1], tab[0], split);
+    })()}
     <h2>レースごと</h2>
-    <div class="list-wrap"><table class="list">
+    <div class="list-wrap"><table class="list" data-sort-key="records-races">
       <thead><tr><th>日付</th><th>レース</th><th>自信度</th><th>本命</th><th class="num">着順</th><th class="num">単勝</th><th>3着内率1位の馬</th><th class="num">着順</th><th class="num">予想の良さ</th></tr></thead>
       <tbody>${data.races.map((r) => `<tr>
-        <td>${dateLabel(r.race_date)}</td>
+        <td data-value="${r.race_date}${r.start_time ? ' ' + esc(r.start_time) : ''}">${dateLabel(r.race_date)}</td>
         <td><a href="#/race/${r.region}/${r.race_id}">${esc(r.course)} ${r.race_number}R</a> <span class="muted small">${esc(r.race_name || '')}</span></td>
         <td>${r.confidence ? `<span class="conf-mini conf-${r.confidence}">${r.confidence}</span>` : ''}</td>
         <td>${r.favourite_horse_number ?? ''}</td>
@@ -796,6 +887,8 @@ async function recordsView() {
     recordState.days = b.dataset.days; recordState.day = 'latest'; store.set('records-days', b.dataset.days); recordsView(); }));
   view.querySelectorAll('[data-breakdown]').forEach((b) => b.addEventListener('click', () => {
     recordState.breakdown = b.dataset.breakdown; store.set('records-breakdown', b.dataset.breakdown); recordsView(); }));
+  view.querySelector('#split')?.addEventListener('change', (e) => {
+    recordState.split = e.target.checked; store.set('records-split', e.target.checked ? '1' : '0'); recordsView(); });
   view.querySelector('#region').addEventListener('change', (e) => { recordState.region = e.target.value; recordsView(); });
   view.querySelector('#after').addEventListener('change', (e) => { recordState.after = e.target.checked; recordsView(); });
   if (daily) {
@@ -844,7 +937,7 @@ async function statusView() {
     <p class="small muted">成績の追加は、収集・DB更新・照合・当日の予想まで行います（1〜2時間）。学習し直しは、それに加えてモデルを作り直します（さらに30分ほど）。</p>
     <h2>自動処理の履歴</h2>
     ${data.runs.length ? `<div class="list-wrap"><table class="list"><thead><tr><th>開始</th><th>結果</th><th>段階</th></tr></thead><tbody>
-      ${data.runs.map((run) => `<tr><td>${timeLabel(run.started_at)}</td><td>${statusNames[run.status] || esc(run.status)}</td>
+      ${data.runs.map((run) => `<tr><td data-value="${esc(run.started_at)}">${timeLabel(run.started_at)}</td><td>${statusNames[run.status] || esc(run.status)}</td>
         <td><div class="steps">${run.steps.map((s) => `<span class="step ${s.status}">${stepNames[s.step] || s.step} ${statusNames[s.status] || s.status}</span>`).join('')}</div></td></tr>`).join('')}
     </tbody></table></div>` : '<p class="muted">まだ自動処理を実行していません。</p>'}
     ${log.lines.length ? `<h2>最新のログ</h2><pre class="log">${esc(log.lines.join('\n'))}</pre>` : ''}`;

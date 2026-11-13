@@ -167,7 +167,10 @@ table.card { border-collapse: collapse; width: 100%; min-width: 860px; }
 .card th, .card td { padding: 6px 8px; border-bottom: 1px solid var(--soft); text-align: left; vertical-align: middle; }
 .card thead th { font-size: 12px; color: var(--muted); font-weight: 400; background: var(--surface);
                  border-bottom: 1px solid var(--line); white-space: nowrap; }
-.card th.sortable { cursor: pointer; text-decoration: underline dotted; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--ink); }
+th[aria-sort="ascending"]::after { content: " ▲"; font-size: 10px; }
+th[aria-sort="descending"]::after { content: " ▼"; font-size: 10px; }
 .card td.num, .card th.num { text-align: right; }
 .card tbody tr.runner { cursor: pointer; }
 .card tbody tr.runner:hover { background: var(--soft); }
@@ -258,6 +261,7 @@ table.heat { border-collapse: separate; border-spacing: 2px; font-size: 12px; }
 .day-nav button[disabled] { opacity: .4; cursor: default; }
 .segments.tabs { margin: 4px 0 10px; }
 table.breakdown tr.few { opacity: .55; }
+label.split { display: inline-flex; gap: 6px; align-items: center; margin: 0 0 8px 12px; }
 .chart-box { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-top: 16px; }
 .chart-box .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
 .chart-box .legend span::before { content: ""; display: inline-block; width: 14px; height: 3px; margin-right: 6px;

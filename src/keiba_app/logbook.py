@@ -221,7 +221,19 @@ class Logbook:
         daily = [dict(day=day, races=len(values[0]), model=mean(values[0]), uniform=mean(values[1]))
                  for day, values in sorted(by_day.items())]
         breakdowns = {name: _breakdown(rows, key, order) for name, (key, order) in BREAKDOWNS.items()}
-        return dict(summary=summary, daily=daily, breakdowns=breakdowns, races=rows[:limit])
+        # the same tables with each condition split by confidence tier (A, B, C)
+        by_confidence = {}
+        for name, (key, order) in BREAKDOWNS.items():
+            if name == 'confidence':
+                continue
+            split = []
+            for item in _breakdown(rows, key, order):
+                members = [row for row in rows if row.get(key) == item['name']]
+                for tier in _breakdown(members, 'confidence', BREAKDOWNS['confidence'][1]):
+                    split.append(dict(tier, name=item['name'], confidence=tier['name']))
+            by_confidence[name] = split
+        return dict(summary=summary, daily=daily, breakdowns=breakdowns, breakdowns_by_confidence=by_confidence,
+                    races=rows[:limit])
 
     def confidence_history(self, region):
         """[(win probabilities, pick_won or None, pick_top3 or None)] of the last pre-race prediction of each race."""
