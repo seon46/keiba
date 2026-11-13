@@ -44,8 +44,11 @@ class BetTests(unittest.TestCase):
             self.assertGreaterEqual(item['min_payout'], item['cost'])
             self.assertEqual(sum(ticket['stake'] for ticket in item['tickets']), item['cost'])
             self.assertGreaterEqual(item['hit_rate'], .2)
-        returns = [item['expected_return'] for item in proposals]
-        self.assertEqual(returns, sorted(returns, reverse=True))
+        growths = [item['growth'] for item in proposals]
+        self.assertEqual(growths, sorted(growths, reverse=True))
+        # odds 25% below fair: no set grows the bankroll, so each keeps its smallest stake
+        self.assertTrue(all(item['growth'] < 0 for item in proposals))
+        self.assertTrue(all(item['cost'] == 100 * item['points'] for item in proposals))
         from keiba_ai.bets import combine
         mixes = combine(self.bets, odds, min_hit=.2, max_points=10, budget=1000)
         self.assertTrue(mixes)
@@ -56,6 +59,30 @@ class BetTests(unittest.TestCase):
             self.assertGreaterEqual(mix['min_payout'], mix['cost'])
             self.assertGreaterEqual(mix['hit_rate'], .2)
         self.assertEqual(combine(self.bets, None), [])
+
+    def test_kelly_stake_and_long_shot_parts(self):
+        from keiba_ai.bets import combine, propose
+        # odds 40% above fair: betting grows the bankroll, and the stake grows with the bankroll
+        odds = {bet: {key: round(1.4 / p, 1) for key, p in self.bets.probabilities(bet).items() if p > .002}
+                for bet in ('win', 'quinella', 'exacta', 'trio', 'trifecta')}
+        priced = lambda items: [item for item in items if item['priced']]
+        small = priced(propose(self.bets, odds, min_hit=.2, budget=10000, bankroll=20000))
+        large = priced(propose(self.bets, odds, min_hit=.2, budget=10000, bankroll=1000000))
+        self.assertTrue(small and all(item['growth'] > 0 for item in small))
+        self.assertLess(max(item['cost'] for item in small), 10000)  # Kelly keeps it below the cap
+        by_bet = {item['bet']: item['cost'] for item in small}
+        self.assertTrue(any(item['cost'] >= by_bet.get(item['bet'], 0) for item in large))
+        self.assertTrue(all(item['min_payout'] >= item['cost'] for item in small + large))
+        # a mix may contain a part that alone hits rarely (3連単 / 馬単 sets)
+        mixes = combine(self.bets, odds, min_hit=.3, max_points=10, budget=5000, bankroll=50000)
+        self.assertTrue(mixes)
+        self.assertEqual([mix['growth'] for mix in mixes], sorted((mix['growth'] for mix in mixes), reverse=True))
+        rare = [part for mix in mixes for part in mix['parts']
+                if self.bets.hit_rate(part['bet'], [ticket['key'] for ticket in part['tickets']]) < .3]
+        self.assertTrue(rare)
+        for mix in mixes:
+            self.assertGreaterEqual(mix['hit_rate'], .3)
+            self.assertGreaterEqual(mix['min_payout'], mix['cost'])
         # without odds: 100 yen each, by hit rate
         plain = propose(self.bets, None, min_hit=.2)
         self.assertTrue(all(ticket['stake'] == 100 for item in plain for ticket in item['tickets']))
