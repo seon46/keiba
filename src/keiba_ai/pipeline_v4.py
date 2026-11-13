@@ -68,7 +68,9 @@ def _fill_strength(keys, stored, predict_missing):
 
 def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow_test_period=False, groups=GROUPS,
         threads=2, device='auto', seeds=NN_SEEDS, nn_config=None, rounds=None, patience=None,
-        evaluation_samples=1024, report=None, **overrides):
+        evaluation_samples=1024, report=None, segments=False, **overrides):
+    """``segments``: also fit the segment corrections of ``keiba_ai.segments`` (approach A) and, with
+    ``evaluate_until``, compare them with the group model.  The saved bundles are the same either way."""
     import numpy as np
     import joblib
     from threadpoolctl import threadpool_limits
@@ -123,7 +125,8 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
                    train_end=train_end, evaluate_until=evaluate_until,
                    evaluated_test_period=bool(evaluate_until and evaluate_until > TEST_START),
                    trained_on_test_period=train_end > TEST_START, device=device, pedigrees=len(pedigrees),
-                   settings=settings, nn_config=asdict(nn_config), nn_seeds=list(seeds), groups={})
+                   settings=settings, nn_config=asdict(nn_config), nn_seeds=list(seeds), segments=bool(segments),
+                   groups={})
     with fresh_directory(output) as temporary:
         for group in groups:
             ctx = group_context(database, group, pedigrees, announce_dropout=settings['announce_dropout'],
@@ -238,6 +241,12 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
                 weights = _blend(stop_structure, stop_b, stop_nn)
                 stop_d = weights[0] * stop_b + weights[1] * stop_nn
                 temperatures, stop_loss, shape = fit_hybrid_temperatures(stop_structure, stop_d)
+                segment_models, labels = {}, None
+                if segments:
+                    segment_models, labels, group_result['segments'] = _fit_segments(
+                        data, group, race_ids, days, fit_mask, stop_mask, training, evaluate_until, train_end,
+                        Blocks(data, columns, train_blocks + [(ped, None)]), categorical, params, model_b, best_b,
+                        networks, seeds, nn_config, inputs, device, report)
                 bundle.update(nn=dict(config=asdict(nn_config), encoders=inputs.encoders(), states=states),
                               blend_weights=weights, temperatures=temperatures, temperature_shape=shape)
                 group_result.update(best_iteration=best_b, best_iteration_a=best_a, finisher_best_iteration=finisher_best,
@@ -256,6 +265,11 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
                                       finisher.predict(data['x'][np.ix_(rows, columns)], num_iteration=finisher_best))
                         args = (race_ids[rows], data['positions'][rows], data['finished'][rows], data['race_numbers'][rows])
                         evaluation = {}
+                        score_segmented = None
+                        if segments:
+                            score_segmented = _segment_scores(rows, labels, segment_models, score_b, score_nn,
+                                                              weights, Blocks(data, columns, train_blocks + [(ped, None)]),
+                                                              inputs)
                         part_temperatures = dict(model=temperatures,
                                                  lightgbm_pedigree=fit_hybrid_temperatures(stop_structure, stop_b)[0],
                                                  network=fit_hybrid_temperatures(stop_structure, stop_nn)[0])
@@ -269,17 +283,33 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
                                 ('uniform', np.zeros(len(rows)), [1.0])):
                             evaluation[name] = score_races(*args, scores, completion, temps, samples=evaluation_samples,
                                                            seed=settings['seed'])['metrics']
+                        if score_segmented is not None:
+                            evaluation['segmented'] = score_races(*args, score_segmented, completion, temperatures,
+                                                                  samples=evaluation_samples,
+                                                                  seed=settings['seed'])['metrics']
+                            for item in group_result['segments']:
+                                chosen = np.flatnonzero(labels[rows] == item['name'])
+                                if not len(chosen):
+                                    continue
+                                part = tuple(array[chosen] for array in args)
+                                item['evaluation'] = {
+                                    name: score_races(*part, scores[chosen], completion[chosen], temperatures,
+                                                      samples=evaluation_samples, seed=settings['seed'])['metrics']
+                                    for name, scores in (('model', score_d), ('segmented', score_segmented))}
                         group_result['evaluation'] = evaluation
                         with (temporary / f'evaluation_{group}.csv').open('w', encoding='utf-8', newline='') as file:
                             writer = csv.writer(file)
                             writer.writerow(['race_date', 'race_id', 'horse_id', 'finish_position', 'strength_score',
-                                             'finish_probability', 'lightgbm_score', 'network_score', 'network_spread'])
-                            for row, score, probability, b, nn, sd in zip(rows, score_d, completion, score_b, score_nn,
-                                                                          spread):
+                                             'finish_probability', 'lightgbm_score', 'network_score', 'network_spread']
+                                            + (['segment', 'segmented_score'] if score_segmented is not None else []))
+                            for index, (row, score, probability, b, nn, sd) in enumerate(
+                                    zip(rows, score_d, completion, score_b, score_nn, spread)):
                                 writer.writerow([days[row], race_ids[row], horses[row],
                                                  int(data['positions'][row]) if data['finished'][row] else '',
                                                  f'{score:.6f}', f'{probability:.6f}', f'{b:.6f}', f'{nn:.6f}',
-                                                 f'{sd:.6f}'])
+                                                 f'{sd:.6f}']
+                                                + ([labels[row], f'{score_segmented[index]:.6f}']
+                                                   if score_segmented is not None else []))
                 networks.clear()
             joblib.dump(bundle, temporary / f'{group}.joblib', compress=3)
             summary['groups'][group] = group_result
@@ -290,6 +320,61 @@ def fit(database, race_db, output, *, train_end=None, evaluate_until=None, allow
         (temporary / 'model.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str) + '\n',
                                               encoding='utf-8')
     return summary
+
+
+def _fit_segments(data, group, race_ids, days, fit_mask, stop_mask, training, evaluate_until, train_end, matrix_b,
+                  categorical, params, model_b, best_b, networks, seeds, nn_config, inputs, device, report):
+    """Approach A of ``keiba_ai.segments``: per segment, B continued from its scores and each NN seed fine-tuned,
+    both early stopped on the segment's stop races.  Returns (models by segment, row labels, summary)."""
+    import numpy as np
+    from .experiment_v3b import _finisher_rows
+    from .segments import MIN_FIT_RACES, MIN_STOP_RACES, fine_tune_network, residual_lightgbm, segment_labels
+    labels = segment_labels(data['x'], group)
+    needed = fit_mask | stop_mask | ((days >= train_end) & (days < evaluate_until) if evaluate_until else False)
+    base = np.full(len(days), np.nan)
+    rows = np.flatnonzero(needed)
+    for start in range(0, len(rows), 100000):
+        chunk = rows[start:start + 100000]
+        base[chunk] = model_b.predict(matrix_b(chunk), num_iteration=best_b, raw_score=True)
+    races_of = lambda selected: len(set(race_ids[selected].tolist()))
+    names = sorted(set(labels[training].tolist()), key=lambda name: -int((labels[training] == name).sum()))
+    models, summary = {}, []
+    for name in names:
+        mask = labels == name
+        fit_rows, stop_rows = _finisher_rows(data, fit_mask & mask), _finisher_rows(data, stop_mask & mask)
+        item = dict(name=name, fit_races=races_of(fit_rows), stop_races=races_of(stop_rows))
+        summary.append(item)
+        if item['fit_races'] < MIN_FIT_RACES or item['stop_races'] < MIN_STOP_RACES:
+            item['used'] = False
+            continue
+        report(event='segment', group=group, segment=name, fit_races=item['fit_races'], stop_races=item['stop_races'])
+        booster, rounds, losses = residual_lightgbm(data, matrix_b, categorical, fit_rows, stop_rows, base, params)
+        tuned, epochs = [], []
+        for seed, network in zip(seeds, networks):
+            member = NeuralConfig(**dict(asdict(nn_config), seed=seed))
+            model, info = fine_tune_network(network, inputs, np.flatnonzero(fit_mask & mask),
+                                            np.flatnonzero(stop_mask & mask), member, device=device)
+            tuned.append(model)
+            epochs.append(info['best_epoch'])
+        models[name] = (booster, rounds, tuned)
+        item.update(used=True, lgbm_rounds=rounds, lgbm_stop_loss=losses, nn_best_epochs=epochs)
+        report(event='segment_done', group=group, segment=name, lgbm_rounds=rounds, nn_best_epochs=epochs)
+    return models, labels, summary
+
+
+def _segment_scores(rows, labels, models, score_b, score_nn, weights, matrix_b, inputs):
+    """Blended scores of ``rows`` with each used segment's corrections (others keep the group model)."""
+    import numpy as np
+    from .neural import predict as nn_predict
+    b, nn = score_b.copy(), score_nn.copy()
+    for name, (booster, rounds, tuned) in models.items():
+        chosen = np.flatnonzero(labels[rows] == name)
+        if not len(chosen):
+            continue
+        if booster is not None:
+            b[chosen] += booster.predict(matrix_b(rows[chosen]), num_iteration=rounds, raw_score=True)
+        nn[chosen] = np.mean([nn_predict(model, inputs, rows[chosen]) for model in tuned], axis=0)
+    return weights[0] * b + weights[1] * nn
 
 
 # --------------------------------------------------------------------------
@@ -623,6 +708,8 @@ def main(argv=None):
     fitting.add_argument('--train-end', help='この日より前で学習（既定: データ最終日の翌日）')
     fitting.add_argument('--train-start', help='この日以降で学習（既定: 2022-04-01。DBの最初の日から半年ほど後にします）')
     fitting.add_argument('--evaluate-until', help='train-end以降、この日より前を評価')
+    fitting.add_argument('--segments', action='store_true',
+                         help='区分（芝ダ×年齢×クラス）ごとの補正も学習し、--evaluate-untilの期間で比べる（保存するモデルは同じ）')
     fitting.add_argument('--allow-test-period', action='store_true')
     fitting.add_argument('--groups', nargs='+', default=list(GROUPS), choices=list(GROUPS))
     fitting.add_argument('--threads', type=int, default=2)
@@ -651,7 +738,7 @@ def main(argv=None):
             summary = fit(args.dataset, args.race_db, args.output_dir, train_end=args.train_end,
                           evaluate_until=args.evaluate_until, allow_test_period=args.allow_test_period,
                           groups=args.groups, threads=args.threads, device=args.device, rounds=args.rounds,
-                          patience=args.patience, evaluation_samples=args.evaluation_samples, report=emit,
+                          patience=args.patience, evaluation_samples=args.evaluation_samples, report=emit, segments=args.segments,
                           **({'train_start': args.train_start} if args.train_start else {}))
             emit(event='fit_complete', model=str(args.output_dir / 'model.json'), train_end=summary['train_end'],
                  seconds=summary['seconds'])
