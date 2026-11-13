@@ -229,8 +229,13 @@ class Scraper:
             failed += code != 0
         return failed
 
-    def odds(self, region, race_id):
-        code, messages = self.run('odds', '--region', region, '--race-id', race_id, timeout=180, priority=True)
+    def odds(self, region, race_id, *, trio_axes=(), trifecta_axes=()):
+        arguments = ['odds', '--region', region, '--race-id', race_id]
+        for axis in trio_axes:
+            arguments += ['--trio-axis', str(axis)]
+        for axis in trifecta_axes:
+            arguments += ['--trifecta-axis', str(axis)]
+        code, messages = self.run(*arguments, timeout=180 + 15 * (len(trio_axes) + len(trifecta_axes)), priority=True)
         if code != 0:
             detail = ' '.join(message.get('text', '') for message in messages).replace('ERROR: ', '')[-300:]
             raise ValueError(f'オッズを取得できません: {detail}')

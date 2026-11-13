@@ -403,8 +403,38 @@ class Engine:
                     odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
                                                          official_at=saved.get('official_at'), status=saved.get('status'),
                                                          bets=sorted(saved.get('odds', {}))),
-                    odds_supported=True, odds_partial=prediction['region'] == 'local',
+                    odds_supported=True, odds_partial=prediction['region'] == 'local' and not {'trio', 'trifecta'} <= set(table or {}),
                     confidence=self.confidence(prediction))
 
-    def fetch_odds(self, region, race_id):
-        return self.scraper.odds(region, race_id)
+    def fetch_odds(self, region, race_id, *, axes=3):
+        """Fetch the odds; for a local race with a prediction also 3連複 / 3連単 for ``axes`` axis horses each."""
+        trio, trifecta = self.odds_axes(region, race_id, axes) if region == 'local' else ([], [])
+        return self.scraper.odds(region, race_id, trio_axes=trio, trifecta_axes=trifecta)
+
+    def odds_axes(self, region, race_id, count=3):
+        """Axis horses whose local 3連複 / 3連単 pages cover the likeliest tickets: (trio axes, trifecta axes).
+
+        3連単 pages list the orders with the axis first, so the axes are the ``count`` most likely winners.  3連複
+        pages list every trio containing the axis, so the axes are picked greedily to cover the most probability
+        among the 60 likeliest trios.  ([], []) without a prediction."""
+        predictions = self.logbook.predictions_for_race(race_id)
+        if not predictions or count <= 0:
+            return [], []
+        try:
+            bets = self._race_bets(predictions[0])
+        except ValueError:
+            return [], []
+        winners = sorted(bets.probabilities('win').items(), key=lambda item: -item[1])
+        trifecta = [int(key) for key, _ in winners[:count]]
+        trios = sorted(bets.probabilities('trio').items(), key=lambda item: -item[1])[:60]
+        tickets = [(set(int(number) for number in key.split('-')), probability) for key, probability in trios]
+        trio = []
+        while len(trio) < count and tickets:
+            gain = {}
+            for horses, probability in tickets:
+                for horse in horses:
+                    gain[horse] = gain.get(horse, 0) + probability
+            best = max(gain, key=lambda horse: (gain[horse], -horse))
+            trio.append(best)
+            tickets = [(horses, probability) for horses, probability in tickets if best not in horses]
+        return trio, trifecta

@@ -626,6 +626,8 @@ def parse_odds_json(text: str, *, race_id: str, region: str) -> dict:
 # 3連複・3連単 pages hold one axis horse each (a dozen requests per race), so they are not read.
 LOCAL_ODDS_PAGES = ("b1", "b3", "b4", "b5", "b6")
 _LOCAL_PAIRS = {"b3": ("bracket", False), "b4": ("quinella", False), "b5": ("wide", False), "b6": ("exacta", True)}
+# 3連複 / 3連単: one page per axis horse (urls.local_axis_odds_url)
+LOCAL_TRIPLES = {"b7": ("trio", False), "b8": ("trifecta", True)}
 
 
 def _range(text):
@@ -635,7 +637,8 @@ def _range(text):
 
 
 def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
-    """{bet: {ticket key: odds}} from one nar.netkeiba.com odds page (b1 単勝・複勝, b3 枠連, b4 馬連, b5 ワイド, b6 馬単)."""
+    """{bet: {ticket key: odds}} from one nar.netkeiba.com odds page (b1 単勝・複勝, b3 枠連, b4 馬連, b5 ワイド, b6 馬単,
+    and one axis horse's page of b7 3連複 / b8 3連単).  Odds shown as 0.0 (no sales) are left out."""
     soup = BeautifulSoup(html, "html.parser")
     odds = {}
     if kind == "b1":
@@ -669,6 +672,20 @@ def parse_local_odds(html: str, *, race_id: str, kind: str) -> dict:
                 continue
             a, b = (int(group) for group in match.groups())  # 馬単: the first number finishes first
             entries[f"{a}>{b}" if ordered else f"{min(a, b)}-{max(a, b)}"] = value
+        if entries:
+            odds[bet] = entries
+    elif kind in LOCAL_TRIPLES:
+        bet, ordered = LOCAL_TRIPLES[kind]
+        entries = {}
+        for cell in soup.select("td.Odds[id]"):
+            match = re.search(rf"_{kind}_c\d+_(\d+)_(\d+)_(\d+)$", cell.get("id", ""))
+            if not match:
+                continue
+            value = _odds_number(_cell_text(cell))
+            if not value:
+                continue
+            numbers = [int(group) for group in match.groups()]  # 3連単: 1st, 2nd, 3rd
+            entries[">".join(map(str, numbers)) if ordered else "-".join(map(str, sorted(numbers)))] = value
         if entries:
             odds[bet] = entries
     else:
