@@ -230,7 +230,8 @@ class Engine:
             if status in ('scratched', 'excluded'):
                 continue
             actual[str(row.get('horse_id'))] = dict(horse_number=row.get('horse_number'), status=status,
-                                                    position=row.get('finish_position'))
+                                                    position=row.get('finish_position'), odds=row.get('odds'),
+                                                    popularity=row.get('popularity'))
         runners = [runner for runner in prediction['runners'] if runner.get('distribution')]
         outcome = dict(scored_at=now().isoformat(timespec='seconds'), actual_starters=len(actual),
                        results={str(item['horse_number']): item for item in actual.values()})
@@ -274,6 +275,9 @@ class Engine:
         for item in self.logbook.unscored(today()):
             status = self.score(item['id'])
             counts[status or 'waiting'] = counts.get(status or 'waiting', 0) + 1
+        # outcomes scored before the final win odds were kept: score them again so the records can show returns
+        for identifier in self.logbook.scored_without_odds():
+            self.score(identifier)
         return counts
 
 

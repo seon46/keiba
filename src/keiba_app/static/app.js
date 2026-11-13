@@ -710,17 +710,43 @@ function outcomeBox(o) {
 }
 
 // ---------------------------------------------------------------- records
-const recordState = {days: store.get('records-days', '30'), region: '', after: false};
+const recordState = {days: store.get('records-days', '30'), day: 'latest', region: '', after: false,
+                     breakdown: store.get('records-breakdown', 'course')};
+const BREAKDOWN_TABS = [['course', '競馬場'], ['confidence', '自信度'], ['surface', '芝・ダート'], ['distance', '距離'],
+                        ['race_number', 'R番号']];
+
+function skillText(v) {
+  return v == null ? '–' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`;
+}
+
+function breakdownTable(rows, label) {
+  if (!rows || !rows.length) return '<p class="empty small">この条件ではまだありません。</p>';
+  return `<div class="list-wrap"><table class="list breakdown">
+    <thead><tr><th>${label}</th><th class="num">レース</th><th class="num">本命1着</th><th class="num">本命3着内</th>
+      <th class="num" title="全馬同じ確率と比べて、着順全体の対数損失がどれだけ小さいか">予想の良さ</th>
+      <th class="num" title="本命の単勝を毎レース100円ずつ買った場合（確定オッズ）">本命単勝回収率</th></tr></thead>
+    <tbody>${rows.map((r) => `<tr class="${r.races < 10 ? 'few' : ''}">
+      <td>${label === '自信度' ? `<span class="conf-mini conf-${r.name}">${r.name}</span>` : esc(r.name)}</td>
+      <td class="num">${r.races}</td>
+      <td class="num">${pct(r.favourite_win_rate, 0)}</td>
+      <td class="num">${pct(r.favourite_top3_rate, 0)}</td>
+      <td class="num">${skillText(r.skill)}</td>
+      <td class="num">${r.favourite_roi == null ? '–' : pct(r.favourite_roi, 0)}${r.priced_races && r.priced_races < r.races ? `<span class="muted small">（${r.priced_races}R）</span>` : ''}</td>
+    </tr>`).join('')}</tbody></table></div>
+    <p class="muted small">10レース未満の行は薄く表示しています（数が少なく、偶然の影響が大きいため）。</p>`;
+}
 
 async function recordsView() {
-  const query = `records?days=${recordState.days}&region=${recordState.region}&after=${recordState.after ? 1 : 0}`;
+  const daily = recordState.days === 'day';
+  const query = `records?${daily ? `day=${recordState.day}` : `days=${recordState.days}`}&region=${recordState.region}&after=${recordState.after ? 1 : 0}`;
   const data = await api(query);
   const s = data.summary;
   const better = s.outcome_log_loss != null && s.uniform_log_loss != null ? s.uniform_log_loss - s.outcome_log_loss : null;
+  const tab = BREAKDOWN_TABS.find(([key]) => key === recordState.breakdown) || BREAKDOWN_TABS[0];
   view.innerHTML = `
     <h1>予想の記録</h1>
     <div class="filters">
-      <div class="segments" role="group" aria-label="期間">${[['7', '7日'], ['30', '30日'], ['90', '90日'], ['all', '全期間']].map(([v, l]) =>
+      <div class="segments" role="group" aria-label="期間">${[['day', '日別'], ['7', '7日'], ['30', '30日'], ['90', '90日'], ['all', '全期間']].map(([v, l]) =>
         `<button type="button" data-days="${v}" aria-pressed="${recordState.days === v}">${l}</button>`).join('')}</div>
       <select id="region" aria-label="中央・地方">
         <option value="" ${recordState.region === '' ? 'selected' : ''}>中央と地方</option>
@@ -729,30 +755,54 @@ async function recordsView() {
       </select>
       <label class="small"><input type="checkbox" id="after" ${recordState.after ? 'checked' : ''}> 発走後に作った予想も含める</label>
     </div>
+    ${daily ? `<div class="day-nav">
+      <button type="button" id="prev-day" ${data.previous_day ? '' : 'disabled'}>◀ 前の開催日</button>
+      <strong>${data.day ? dateLabel(data.day) : ''}</strong>
+      <input type="date" id="pick-day" value="${data.day || ''}" aria-label="日付を選ぶ">
+      <button type="button" id="next-day" ${data.next_day ? '' : 'disabled'}>次の開催日 ▶</button>
+    </div>` : ''}
     ${s.races ? `
     <div class="figures">
       <div class="figure"><div class="value">${s.races}</div><div class="label">採点したレース</div><div class="compare">結果待ち ${s.pending_races}レース</div></div>
+      <div class="figure"><div class="value">${pct(s.favourite_win_rate)}</div><div class="label">本命（勝率1位）が1着</div></div>
+      <div class="figure"><div class="value">${pct(s.favourite_top3_rate)}</div><div class="label">本命が3着以内</div></div>
+      <div class="figure"><div class="value">${s.favourite_roi == null ? '–' : pct(s.favourite_roi, 0)}</div><div class="label">本命の単勝回収率</div>
+        <div class="compare">${s.priced_races ? `確定オッズ、${s.priced_races}レース` : 'オッズのある結果がまだありません'}</div></div>
+      <div class="figure"><div class="value">${skillText(s.skill)}</div><div class="label">予想の良さ（着順全体）</div>
+        <div class="compare">全馬同じ確率と比べた対数損失の改善</div></div>
       <div class="figure"><div class="value">${num(s.outcome_log_loss, 3)}</div><div class="label">順位分布の対数損失（小さいほど良い）</div>
         <div class="compare">全馬同じ確率なら ${num(s.uniform_log_loss, 3)}${better != null ? `（${Math.abs(better).toFixed(3)}${better >= 0 ? '良い' : '悪い'}）` : ''}</div></div>
-      <div class="figure"><div class="value">${pct(s.pick_top3_rate)}</div><div class="label">3着内率1位の馬が3着以内</div></div>
-      <div class="figure"><div class="value">${pct(s.favourite_win_rate)}</div><div class="label">勝率1位の馬が1着</div></div>
-      <div class="figure"><div class="value">${num(s.win_log_loss, 3)}</div><div class="label">1着の対数損失</div></div>
     </div>
-    ${data.daily.length >= 2 ? `<div class="chart-box"><div class="legend"><span>予想</span><span class="uniform">全馬同じ確率</span></div>${lineChart(data.daily)}</div>` : ''}
+    ${!daily && data.daily.length >= 2 ? `<div class="chart-box"><div class="legend"><span>予想</span><span class="uniform">全馬同じ確率</span></div>${lineChart(data.daily)}</div>` : ''}
+    <h2>条件ごとの成績</h2>
+    <div class="segments tabs" role="group" aria-label="分け方">${BREAKDOWN_TABS.map(([key, label]) =>
+      `<button type="button" data-breakdown="${key}" aria-pressed="${key === tab[0]}">${label}</button>`).join('')}</div>
+    ${breakdownTable(data.breakdowns[tab[0]], tab[1])}
     <h2>レースごと</h2>
     <div class="list-wrap"><table class="list">
-      <thead><tr><th>日付</th><th>レース</th><th>3着内率1位の馬</th><th class="num">着順</th><th class="num">対数損失</th><th class="num">全馬同確率</th></tr></thead>
+      <thead><tr><th>日付</th><th>レース</th><th>自信度</th><th>本命</th><th class="num">着順</th><th class="num">単勝</th><th>3着内率1位の馬</th><th class="num">着順</th><th class="num">予想の良さ</th></tr></thead>
       <tbody>${data.races.map((r) => `<tr>
         <td>${dateLabel(r.race_date)}</td>
         <td><a href="#/race/${r.region}/${r.race_id}">${esc(r.course)} ${r.race_number}R</a> <span class="muted small">${esc(r.race_name || '')}</span></td>
+        <td>${r.confidence ? `<span class="conf-mini conf-${r.confidence}">${r.confidence}</span>` : ''}</td>
+        <td>${r.favourite_horse_number ?? ''}</td>
+        <td class="num">${r.favourite_position ?? '–'}</td>
+        <td class="num">${r.favourite_odds != null ? num(r.favourite_odds, 1) : '–'}</td>
         <td>${r.pick_horse_number ?? ''} ${esc(r.pick_horse_name || '')}</td>
         <td class="num">${r.pick_position ?? '–'}</td>
-        <td class="num">${num(r.outcome_log_loss, 3)}</td>
-        <td class="num muted">${num(r.uniform_log_loss, 3)}</td></tr>`).join('')}</tbody>
+        <td class="num">${skillText(r.skill)}</td></tr>`).join('')}</tbody>
     </table></div>` : `<p class="empty">この条件で採点済みの予想はまだありません。予想したレースは、結果が出たあとの自動処理で採点されます（結果待ち ${s.pending_races}レース）。</p>`}`;
-  view.querySelectorAll('[data-days]').forEach((b) => b.addEventListener('click', () => { recordState.days = b.dataset.days; store.set('records-days', b.dataset.days); recordsView(); }));
+  view.querySelectorAll('[data-days]').forEach((b) => b.addEventListener('click', () => {
+    recordState.days = b.dataset.days; recordState.day = 'latest'; store.set('records-days', b.dataset.days); recordsView(); }));
+  view.querySelectorAll('[data-breakdown]').forEach((b) => b.addEventListener('click', () => {
+    recordState.breakdown = b.dataset.breakdown; store.set('records-breakdown', b.dataset.breakdown); recordsView(); }));
   view.querySelector('#region').addEventListener('change', (e) => { recordState.region = e.target.value; recordsView(); });
   view.querySelector('#after').addEventListener('change', (e) => { recordState.after = e.target.checked; recordsView(); });
+  if (daily) {
+    view.querySelector('#prev-day').addEventListener('click', () => { recordState.day = data.previous_day; recordsView(); });
+    view.querySelector('#next-day').addEventListener('click', () => { recordState.day = data.next_day; recordsView(); });
+    view.querySelector('#pick-day').addEventListener('change', (e) => { if (e.target.value) { recordState.day = e.target.value; recordsView(); } });
+  }
 }
 
 function lineChart(daily) {
