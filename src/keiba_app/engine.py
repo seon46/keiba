@@ -10,6 +10,7 @@ import threading
 from .logbook import Logbook
 from .sources import SavedRaces, Scraper, course_of, entries_from_results, race_number_of
 from .state import JST, App, now, today
+from .wallet import Wallet
 
 UNSUPPORTED = 'このレースは対象外です（中央・地方の平地のみ予想します）。'
 
@@ -38,6 +39,7 @@ class Engine:
     def __init__(self, app: App, *, scraper=None, samples=4096, report=None):
         self.app = app
         self.logbook = Logbook(app.logbook_path)
+        self.wallet = Wallet(app.logbook_path)
         self.saved = SavedRaces(app.scraper_db)
         self.scraper = scraper or Scraper(app.data_dir)
         self.samples = samples
@@ -278,6 +280,9 @@ class Engine:
         # outcomes scored before the final win odds were kept: score them again so the records can show returns
         for identifier in self.logbook.scored_without_odds():
             self.score(identifier)
+        settled = self.wallet.settle(self.saved)  # users' recorded bets of races with saved payouts
+        if settled:
+            counts['bets_settled'] = settled
         return counts
 
 
@@ -309,11 +314,13 @@ class Engine:
         return dict(value=value, tier=tier, thresholds=list(scale['thresholds']), approximate=approximate,
                     expected=dict(races=scale['races'], **scale['rates'][tier]), rates=scale['rates'])
 
-    def _race_bets(self, prediction):
-        """Simulated finishing orders of a logged prediction (cached)."""
-        from keiba_ai.bets import RaceBets, simulate_top3
+    def _race_bets(self, prediction, win_odds=None):
+        """Simulated finishing orders of a logged prediction (cached).  With ``win_odds`` ({horse number: odds})
+        the strengths are blended with the market (``keiba_ai.bets.MARKET_BLEND``); ``bets.blended`` says
+        whether that happened (it does not when a runner has no win odds)."""
+        from keiba_ai.bets import RaceBets, blend_with_market, simulate_top3
         from keiba_ai.rank_model import race_seed
-        identifier = prediction['id']
+        identifier = (prediction['id'], tuple(sorted((str(k), str(v)) for k, v in (win_odds or {}).items())))
         if identifier in self._bets:
             self._bets.move_to_end(identifier)
             return self._bets[identifier]
@@ -323,11 +330,17 @@ class Engine:
         temperatures, approximate = self._temperatures(prediction)
         if not temperatures:
             raise ValueError('この予想のモデルが見つからないため、馬券の確率を計算できません。予想し直してください。')
-        top3 = simulate_top3([runner['strength_score'] for runner in runners],
-                             [runner['finish_probability'] for runner in runners], temperatures,
+        scores = [runner['strength_score'] for runner in runners]
+        blended = blend_with_market(prediction['region'], scores, temperatures,
+                                    [(win_odds or {}).get(str(runner['horse_number'])) for runner in runners]
+                                    ) if win_odds else None
+        if blended is not None:
+            scores, temperatures = blended
+        top3 = simulate_top3(scores, [runner['finish_probability'] for runner in runners], temperatures,
                              seed=race_seed(prediction['race_id'], 42))
         bets = RaceBets([runner['horse_number'] for runner in runners], [runner.get('frame') for runner in runners], top3)
         bets.approximate = approximate
+        bets.blended = blended is not None
         self._bets[identifier] = bets
         while len(self._bets) > 24:
             self._bets.popitem(last=False)
@@ -387,14 +400,15 @@ class Engine:
                     pick_horse_number=pick['horse_number'], pick_win_probability=pick.get('win_probability'),
                     pick_top3_probability=pick.get('top3_probability'))
 
-    def bets(self, prediction_id, *, min_hit=.2, max_points=10, budget=1000, bankroll=50000):
-        from keiba_ai.bets import BET_NAMES, combine, propose
+    def bets(self, prediction_id, *, min_hit=.2, max_points=10, budget=1000, bankroll=50000, blend=True):
+        from keiba_ai.bets import BET_NAMES, MARKET_BLEND, combine, propose
         prediction = self.logbook.prediction(prediction_id)
         if prediction is None:
             raise KeyError('予想がありません。')
-        race_bets = self._race_bets(prediction)
         saved = self.saved.odds(prediction['region'], prediction['race_id'])
         table = (saved or {}).get('odds')
+        win_odds = (table or {}).get('win') if blend else None
+        race_bets = self._race_bets(prediction, win_odds or None)
         proposals = propose(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
         mixes = combine(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
         return dict(prediction_id=prediction_id, proposals=proposals, mixes=mixes, bet_names=BET_NAMES, budget=budget,
@@ -403,6 +417,8 @@ class Engine:
                     odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
                                                          official_at=saved.get('official_at'), status=saved.get('status'),
                                                          bets=sorted(saved.get('odds', {}))),
+                    blend=dict(requested=blend, applied=getattr(race_bets, 'blended', False),
+                               **MARKET_BLEND['central' if prediction['region'] == 'central' else 'local']),
                     odds_supported=True, odds_partial=prediction['region'] == 'local' and not {'trio', 'trifecta'} <= set(table or {}),
                     confidence=self.confidence(prediction))
 

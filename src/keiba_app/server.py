@@ -133,6 +133,50 @@ class Api:
         self.jobs = Jobs()
         self.python = python or sys.executable
         self.nightly_process = None
+        self.request = threading.local()  # who sent the request being handled (set by the handler)
+        self._seen = {}  # login -> last time noted as a visitor
+
+    # -- users -------------------------------------------------------------
+    def identity(self):
+        """Who is asking: dict(login, name, admin, local, user).
+
+        Through Tailscale Serve every request comes from this PC with the Tailscale-User-Login / -Name headers
+        set by Tailscale (it removes any a client sends).  A request from this PC without them is this PC's own
+        browser: the administrator.  Headers on a request from elsewhere are not trusted."""
+        request = getattr(self.request, 'value', None) or {}
+        login = request.get('login') if request.get('loopback') else None
+        local = bool(request.get('loopback')) and not login
+        user = self.engine.wallet.user(login) if login else None
+        return dict(login=login, name=(user or {}).get('name') or request.get('name') or login, local=local,
+                    admin=local or bool(user and user['admin']), user=user)
+
+    def note_visitor(self):
+        """Remember an unregistered Tailscale login (at most every ten minutes) for the administrator's list."""
+        import time
+        request = getattr(self.request, 'value', None) or {}
+        login = request.get('login') if request.get('loopback') else None
+        if not login or time.time() - self._seen.get(login, 0) < 600:
+            return
+        self._seen[login] = time.time()
+        if self.engine.wallet.user(login) is None:
+            self.engine.wallet.seen(login, request.get('name'))
+
+    def _subject(self, values, *, require=True):
+        """The user whose wallet a request is about: yourself, or (administrator) the one named by ``user``."""
+        me = self.identity()
+        wanted = values.get('user') or None
+        if wanted and wanted != me['login']:
+            if not me['admin']:
+                raise ValueError('他のユーザーの資金は操作できません。')
+            if self.engine.wallet.user(wanted) is None:
+                raise KeyError('ユーザーがいません。')
+            return wanted, me
+        if me['user']:
+            return me['login'], me
+        if require:
+            raise ValueError('ユーザーが登録されていません。資金のページで管理者に追加してもらってください。'
+                             if me['login'] else 'ユーザーを選んでください。')
+        return None, me
 
     def _child(self, arguments, progress):
         """Run ``python -m keiba_app <arguments>``; its {"event": "progress"} lines update the job, and its
@@ -236,7 +280,46 @@ class Api:
             bankroll = min(max(int(query.get('bankroll', 50000)), 1000), 100_000_000)
         except ValueError as exc:
             raise ValueError('prediction・min_hit・max_points・budget・bankroll の指定が不正です。') from exc
-        return self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
+        source = dict(kind='setting')
+        if query.get('wallet') == '1':
+            login, _ = self._subject(query, require=False)
+            user = self.engine.wallet.user(login) if login else None
+            if user:
+                balance = int(user['balance'])
+                fraction = float(user['kelly_fraction'])
+                source = dict(kind='wallet', user=login, name=user['name'], balance=balance, kelly_fraction=fraction)
+                if balance >= 1000:
+                    # fractional Kelly: stakes of full Kelly on a bankroll of fraction x balance
+                    bankroll = max(1000, int(balance * fraction))
+                    budget = max(100, min(budget, balance // 100 * 100))
+                else:
+                    source['too_small'] = True
+        result = self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll,
+                                  blend=query.get('blend', '1') != '0')
+        result['bankroll_source'] = source
+        return result
+
+    def me(self, _query):
+        me = self.identity()
+        users = self.engine.wallet.users() if me['admin'] else ([me['user']] if me['user'] else [])
+        return dict(me, users=[dict(login=user['login'], name=user['name'], balance=user['balance'],
+                                    kelly_fraction=user['kelly_fraction']) for user in users])
+
+    def wallet(self, query):
+        """The funds page: settles what can be settled, then the chosen user's balance history and bets."""
+        self.engine.wallet.settle(self.engine.saved)
+        login, me = self._subject(query, require=False)
+        if login is None and me['admin']:
+            users = self.engine.wallet.users()
+            login = users[0]['login'] if users else None
+        users = self.engine.wallet.users() if me['admin'] else ([me['user']] if me['user'] else [])
+        result = dict(me=dict(login=me['login'], name=me['name'], admin=me['admin'], local=me['local'],
+                              registered=bool(me['user'])), users=users, user=None,
+                      visitors=self.engine.wallet.visitors() if me['admin'] else [])
+        if login:
+            result.update(user=self.engine.wallet.user(login), bets=self.engine.wallet.bets(login),
+                          **self.engine.wallet.history(login))
+        return result
 
     def jobs_overview(self, _query):
         from .nightly import progress
@@ -336,10 +419,90 @@ class Api:
         self.nightly_process = subprocess.Popen(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return dict(started=True)
 
+    def add_user(self, body):
+        if not self.identity()['admin']:
+            raise ValueError('ユーザーの追加は管理者だけができます。')
+        return self.engine.wallet.add_user(body.get('login'), body.get('name'), deposit=body.get('deposit') or 0,
+                                           admin=bool(body.get('admin')))
+
+    def forget_visitor(self, body):
+        if not self.identity()['admin']:
+            raise ValueError('管理者だけが操作できます。')
+        self.engine.wallet.forget_visitor(body.get('login'))
+        return dict(forgotten=body.get('login'))
+
+    def update_user(self, body):
+        login, me = self._subject(body)
+        admin = body.get('admin')
+        if admin is not None and not me['admin']:
+            raise ValueError('管理者の設定は管理者だけが変えられます。')
+        return self.engine.wallet.update_user(login, name=body.get('name'), admin=admin,
+                                              kelly_fraction=body.get('kelly_fraction'))
+
+    def remove_user(self, body):
+        me = self.identity()
+        if not me['admin']:
+            raise ValueError('ユーザーの削除は管理者だけができます。')
+        if body.get('user') == me['login']:
+            raise ValueError('自分自身は削除できません。')
+        self.engine.wallet.remove_user(body.get('user'))
+        return dict(removed=body.get('user'))
+
+    def move_money(self, body):
+        login, _ = self._subject(body)
+        return dict(balance=self.engine.wallet.move(login, body.get('kind'), body.get('amount'), body.get('note')))
+
+    def delete_entry(self, body):
+        login, _ = self._subject(body)
+        self.engine.wallet.delete_entry(login, int(body.get('id') or 0))
+        return dict(balance=self.engine.wallet.balance(login))
+
+    def record_bet(self, body):
+        """Record bought tickets: {prediction_id or region+race_id, tickets: [{bet, key, stake}], label}."""
+        login, _ = self._subject(body)
+        prediction = None
+        if body.get('prediction_id'):
+            prediction = self.engine.logbook.prediction(int(body['prediction_id']))
+            if prediction is None:
+                raise KeyError('予想がありません。')
+            race = dict(region=prediction['region'], race_id=prediction['race_id'], race_date=prediction['race_date'],
+                        course=prediction['course'], race_number=prediction['race_number'],
+                        race_name=prediction['race_name'])
+        else:
+            region, race_id = body.get('region'), body.get('race_id')
+            if region not in ('central', 'local') or not race_id:
+                raise ValueError('region と race_id を指定してください。')
+            rows = self.engine.saved.snapshot(region, race_id, 'entries') or self.engine.saved.snapshot(
+                region, race_id, 'results')
+            if not rows:
+                raise ValueError('このレースの出馬表がありません。')
+            first = rows[0]
+            from .sources import course_of, race_number_of
+            race = dict(region=region, race_id=race_id, race_date=first.get('race_date'),
+                        course=first.get('race_course') or course_of(region, race_id),
+                        race_number=first.get('race_number') or race_number_of(race_id),
+                        race_name=first.get('race_name'))
+            if not race['race_date']:
+                raise ValueError('このレースの日付がわかりません。')
+        bet = self.engine.wallet.record_bet(login, race, body.get('tickets'), label=body.get('label'),
+                                            prediction_id=prediction and prediction['id'])
+        self.engine.wallet.settle(self.engine.saved)  # a race already run settles at once
+        return dict(bet=self.engine.wallet.bet(bet['id']), balance=self.engine.wallet.balance(login))
+
+    def cancel_bet(self, body):
+        login, _ = self._subject(body)
+        self.engine.wallet.cancel_bet(login, int(body.get('id') or 0))
+        return dict(balance=self.engine.wallet.balance(login))
+
+    def void_bet(self, body):
+        login, _ = self._subject(body)
+        self.engine.wallet.void_bet(login, int(body.get('id') or 0))
+        return dict(balance=self.engine.wallet.balance(login))
+
     def changes(self, _query):
         """A token that changes whenever predictions, results, day lists, runs, the state or jobs change."""
         import hashlib
-        parts = [self.engine.logbook.change_token()]
+        parts = [self.engine.logbook.change_token(), self.engine.wallet.change_token()]
         for path in (self.app.state_path, self.app.home / 'nightly.lock'):
             try:
                 parts.append(f'{path.name}:{path.stat().st_mtime_ns}')
@@ -350,9 +513,11 @@ class Api:
         return dict(token=hashlib.sha1('|'.join(parts).encode()).hexdigest()[:16])
 
     GET = dict(status=status, day=day, race=race, bets=bets, job=job, jobs=jobs_overview, records=records, log=log,
-               changes=changes)
+               changes=changes, me=me, wallet=wallet)
     POST = {'race/predict': predict_race, 'race/odds': fetch_odds, 'day/discover': discover, 'day/predict': predict_day,
-            'nightly': nightly}
+            'nightly': nightly, 'wallet/user': add_user, 'wallet/user/update': update_user,
+            'wallet/user/remove': remove_user, 'wallet/visitor/forget': forget_visitor, 'wallet/move': move_money, 'wallet/entry/delete': delete_entry,
+            'wallet/bet': record_bet, 'wallet/bet/cancel': cancel_bet, 'wallet/bet/void': void_bet}
 
 
 _DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
@@ -377,6 +542,28 @@ class _Server(ThreadingHTTPServer):
 
 
 LOCAL_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
+
+
+def _loopback(address):
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(str(address).split('%')[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, 'ipv4_mapped', None)
+    return (mapped or ip).is_loopback
+
+
+def _header_text(value):
+    """A header value; Tailscale sends non-ASCII names MIME-encoded (=?utf-8?q?...?=)."""
+    if not value:
+        return None
+    from email.header import decode_header, make_header
+    try:
+        text = str(make_header(decode_header(value)))
+    except (ValueError, LookupError):
+        text = value
+    return text.strip()[:200] or None
 
 
 def host_allowed(host, extra=()):
@@ -438,6 +625,13 @@ def make_handler(api: Api, *, allowed_hosts=()):
             function = table.get(name)
             if function is None:
                 return self._send(404, dict(error='見つかりません。'))
+            api.request.value = dict(loopback=_loopback(self.client_address[0]),
+                                     login=_header_text(self.headers.get('Tailscale-User-Login')),
+                                     name=_header_text(self.headers.get('Tailscale-User-Name')))
+            try:
+                api.note_visitor()
+            except Exception:  # never stop a request over the visitor list
+                traceback.print_exc()
             try:
                 return self._send(200, function(api, argument))
             except (ValueError, KeyError) as exc:

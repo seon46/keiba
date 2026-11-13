@@ -75,6 +75,16 @@ class AppTests(unittest.TestCase):
         wins = {str(runner['horse_number']): runner['win_probability'] for runner in prediction['runners']}
         self.assertEqual(trifecta_axes[0], int(max(wins, key=wins.get)))  # the likeliest winner first
         self.assertEqual(engine.odds_axes(region, 'no-such-race', 3), ([], []))
+        # with win odds the betting strengths are blended with the market: a longshot the market likes rises
+        odds = {str(number): (1.5 if number == min(win, key=win.get) else 30.0) for number in win}
+        blended = engine._race_bets(prediction, odds)
+        self.assertTrue(blended.blended)
+        longshot = str(min(win, key=win.get))
+        self.assertGreater(blended.probabilities('win')[longshot], single.get(longshot, 0) + .1)
+        missing = dict(odds)
+        missing.pop(longshot)
+        self.assertFalse(engine._race_bets(prediction, missing).blended)
+        self.assertFalse(bets['blend']['applied'])  # no odds saved
         capped = engine.bets(identifier, min_hit=.2, max_points=10, budget=10000, bankroll=10000)
         self.assertTrue(capped['budget_capped'])  # a cap at or above the bankroll is used up to the bankroll
         self.assertTrue(capped['proposals'])
