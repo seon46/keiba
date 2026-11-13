@@ -78,6 +78,8 @@ class Matrix:
 def _finisher_rows(data, mask):
     import numpy as np
     rows = np.flatnonzero(mask & data['finished'])
+    if not len(rows):  # e.g. a segment with no race in the period
+        return rows
     keys = data['race_ids'][rows]
     change = np.r_[True, keys[1:] != keys[:-1]]
     code = np.cumsum(change) - 1
