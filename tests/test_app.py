@@ -69,6 +69,10 @@ class AppTests(unittest.TestCase):
         self.assertIn(bets['confidence']['tier'], 'ABC')
         self.assertEqual(bets['confidence']['basis'], 'evaluation')
         self.assertIn('pick_top3_rate', bets['confidence']['expected'])
+        overall = bets['confidence']['overall']
+        self.assertIn(overall['tier'], ('A', 'B', 'C'))
+        self.assertTrue(0 <= overall['value'] <= 1)
+        self.assertFalse(overall['approximate'])
         marks = engine.day_confidence(day)
         self.assertEqual(set(marks), {race_id})
         self.assertEqual(marks[race_id]['tier'], bets['confidence']['tier'])
@@ -91,7 +95,10 @@ class AppTests(unittest.TestCase):
         summary = records['summary']
         self.assertIsNotNone(summary['favourite_top3_rate'])
         self.assertIsNotNone(summary['skill'])
-        self.assertEqual(set(records['breakdowns']), {'course', 'confidence', 'surface', 'distance', 'race_number'})
+        self.assertEqual(set(records['breakdowns']),
+                         {'course', 'confidence', 'overall', 'surface', 'distance', 'race_number'})
+        self.assertEqual(sum(item['races'] for item in records['breakdowns']['overall']), len(races))
+        self.assertTrue(all(row['overall'] in ('A', 'B', 'C') for row in records['races']))
         self.assertEqual(sum(item['races'] for item in records['breakdowns']['course']), len(races))
         self.assertEqual(sum(item['races'] for item in records['breakdowns']['confidence']), len(races))
         self.assertTrue(all(row['confidence'] in ('A', 'B', 'C') for row in records['races']))
@@ -129,6 +136,7 @@ class AppTests(unittest.TestCase):
             listed = get(f'/api/day?date={day}')
             self.assertEqual({race['race_id'] for race in listed['races']}, {race_id for _, race_id in races})
             self.assertTrue(all(race['predictions'] for race in listed['races']))
+            self.assertTrue(all(race['confidence']['overall'] in ('A', 'B', 'C') for race in listed['races']))
             detail = get(f'/api/race?region={region}&race_id={race_id}')
             self.assertEqual(len(detail['card']), 10)
             self.assertEqual(len(detail['predictions']), 2)

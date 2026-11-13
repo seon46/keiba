@@ -282,6 +282,33 @@ class Engine:
 
 
     # -- bets and confidence ---------------------------------------------
+    @staticmethod
+    def _temperatures(prediction):
+        """(stage temperatures of the prediction, approximate?); older predictions take the model's current ones."""
+        temperatures = json.loads(prediction.get('temperatures_json') or 'null')
+        if temperatures:
+            return temperatures, False
+        from .nightly import model_info
+        group = 'central_flat' if prediction['region'] == 'central' else 'local_flat'
+        temperatures = ((model_info(prediction['model_dir']) or {}).get('groups', {}).get(group) or {}).get(
+            'temperatures')
+        return temperatures, True
+
+    def overall_confidence(self, prediction):
+        """Whole-race confidence: how predictable the top-3 order is to the model, its tier, and what that tier's
+        races did in the v4 evaluation year."""
+        from keiba_ai.bets import OVERALL_TIERS, order_certainty, overall_tier
+        runners = [runner for runner in prediction['runners']
+                   if runner.get('distribution') is not None and runner.get('strength_score') is not None]
+        temperatures, approximate = self._temperatures(prediction)
+        if len(runners) < 3 or not temperatures:
+            return None
+        value = order_certainty([runner['strength_score'] for runner in runners], temperatures)
+        scale = OVERALL_TIERS['central' if prediction['region'] == 'central' else 'local']
+        tier = overall_tier(prediction['region'], value)
+        return dict(value=value, tier=tier, thresholds=list(scale['thresholds']), approximate=approximate,
+                    expected=dict(races=scale['races'], **scale['rates'][tier]), rates=scale['rates'])
+
     def _race_bets(self, prediction):
         """Simulated finishing orders of a logged prediction (cached)."""
         from keiba_ai.bets import RaceBets, simulate_top3
@@ -293,16 +320,9 @@ class Engine:
         runners = [runner for runner in prediction['runners'] if runner.get('distribution') is not None]
         if len(runners) < 2 or any(runner.get('strength_score') is None for runner in runners):
             raise ValueError('この予想からは馬券の確率を計算できません。')
-        approximate = False
-        temperatures = json.loads(prediction.get('temperatures_json') or 'null')
-        if not temperatures:  # predictions made before the temperatures were logged
-            from .nightly import model_info
-            group = 'central_flat' if prediction['region'] == 'central' else 'local_flat'
-            temperatures = ((model_info(prediction['model_dir']) or {}).get('groups', {}).get(group) or {}).get(
-                'temperatures')
-            approximate = True
-            if not temperatures:
-                raise ValueError('この予想のモデルが見つからないため、馬券の確率を計算できません。予想し直してください。')
+        temperatures, approximate = self._temperatures(prediction)
+        if not temperatures:
+            raise ValueError('この予想のモデルが見つからないため、馬券の確率を計算できません。予想し直してください。')
         top3 = simulate_top3([runner['strength_score'] for runner in runners],
                              [runner['finish_probability'] for runner in runners], temperatures,
                              seed=race_seed(prediction['race_id'], 42))
@@ -324,13 +344,18 @@ class Engine:
         return cached[1]
 
     def day_confidence(self, day):
-        """{race_id: dict(tier, value)} from the latest prediction of each race of the day."""
-        from keiba_ai.bets import confidence_tier, top_win
+        """{race_id: dict(tier, value, overall)} from the latest prediction of each race of the day; ``overall`` is
+        the whole-race tier (None when the prediction has no temperatures)."""
+        from keiba_ai.bets import confidence_tier, order_certainty, overall_tier, top_win
         result = {}
-        for race_id, (region, wins) in self.logbook.day_win_probabilities(day).items():
+        for race_id, (region, wins, strengths, temperatures) in self.logbook.day_win_probabilities(day).items():
             value = top_win(wins)
-            if value is not None:
-                result[race_id] = dict(tier=confidence_tier(region, value), value=value)
+            if value is None:
+                continue
+            overall = order_certainty(strengths, temperatures) if temperatures and len(strengths) >= 3 else None
+            result[race_id] = dict(tier=confidence_tier(region, value), value=value,
+                                   overall=None if overall is None else overall_tier(region, overall),
+                                   overall_value=overall)
         return result
 
     def confidence(self, prediction):
@@ -358,6 +383,7 @@ class Engine:
         pick = max(runners, key=lambda runner: runner.get('win_probability') or 0)
         return dict(value=value, tier=tier, thresholds=list(scale['thresholds']), basis='evaluation',
                     expected=dict(races=scale['races'], **scale['rates'][tier]), record=record,
+                    overall=self.overall_confidence(prediction),
                     pick_horse_number=pick['horse_number'], pick_win_probability=pick.get('win_probability'),
                     pick_top3_probability=pick.get('top3_probability'))
 

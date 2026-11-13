@@ -180,7 +180,9 @@ class Logbook:
                 f'SELECT p.*,o.outcome_log_loss,o.uniform_log_loss,o.top3_log_loss,o.win_log_loss,o.pick_horse_number,'
                 f'o.pick_position,o.pick_top3,o.favourite_horse_number,o.favourite_won,o.results_json,'
                 f'(SELECT MAX(win_probability)/SUM(win_probability) FROM prediction_runners x WHERE x.prediction_id=p.id '
-                f'AND x.distribution_json IS NOT NULL) AS top_win FROM predictions p '
+                f'AND x.distribution_json IS NOT NULL) AS top_win,'
+                f'(SELECT GROUP_CONCAT(strength_score) FROM prediction_runners x WHERE x.prediction_id=p.id '
+                f'AND x.distribution_json IS NOT NULL AND x.strength_score IS NOT NULL) AS strengths FROM predictions p '
                 f'JOIN outcomes o ON o.prediction_id=p.id WHERE {where} AND p.id=('
                 f'SELECT q.id FROM predictions q JOIN outcomes r ON r.prediction_id=q.id WHERE q.race_id=p.race_id '
                 f"AND r.status='scored' {inner} "
@@ -254,14 +256,22 @@ class Logbook:
         return history
 
     def day_win_probabilities(self, day):
-        """{race_id: (region, win probabilities)} of the latest prediction of each race on ``day``."""
+        """{race_id: (region, win probabilities, strength scores, stage temperatures or None)} of the latest
+        prediction of each race on ``day``."""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT p.race_id,p.region,GROUP_CONCAT(r.win_probability) AS wins FROM predictions p "
+                "SELECT p.race_id,p.region,p.temperatures_json,r.win_probability,r.strength_score FROM predictions p "
                 "JOIN prediction_runners r ON r.prediction_id=p.id WHERE p.race_date=? AND r.win_probability IS NOT NULL "
                 "AND p.id=(SELECT q.id FROM predictions q WHERE q.race_id=p.race_id ORDER BY q.created_at DESC, q.id DESC "
-                "LIMIT 1) GROUP BY p.id", (day,)).fetchall()
-        return {row['race_id']: (row['region'], [float(value) for value in row['wins'].split(',')]) for row in rows}
+                "LIMIT 1)", (day,)).fetchall()
+        result = {}
+        for row in rows:
+            entry = result.setdefault(row['race_id'], (row['region'], [], [],
+                                                       json.loads(row['temperatures_json'] or 'null')))
+            entry[1].append(float(row['win_probability']))
+            if row['strength_score'] is not None:
+                entry[2].append(float(row['strength_score']))
+        return result
 
     # -- day races and runs --------------------------------------------
     def set_day_races(self, day, region, races, discovered_at):
@@ -317,6 +327,7 @@ SURFACES = {'芝': '芝', 'ダ': 'ダート', '障': '障害'}
 BREAKDOWNS = {
     'course': ('course', None),
     'confidence': ('confidence', ['A', 'B', 'C']),
+    'overall': ('overall', ['A', 'B', 'C']),
     'surface': ('surface_name', ['芝', 'ダート', '障害']),
     'distance': ('distance_band', [name for name, *_ in DISTANCES]),
     'race_number': ('race_band', ['1〜4R', '5〜8R', '9R〜']),
@@ -339,6 +350,13 @@ def _describe(row):
     row['skill'] = 1 - model / uniform if model is not None and uniform else None
     top_win = row.get('top_win')
     row['confidence'] = confidence_tier(row['region'], top_win) if top_win is not None else None
+    strengths = [float(value) for value in (row.pop('strengths', None) or '').split(',') if value]
+    temperatures = json.loads(row.get('temperatures_json') or 'null')
+    row['overall'] = row['overall_value'] = None
+    if temperatures and len(strengths) >= 3:
+        from keiba_ai.bets import order_certainty, overall_tier
+        row['overall_value'] = order_certainty(strengths, temperatures)
+        row['overall'] = overall_tier(row['region'], row['overall_value'])
     row['surface_name'] = SURFACES.get(row.get('surface'), row.get('surface'))
     distance = row.get('distance_m')
     row['distance_band'] = next((name for name, low, high in DISTANCES if distance and low <= distance < high), None)
