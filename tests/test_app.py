@@ -88,6 +88,16 @@ class AppTests(unittest.TestCase):
         records = engine.logbook.records(include_after=True)
         self.assertEqual(records['summary']['races'], len(races))
         self.assertEqual(engine.logbook.records()['summary']['races'], 0)  # only after-race predictions
+        summary = records['summary']
+        self.assertIsNotNone(summary['favourite_top3_rate'])
+        self.assertIsNotNone(summary['skill'])
+        self.assertEqual(set(records['breakdowns']), {'course', 'confidence', 'surface', 'distance', 'race_number'})
+        self.assertEqual(sum(item['races'] for item in records['breakdowns']['course']), len(races))
+        self.assertEqual(sum(item['races'] for item in records['breakdowns']['confidence']), len(races))
+        self.assertTrue(all(row['confidence'] in ('A', 'B', 'C') for row in records['races']))
+        self.assertEqual(engine.logbook.scored_without_odds(), [])  # final odds are kept with the results
+        self.assertEqual(engine.logbook.records(day=day, include_after=True)['summary']['races'], len(races))
+        self.assertEqual(engine.logbook.records(day='2000-01-01', include_after=True)['summary']['races'], 0)
 
         # A weekday-like day: the central list cannot be read, the local one still is
         weekday = FakeScraper({('2025-09-03', 'local'): ['202544090301']})
@@ -120,6 +130,10 @@ class AppTests(unittest.TestCase):
             self.assertEqual(len(detail['predictions']), 2)
             self.assertIsNotNone(detail['results'])
             self.assertIn('summary', get('/api/records?days=all&after=1'))
+            latest = get('/api/records?day=latest&after=1')
+            self.assertEqual(latest['day'], day)
+            self.assertEqual(latest['summary']['races'], len(races))
+            self.assertIsNone(latest['next_day'])
             self.assertIn('state', get('/api/status'))
             before = get('/api/changes')['token']
             page = urllib.request.urlopen(base + '/').read().decode('utf-8')

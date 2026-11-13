@@ -250,8 +250,25 @@ class Api:
     def records(self, query):
         days = query.get('days')
         since = day_after(today(), -int(days)) if days and days != 'all' else None
-        return self.engine.logbook.records(since=since, region=query.get('region') or None,
-                                           include_after=query.get('after') == '1')
+        include_after = query.get('after') == '1'
+        day = query.get('day') or None
+        if day == 'latest':  # the last race day with scored predictions
+            day = next(iter(self.engine.logbook.scored_days(include_after)), None) or today()
+        if day:
+            try:
+                from datetime import date
+                date.fromisoformat(day)
+            except ValueError as exc:
+                raise ValueError(f'日付の形式が正しくありません: {day}') from exc
+            since = None
+        result = self.engine.logbook.records(since=since, day=day, region=query.get('region') or None,
+                                             include_after=include_after)
+        days = self.engine.logbook.scored_days(include_after)
+        result['day'] = day
+        if day:
+            result['previous_day'] = next((other for other in days if other < day), None)
+            result['next_day'] = next((other for other in reversed(days) if other > day), None)
+        return result
 
     def log(self, query):
         runs = self.engine.logbook.runs(50)

@@ -140,12 +140,33 @@ class Logbook:
                 f'VALUES (?,{",".join("?" * len(fields))},?)',
                 [prediction_id] + [outcome.get(field) for field in fields] + [json.dumps(outcome.get('results'))])
 
+    def scored_without_odds(self, limit=500):
+        """Scored predictions whose stored results predate keeping the final win odds."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT prediction_id FROM outcomes WHERE status='scored' AND results_json NOT LIKE '%\"odds\"%' "
+                'ORDER BY prediction_id DESC LIMIT ?', (limit,)).fetchall()
+        return [row[0] for row in rows]
+
+    def scored_days(self, include_after=False):
+        """Race days with at least one scored prediction, newest first."""
+        timing = '' if include_after else "AND p.timing='before'"
+        with self._connect() as connection:
+            rows = connection.execute(
+                'SELECT DISTINCT p.race_date FROM predictions p JOIN outcomes o ON o.prediction_id=p.id '
+                f"WHERE o.status='scored' {timing} ORDER BY p.race_date DESC").fetchall()
+        return [row[0] for row in rows]
+
     # -- records -------------------------------------------------------
-    def records(self, *, since=None, region=None, include_after=False, limit=300):
-        """The last pre-race prediction of each race with a scored outcome, newest first, and summary metrics."""
+    def records(self, *, since=None, day=None, region=None, include_after=False, limit=300):
+        """The last pre-race prediction of each race with a scored outcome, newest first, summary metrics, and
+        the same metrics by racecourse, confidence, surface and distance."""
         conditions, arguments = ["o.status='scored'"], []
         if not include_after:
             conditions.append("p.timing='before'")
+        if day:
+            conditions.append('p.race_date=?')
+            arguments.append(day)
         if since:
             conditions.append('p.race_date>=?')
             arguments.append(since)
@@ -157,7 +178,9 @@ class Logbook:
         with self._connect() as connection:
             rows = connection.execute(
                 f'SELECT p.*,o.outcome_log_loss,o.uniform_log_loss,o.top3_log_loss,o.win_log_loss,o.pick_horse_number,'
-                f'o.pick_position,o.pick_top3,o.favourite_horse_number,o.favourite_won FROM predictions p '
+                f'o.pick_position,o.pick_top3,o.favourite_horse_number,o.favourite_won,o.results_json,'
+                f'(SELECT MAX(win_probability)/SUM(win_probability) FROM prediction_runners x WHERE x.prediction_id=p.id '
+                f'AND x.distribution_json IS NOT NULL) AS top_win FROM predictions p '
                 f'JOIN outcomes o ON o.prediction_id=p.id WHERE {where} AND p.id=('
                 f'SELECT q.id FROM predictions q JOIN outcomes r ON r.prediction_id=q.id WHERE q.race_id=p.race_id '
                 f"AND r.status='scored' {inner} "
@@ -175,6 +198,8 @@ class Logbook:
                 "WHERE o.prediction_id IS NULL").fetchone()[0]
         for row in rows[:limit]:
             row['pick_horse_name'] = names.get(row['id'])
+        for row in rows:
+            _describe(row)
 
         def mean(values):
             values = [value for value in values if value is not None and math.isfinite(value)]
@@ -187,7 +212,7 @@ class Logbook:
                        win_log_loss=mean([row['win_log_loss'] for row in rows]),
                        pick_top3_rate=mean([row['pick_top3'] for row in rows]),
                        favourite_win_rate=mean([row['favourite_won'] for row in rows]),
-                       pending_races=pending)
+                       pending_races=pending, **_group_metrics(rows))
         by_day = {}
         for row in rows:
             entry = by_day.setdefault(row['race_date'], [[], []])
@@ -195,7 +220,8 @@ class Logbook:
             entry[1].append(row['uniform_log_loss'])
         daily = [dict(day=day, races=len(values[0]), model=mean(values[0]), uniform=mean(values[1]))
                  for day, values in sorted(by_day.items())]
-        return dict(summary=summary, daily=daily, races=rows[:limit])
+        breakdowns = {name: _breakdown(rows, key, order) for name, (key, order) in BREAKDOWNS.items()}
+        return dict(summary=summary, daily=daily, breakdowns=breakdowns, races=rows[:limit])
 
     def confidence_history(self, region):
         """[(win probabilities, pick_won or None, pick_top3 or None)] of the last pre-race prediction of each race."""
@@ -270,3 +296,64 @@ class Logbook:
             row['steps'] = json.loads(row.pop('steps_json') or '[]')
             result.append(row)
         return result
+
+
+# -- record breakdowns -----------------------------------------------------
+DISTANCES = (('短距離（〜1399m）', 0, 1400), ('マイル（1400〜1899m）', 1400, 1900),
+             ('中距離（1900〜2399m）', 1900, 2400), ('長距離（2400m〜）', 2400, 10 ** 6))
+SURFACES = {'芝': '芝', 'ダ': 'ダート', '障': '障害'}
+BREAKDOWNS = {
+    'course': ('course', None),
+    'confidence': ('confidence', ['A', 'B', 'C']),
+    'surface': ('surface_name', ['芝', 'ダート', '障害']),
+    'distance': ('distance_band', [name for name, *_ in DISTANCES]),
+    'race_number': ('race_band', ['1〜4R', '5〜8R', '9R〜']),
+}
+
+
+def _describe(row):
+    """Per-race fields for the breakdowns: the favourite (highest win probability) and how it ran, its 単勝 return
+    at the final odds, the confidence tier, and the order skill (1 - log loss / log loss of equal chances)."""
+    from keiba_ai.bets import confidence_tier
+    results = json.loads(row.pop('results_json', None) or 'null') or {}
+    favourite = results.get(str(row.get('favourite_horse_number'))) or {}
+    position = favourite.get('position') if favourite.get('status') == 'finished' else None
+    row['favourite_position'] = position
+    row['favourite_top3'] = int(bool(position) and position <= 3)
+    odds = favourite.get('odds')
+    row['favourite_odds'] = odds
+    row['favourite_return'] = (odds if position == 1 else 0.0) if isinstance(odds, (int, float)) and odds > 0 else None
+    model, uniform = row.get('outcome_log_loss'), row.get('uniform_log_loss')
+    row['skill'] = 1 - model / uniform if model is not None and uniform else None
+    top_win = row.get('top_win')
+    row['confidence'] = confidence_tier(row['region'], top_win) if top_win is not None else None
+    row['surface_name'] = SURFACES.get(row.get('surface'), row.get('surface'))
+    distance = row.get('distance_m')
+    row['distance_band'] = next((name for name, low, high in DISTANCES if distance and low <= distance < high), None)
+    number = row.get('race_number')
+    row['race_band'] = None if not number else '1〜4R' if number <= 4 else '5〜8R' if number <= 8 else '9R〜'
+    return row
+
+
+def _group_metrics(rows):
+    def mean(values):
+        values = [value for value in values if value is not None and math.isfinite(value)]
+        return sum(values) / len(values) if values else None
+    priced = [row['favourite_return'] for row in rows if row.get('favourite_return') is not None]
+    return dict(favourite_top3_rate=mean([row.get('favourite_top3') for row in rows]),
+                skill=mean([row.get('skill') for row in rows]),
+                favourite_roi=sum(priced) / len(priced) if priced else None, priced_races=len(priced))
+
+
+def _breakdown(rows, key, order=None):
+    groups = {}
+    for row in rows:
+        if row.get(key):
+            groups.setdefault(row[key], []).append(row)
+    result = [dict(name=name, races=len(members),
+                   favourite_win_rate=sum(bool(row['favourite_won']) for row in members) / len(members),
+                   **_group_metrics(members)) for name, members in groups.items()]
+    if order:
+        rank = {name: index for index, name in enumerate(order)}
+        return sorted(result, key=lambda item: (rank.get(item['name'], len(rank)), item['name']))
+    return sorted(result, key=lambda item: (-item['races'], item['name']))
