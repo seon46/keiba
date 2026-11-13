@@ -709,7 +709,7 @@ def main(argv=None):
     fitting.add_argument('--train-start', help='この日以降で学習（既定: 2022-04-01。DBの最初の日から半年ほど後にします）')
     fitting.add_argument('--evaluate-until', help='train-end以降、この日より前を評価')
     fitting.add_argument('--segments', action='store_true',
-                         help='区分（芝ダ×年齢×クラス）ごとの補正も学習し、--evaluate-untilの期間で比べる（保存するモデルは同じ）')
+                         help='区分（芝ダ×距離×年齢×クラス）ごとの補正も学習し、--evaluate-untilの期間で比べる（保存するモデルは同じ）')
     fitting.add_argument('--allow-test-period', action='store_true')
     fitting.add_argument('--groups', nargs='+', default=list(GROUPS), choices=list(GROUPS))
     fitting.add_argument('--threads', type=int, default=2)
