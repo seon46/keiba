@@ -96,6 +96,10 @@ class AppTests(unittest.TestCase):
         self.assertEqual(sum(item['races'] for item in records['breakdowns']['confidence']), len(races))
         self.assertTrue(all(row['confidence'] in ('A', 'B', 'C') for row in records['races']))
         self.assertEqual(engine.logbook.scored_without_odds(), [])  # final odds are kept with the results
+        split = records['breakdowns_by_confidence']['course']
+        self.assertEqual(sum(item['races'] for item in split), len(races))
+        self.assertTrue(all(item['confidence'] in ('A', 'B', 'C') for item in split))
+        self.assertNotIn('confidence', records['breakdowns_by_confidence'])
         self.assertEqual(engine.logbook.records(day=day, include_after=True)['summary']['races'], len(races))
         self.assertEqual(engine.logbook.records(day='2000-01-01', include_after=True)['summary']['races'], 0)
 
