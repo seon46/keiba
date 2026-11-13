@@ -88,6 +88,21 @@ class LocalOddsTests(unittest.TestCase):
         bracket = NAR_B4.replace('_b4_c0_1_2', '_b3_c0_7_7').replace('_b4_', '_b3_')
         self.assertEqual(parse_local_odds(bracket, race_id='x', kind='b3')['odds']['bracket'], {'7-7': 18.3, '1-3': 285.0})
 
+    def test_trio_and_trifecta_axis_pages(self):
+        from keiba_scraper import urls
+        from keiba_scraper.parsers import parse_local_odds
+        # same cell ids as the real pages: axis first, then the other two horses; 0.0 = no sales
+        page = """<table class="Odds_Table"><tr><td class="Odds" id="chk_1a6-48-9_b8_c0_5_1_10">789.7</td>
+<td class="Odds" id="chk_1a6-48-9_b8_c0_5_1_11">0.0</td><td class="Odds" id="chk_1a6-48-9_b8_c0_5_10_1">2,369.3</td></tr></table>"""
+        self.assertEqual(parse_local_odds(page, race_id='x', kind='b8')['odds'],
+                         {'trifecta': {'5>1>10': 789.7, '5>10>1': 2369.3}})
+        trio = page.replace('_b8_', '_b7_').replace('5_10_1', '7_2_3')
+        self.assertEqual(parse_local_odds(trio, race_id='x', kind='b7')['odds'], {'trio': {'1-5-10': 789.7, '2-3-7': 2369.3}})
+        self.assertEqual(urls.local_axis_odds_url('202648111309', 'b8', 5),
+                         'https://nar.netkeiba.com/odds/odds_get_form.html?type=b8&race_id=202648111309&jiku=5')
+        with self.assertRaises(ValueError):
+            urls.local_axis_odds_url('202648111309', 'b4', 5)
+
     def test_presale_pages_have_no_odds(self):
         from keiba_scraper.parsers import parse_local_odds
         import re

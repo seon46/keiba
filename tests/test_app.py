@@ -69,6 +69,12 @@ class AppTests(unittest.TestCase):
         self.assertIn(bets['confidence']['tier'], 'ABC')
         self.assertEqual(bets['confidence']['basis'], 'evaluation')
         self.assertIn('pick_top3_rate', bets['confidence']['expected'])
+        trio_axes, trifecta_axes = engine.odds_axes(region, race_id, 3)
+        self.assertEqual(len(trio_axes), 3)
+        self.assertEqual(len(set(trio_axes)), 3)
+        wins = {str(runner['horse_number']): runner['win_probability'] for runner in prediction['runners']}
+        self.assertEqual(trifecta_axes[0], int(max(wins, key=wins.get)))  # the likeliest winner first
+        self.assertEqual(engine.odds_axes(region, 'no-such-race', 3), ([], []))
         capped = engine.bets(identifier, min_hit=.2, max_points=10, budget=10000, bankroll=10000)
         self.assertTrue(capped['budget_capped'])  # a cap at or above the bankroll is used up to the bankroll
         self.assertTrue(capped['proposals'])

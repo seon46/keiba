@@ -79,6 +79,10 @@ def parser() -> argparse.ArgumentParser:
     odds.add_argument('--race-id', action='append', required=True,
                       type=lambda v: identifier(v, urls.race_id), help='12桁のレースID。複数回指定可')
     odds.add_argument('--sample-dir', type=Path, help='形式確認用に受信した原本をこのフォルダーにも保存（地方はこれのみ）')
+    odds.add_argument('--trio-axis', action='append', type=int, default=[],
+                      help='地方：この馬を含む3連複のオッズも取得（軸1頭ごとに1ページ。複数回指定可）')
+    odds.add_argument('--trifecta-axis', action='append', type=int, default=[],
+                      help='地方：この馬が1着の3連単のオッズも取得（軸1頭ごとに1ページ。複数回指定可）')
     listing = commands.add_parser('list', help='指定日のレースIDを表示')
     listing.add_argument('--date', required=True, type=iso_date)
     listing.add_argument('--region', choices=('central', 'local'), required=True)
@@ -339,6 +343,17 @@ def main(argv: list[str] | None = None) -> int:
                         if parsed['odds']:
                             store.save_odds(observation, parsed)
                             counts.update({bet: len(table) for bet, table in parsed['odds'].items()})
+                    # 3連複・3連単: the chosen axis horses' pages, merged into one table per bet before saving
+                    triples, last = {}, None
+                    for kind, axes in (('b7', args.trio_axis), ('b8', args.trifecta_axis)):
+                        for axis in dict.fromkeys(axes):
+                            last, html, _ = client.fetch(urls.local_axis_odds_url(race_id, kind, axis))
+                            for bet, table in parse_local_odds(html, race_id=race_id, kind=kind)['odds'].items():
+                                triples.setdefault(bet, {}).update(table)
+                    if triples:
+                        store.save_odds(last, dict(race_id=race_id, region='local', status=None, official_at=None,
+                                                   odds=triples, popularity={}))
+                        counts.update({bet: len(table) for bet, table in triples.items()})
                     if not counts:
                         raise ValueError('まだ発売前で、オッズがありません。発売が始まってから取得してください。')
                     report(race_id=race_id, region='local', bets=counts, retrieved_at=observation.retrieved_at)

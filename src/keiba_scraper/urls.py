@@ -44,6 +44,15 @@ def odds_page_url(identifier: str, region: str, kind: str = "b1") -> str:
     return f"https://{host}/odds/index.html?{urlencode({'type': kind, 'race_id': identifier})}"
 
 
+def local_axis_odds_url(identifier: str, kind: str, axis: int) -> str:
+    """One axis horse of a local 3連複 (b7: every trio containing it) or 3連単 (b8: every order with it first)."""
+    race_id(identifier)
+    if kind not in ("b7", "b8") or not 1 <= int(axis) <= 18:
+        raise ValueError("軸の馬番または券種が不正です。")
+    return ("https://nar.netkeiba.com/odds/odds_get_form.html?"
+            + urlencode({'type': kind, 'race_id': identifier, 'jiku': int(axis)}))
+
+
 def horse_url(identifier: str) -> str:
     return f"https://db.netkeiba.com/horse/result/{horse_id(identifier)}/"
 

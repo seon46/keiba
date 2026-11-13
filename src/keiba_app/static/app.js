@@ -628,7 +628,7 @@ async function loadBets(region, raceId, prediction) {
       ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '1レースの上限')}
       ${select('bankroll', [[10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], betsSettings.bankroll, '資金')}
       <span class="spacer"></span>
-      ${partial ? '<span class="small muted">地方は3連複・3連単のオッズなし</span>' : ''}
+      ${partial ? '<span class="small muted">地方の3連複・3連単は、予想してからオッズを取得すると、確率の高い軸3頭の分を取ります</span>' : ''}
       <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
     </div>`;
   const wire = () => {  // the settings stay usable whatever was drawn below them
