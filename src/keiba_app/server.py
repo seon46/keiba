@@ -236,8 +236,6 @@ class Api:
             bankroll = min(max(int(query.get('bankroll', 50000)), 1000), 100_000_000)
         except ValueError as exc:
             raise ValueError('prediction・min_hit・max_points・budget・bankroll の指定が不正です。') from exc
-        if budget >= bankroll:
-            raise ValueError('1レースの上限は資金より少なくしてください。')
         return self.engine.bets(identifier, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
 
     def jobs_overview(self, _query):

@@ -69,6 +69,9 @@ class AppTests(unittest.TestCase):
         self.assertIn(bets['confidence']['tier'], 'ABC')
         self.assertEqual(bets['confidence']['basis'], 'evaluation')
         self.assertIn('pick_top3_rate', bets['confidence']['expected'])
+        capped = engine.bets(identifier, min_hit=.2, max_points=10, budget=10000, bankroll=10000)
+        self.assertTrue(capped['budget_capped'])  # a cap at or above the bankroll is used up to the bankroll
+        self.assertTrue(capped['proposals'])
         overall = bets['confidence']['overall']
         self.assertIn(overall['tier'], ('A', 'B', 'C'))
         self.assertTrue(0 <= overall['value'] <= 1)

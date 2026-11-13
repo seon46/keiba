@@ -620,12 +620,39 @@ async function loadBets(region, raceId, prediction) {
   const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}|${betsSettings.bankroll}`;
   let data = betsCache.get(key);
   const box = () => view.querySelector('#bets');
+  const select = (id, values, current, label) => `<label class="small">${label}
+    <select id="${id}">${values.map(([v, t]) => `<option value="${v}" ${Number(v) === current ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
+  const controls = (odds, partial) => `<div class="controls">
+      ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
+      ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
+      ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '1レースの上限')}
+      ${select('bankroll', [[10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], betsSettings.bankroll, '資金')}
+      <span class="spacer"></span>
+      ${partial ? '<span class="small muted">地方は3連複・3連単のオッズなし</span>' : ''}
+      <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
+    </div>`;
+  const wire = () => {  // the settings stay usable whatever was drawn below them
+    const reload = (name) => (e) => { store.set(name, e.target.value); loadBets(region, raceId, prediction); };
+    box().querySelector('#min-hit').addEventListener('change', reload('minHit'));
+    box().querySelector('#max-points').addEventListener('change', reload('maxPoints'));
+    box().querySelector('#budget').addEventListener('change', reload('budget'));
+    box().querySelector('#bankroll').addEventListener('change', reload('bankroll'));
+    box().querySelector('#odds')?.addEventListener('click', async (event) => {
+      event.target.disabled = true;
+      try {
+        watch(await api('race/odds', {region, race_id: raceId}), () => { betsCache.clear(); loadBets(region, raceId, prediction); });
+      } catch (e) { alertJob(e); event.target.disabled = false; }
+    });
+  };
   if (!data) {
     try {
       data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}&bankroll=${betsSettings.bankroll}`);
       betsCache.set(key, data);
     } catch (e) {
-      if (box()) box().innerHTML = `<h2>買い目の提案</h2><p class="error-text">${esc(e.message)}</p>`;
+      if (box()) {
+        box().innerHTML = `<h2>買い目の提案</h2>${controls(null, false)}<p class="error-text">${esc(e.message)}</p>`;
+        wire();
+      }
       return;
     }
   }
@@ -634,21 +661,12 @@ async function loadBets(region, raceId, prediction) {
   if (badge) badge.innerHTML = confidenceBadge(data.confidence);
   const odds = data.odds;
   const hasEv = data.proposals.some((p) => p.expected_return != null);
-  const select = (id, values, current, label) => `<label class="small">${label}
-    <select id="${id}">${values.map(([v, t]) => `<option value="${v}" ${Number(v) === current ? 'selected' : ''}>${t}</option>`).join('')}</select></label>`;
   box().innerHTML = `
     <h2>買い目の提案</h2>
     ${confidenceText(data.confidence)}
     ${overallText(data.confidence?.overall)}
-    <div class="controls">
-      ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
-      ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
-      ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '1レースの上限')}
-      ${select('bankroll', [[10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], betsSettings.bankroll, '資金')}
-      <span class="spacer"></span>
-      ${data.odds_partial ? '<span class="small muted">地方は3連複・3連単のオッズなし</span>' : ''}
-      <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
-    </div>
+    ${controls(odds, data.odds_partial)}
+    ${data.budget_capped ? '<p class="small notice-text">1レースの上限が資金以上なので、資金までの金額で計算しています。</p>' : ''}
     <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
       ${hasEv ? '「資金の伸び」は、同じような買い方を続けたときに1レースあたり資金が平均で何%増えるか（対数成長率）で、高い順に並べています。合計金額は、資金がいちばん速く増える額（ケリー基準）を1レースの上限までで選んでいます。どれが当たっても払戻がほぼ同じになる配分で、当たっても損になる買い方は出しません。マイナスは、モデルの確率では買わない方が良いという意味です。モデルの確率は高めに出やすいので、資金を実際より多めに設定すると控えめな金額になります。' : odds ? '' : 'オッズを取得すると、資金の伸びが一番大きい買い方と金額を出します。'}
       ${data.approximate ? 'この予想は温度の記録がない古い予想のため、確率は近似です。' : ''}</p>
@@ -665,16 +683,7 @@ async function loadBets(region, raceId, prediction) {
       </tr>`).join('')}</tbody></table></div>`
     : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}
     ${mixesTable(data.mixes || [], !!odds)}`;
-  box().querySelector('#min-hit').addEventListener('change', (e) => { store.set('minHit', e.target.value); loadBets(region, raceId, prediction); });
-  box().querySelector('#max-points').addEventListener('change', (e) => { store.set('maxPoints', e.target.value); loadBets(region, raceId, prediction); });
-  box().querySelector('#budget').addEventListener('change', (e) => { store.set('budget', e.target.value); loadBets(region, raceId, prediction); });
-  box().querySelector('#bankroll').addEventListener('change', (e) => { store.set('bankroll', e.target.value); loadBets(region, raceId, prediction); });
-  box().querySelector('#odds')?.addEventListener('click', async (event) => {
-    event.target.disabled = true;
-    try {
-      watch(await api('race/odds', {region, race_id: raceId}), () => { betsCache.clear(); loadBets(region, raceId, prediction); });
-    } catch (e) { alertJob(e); event.target.disabled = false; }
-  });
+  wire();
 }
 
 async function predict(region, raceId, refresh) {
