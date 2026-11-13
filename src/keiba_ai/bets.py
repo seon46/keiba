@@ -209,8 +209,8 @@ def allocate(odds, budget, unit=100):
 #   criterion: what makes the bankroll grow fastest when the same kind of bet is repeated;
 # * sets are ranked by that growth.  A negative best growth means that, by the model's probabilities, not
 #   betting is better; such sets are still listed (smallest stake), flagged by the sign.
-# The model's probabilities are trusted as they are, so a larger bankroll than the real one gives a more
-# cautious (fractional Kelly) stake.
+# The model's probabilities are trusted as they are.  Stakes scale with the bankroll, so a bankroll set below the
+# real one (e.g. half: half Kelly) gives a more cautious stake.
 SEARCH_SAMPLES = 3000   # simulated orders used to screen candidate sets; the shortlist is re-scored on all
 GROWTH_STEPS = 14       # totals tried per set when screening
 POOL_PER_TYPE = 4       # best sets of each bet type that may enter a mix
