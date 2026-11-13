@@ -398,7 +398,7 @@ class Engine:
         proposals = propose(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
         mixes = combine(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
         return dict(prediction_id=prediction_id, proposals=proposals, mixes=mixes, bet_names=BET_NAMES, budget=budget,
-                    bankroll=bankroll,
+                    bankroll=bankroll, budget_capped=budget >= bankroll,
                     approximate=getattr(race_bets, 'approximate', False), samples=race_bets.samples,
                     odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
                                                          official_at=saved.get('official_at'), status=saved.get('status'),
