@@ -549,6 +549,7 @@ const betsSettings = {
   get minHit() { return Number(store.get('minHit', '0.2')); },
   get maxPoints() { return Number(store.get('maxPoints', '10')); },
   get budget() { return Number(store.get('budget', '1000')); },
+  get bankroll() { return Number(store.get('bankroll', '50000')); },
 };
 
 function ticketLabel(key) {
@@ -592,30 +593,36 @@ function ticketChip(t) {
   return `<span class="ticket">${esc(ticketLabel(t.key))}<b class="stake">${t.stake.toLocaleString()}円</b><small>${oddsLabel(t.odds)}倍<span class="detail"> · ${pct(t.probability)}</span></small></span>`;
 }
 
+function growthText(rate) {
+  if (rate == null) return '–';
+  return `${rate >= 0 ? '+' : ''}${(rate * 100).toFixed(rate * 100 >= 1 || rate * 100 <= -1 ? 1 : 2)}%`;
+}
+
 // Mixes of two or three bet types: any ticket that hits alone still covers the total.
 function mixesTable(mixes, hasOdds) {
   if (!hasOdds) return '';
   if (!mixes.length) return '<h3 class="mix-title">組み合わせの提案</h3><p class="muted small">この条件で、当たっても損にならない組み合わせはありません。</p>';
   return `<h3 class="mix-title">組み合わせの提案</h3>
-    <p class="small muted">券種をまたいで買う提案です。どの買い目が1つだけ当たっても合計金額以上が戻る配分で、複数当たれば払戻は足し算になります。的中率は「どれかが当たる確率」です。</p>
+    <p class="small muted">券種をまたいで買う提案です。当たりやすい券種と、当たりにくいが配当の大きい券種も組み合わせます。どの買い目が1つだけ当たっても合計金額以上が戻る配分で、複数当たれば払戻は足し算になります。的中率は「どれかが当たる確率」で、資金の伸びの高い順です。</p>
     <div class="list-wrap"><table class="list bets-table mixes">
-      <thead><tr><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
-      <tbody>${mixes.map((m) => `<tr class="${m.expected_return >= 1 ? 'good' : ''}">
+      <thead><tr><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num" title="1レースあたりの資金の対数成長率">資金の伸び</th><th class="num opt">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
+      <tbody>${mixes.map((m) => `<tr class="${m.growth > 0 ? 'good' : ''}">
         <td>${m.parts.map((part) => `<div class="mix-part"><span class="bet-name">${esc(part.name)}</span><div class="tickets">${part.tickets.map(ticketChip).join('')}</div></div>`).join('')}</td>
         <td class="num opt">${m.cost.toLocaleString()}円<div class="small muted">${m.points}点</div></td>
         <td class="num prob">${pct(m.hit_rate)}</td>
-        <td class="num">${pct(m.expected_return, 0)}</td>
+        <td class="num" data-value="${m.growth}">${growthText(m.growth_rate)}</td>
+        <td class="num opt">${pct(m.expected_return, 0)}</td>
         <td class="num opt">${m.min_payout.toLocaleString()}〜${m.max_payout.toLocaleString()}円<div class="small muted">+${(m.min_payout - m.cost).toLocaleString()}円〜</div></td>
       </tr>`).join('')}</tbody></table></div>`;
 }
 
 async function loadBets(region, raceId, prediction) {
-  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}`;
+  const key = `${prediction.id}|${betsSettings.minHit}|${betsSettings.maxPoints}|${betsSettings.budget}|${betsSettings.bankroll}`;
   let data = betsCache.get(key);
   const box = () => view.querySelector('#bets');
   if (!data) {
     try {
-      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}`);
+      data = await api(`bets?prediction=${prediction.id}&min_hit=${betsSettings.minHit}&max_points=${betsSettings.maxPoints}&budget=${betsSettings.budget}&bankroll=${betsSettings.bankroll}`);
       betsCache.set(key, data);
     } catch (e) {
       if (box()) box().innerHTML = `<h2>買い目の提案</h2><p class="error-text">${esc(e.message)}</p>`;
@@ -636,22 +643,24 @@ async function loadBets(region, raceId, prediction) {
     <div class="controls">
       ${select('min-hit', [[0.1, '10%以上'], [0.2, '20%以上'], [0.3, '30%以上'], [0.5, '50%以上']], betsSettings.minHit, '的中率')}
       ${select('max-points', [[3, '3点まで'], [5, '5点まで'], [10, '10点まで'], [20, '20点まで']], betsSettings.maxPoints, '点数')}
-      ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '予算')}
+      ${select('budget', [[500, '500円'], [1000, '1,000円'], [2000, '2,000円'], [3000, '3,000円'], [5000, '5,000円'], [10000, '10,000円']], betsSettings.budget, '1レースの上限')}
+      ${select('bankroll', [[10000, '1万円'], [30000, '3万円'], [50000, '5万円'], [100000, '10万円'], [300000, '30万円'], [1000000, '100万円']], betsSettings.bankroll, '資金')}
       <span class="spacer"></span>
       ${data.odds_partial ? '<span class="small muted">地方は3連複・3連単のオッズなし</span>' : ''}
       <button type="button" id="odds">${odds ? 'オッズを更新' : 'オッズを取得'}</button>
     </div>
     <p class="small muted">${odds ? `オッズ：${timeLabel(odds.retrieved_at)}取得${odds.official_at ? `（${esc(odds.official_at.slice(11, 16))}時点）` : ''}。` : 'オッズ未取得のため、的中率の高い順です。'}
-      ${hasEv ? 'どれが当たっても払戻がほぼ同じになるよう、オッズの低い買い目ほど多く買う配分です（当たっても損になる買い方は出しません）。期待値の高い順。期待値はモデルの確率×オッズの目安で、100%を超えても儲かる保証はありません。' : odds ? '' : 'オッズを取得すると、当たっても損にならない金額配分と期待値を出します。'}
+      ${hasEv ? '「資金の伸び」は、同じような買い方を続けたときに1レースあたり資金が平均で何%増えるか（対数成長率）で、高い順に並べています。合計金額は、資金がいちばん速く増える額（ケリー基準）を1レースの上限までで選んでいます。どれが当たっても払戻がほぼ同じになる配分で、当たっても損になる買い方は出しません。マイナスは、モデルの確率では買わない方が良いという意味です。モデルの確率は高めに出やすいので、資金を実際より多めに設定すると控えめな金額になります。' : odds ? '' : 'オッズを取得すると、資金の伸びが一番大きい買い方と金額を出します。'}
       ${data.approximate ? 'この予想は温度の記録がない古い予想のため、確率は近似です。' : ''}</p>
     ${data.proposals.length ? `<div class="list-wrap"><table class="list bets-table">
-      <thead><tr><th>券種</th><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
-      <tbody>${data.proposals.map((p) => `<tr class="${p.expected_return != null && p.expected_return >= 1 ? 'good' : ''}">
+      <thead><tr><th>券種</th><th>買い目（金額）</th><th class="num opt">合計</th><th class="num">的中率</th><th class="num" title="1レースあたりの資金の対数成長率">資金の伸び</th><th class="num opt">期待値</th><th class="num opt">的中時の払戻</th></tr></thead>
+      <tbody>${data.proposals.map((p) => `<tr class="${p.growth != null && p.growth > 0 ? 'good' : ''}">
         <td class="bet-name">${esc(p.name)}</td>
         <td><div class="tickets">${p.tickets.map((t) => `<span class="ticket">${esc(ticketLabel(t.key))}${p.priced ? `<b class="stake">${t.stake.toLocaleString()}円</b>` : ''}<small>${t.odds != null ? `${oddsLabel(t.odds)}倍` : ''}<span class="detail">${t.odds != null ? ' · ' : ''}${pct(t.probability)}</span></small></span>`).join('')}</div></td>
         <td class="num opt">${p.cost.toLocaleString()}円<div class="small muted">${p.points}点</div></td>
         <td class="num prob">${pct(p.hit_rate)}</td>
-        <td class="num">${p.expected_return != null ? pct(p.expected_return, 0) : '–'}</td>
+        <td class="num" data-value="${p.growth ?? ''}">${growthText(p.growth_rate)}</td>
+        <td class="num opt">${p.expected_return != null ? pct(p.expected_return, 0) : '–'}</td>
         <td class="num opt">${p.min_payout != null ? `${p.min_payout.toLocaleString()}${p.max_payout > p.min_payout ? `〜${p.max_payout.toLocaleString()}` : ''}円<div class="small muted">+${(p.min_payout - p.cost).toLocaleString()}円〜</div>` : '–'}</td>
       </tr>`).join('')}</tbody></table></div>`
     : '<p class="muted">この条件に合う買い目はありません。的中率か点数の条件を緩めてください。</p>'}
@@ -659,6 +668,7 @@ async function loadBets(region, raceId, prediction) {
   box().querySelector('#min-hit').addEventListener('change', (e) => { store.set('minHit', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#max-points').addEventListener('change', (e) => { store.set('maxPoints', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#budget').addEventListener('change', (e) => { store.set('budget', e.target.value); loadBets(region, raceId, prediction); });
+  box().querySelector('#bankroll').addEventListener('change', (e) => { store.set('bankroll', e.target.value); loadBets(region, raceId, prediction); });
   box().querySelector('#odds')?.addEventListener('click', async (event) => {
     event.target.disabled = true;
     try {

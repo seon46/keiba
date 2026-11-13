@@ -5,7 +5,7 @@ per horse (``ranking_v3.staged_rank_distribution``).  The same process is simula
 probability of any ticket -- including combinations such as exacta or trifecta that the per-horse
 marginals cannot give -- is consistent with the distribution shown on the race card.
 
-Odds are only used to rank proposals by expected value; they never enter the model.
+Odds are only used to size and rank proposals (Kelly growth of a bankroll); they never enter the model.
 """
 from __future__ import annotations
 
@@ -110,15 +110,22 @@ class RaceBets:
         raise ValueError(bet)
 
     def _hits(self, bet, key):
-        """Boolean per sample: does this ticket pay?"""
+        """Boolean per sample: does this ticket pay?  (cached per ticket)"""
+        cache = self.__dict__.setdefault('_hit_cache', {})
+        if (bet, key) not in cache:
+            cache[(bet, key)] = self._compute_hits(bet, key)
+        return cache[(bet, key)]
+
+    def _compute_hits(self, bet, key):
         h = self.horse
         if bet == 'place':
             return (h[:, :self.slots] == int(key)).any(axis=1)
         if bet == 'wide':
             a, b = (int(value) for value in key.split('-'))
             return (h == a).any(axis=1) & (h == b).any(axis=1)
-        outcomes = self._outcome_cache.setdefault(bet, np.asarray(self._outcomes(bet), dtype=object))
-        return outcomes == key
+        lookup, codes = self._codes(bet)
+        code = lookup.get(key)
+        return np.zeros(len(codes), dtype=bool) if code is None or key == '' else codes == code
 
 
     def probabilities(self, bet):
@@ -138,9 +145,18 @@ class RaceBets:
                 if value > 0:
                     result[f'{a}-{b}'] = value
             return result
-        outcomes = self._outcome_cache.setdefault(bet, np.asarray(self._outcomes(bet), dtype=object))
-        keys, counts = np.unique(outcomes[outcomes != None], return_counts=True)  # noqa: E711
-        return {str(key): float(count) / self.samples for key, count in zip(keys.tolist(), counts.tolist())}
+        lookup, codes = self._codes(bet)
+        counts = np.bincount(codes, minlength=len(lookup))
+        return {key: float(counts[code]) / self.samples for key, code in lookup.items() if key and counts[code]}
+
+    def _codes(self, bet):
+        """({ticket key: integer code}, code per sample) of one bet type; '' marks samples that pay nothing."""
+        cache = self.__dict__.setdefault('_code_cache', {})
+        if bet not in cache:  # comparing integers is much faster than comparing strings
+            labels = np.asarray(self._outcomes(bet), dtype=object)
+            names, codes = np.unique(np.where(labels == None, '', labels).astype(str), return_inverse=True)  # noqa: E711
+            cache[bet] = (dict(zip(names.tolist(), range(len(names)))), codes)
+        return cache[bet]
 
     def hit_rate(self, bet, keys):
         hit = np.zeros(self.samples, dtype=bool)
@@ -185,16 +201,101 @@ def allocate(odds, budget, unit=100):
     return stakes, min(stake * value for stake, value in zip(stakes, odds)), sum(stakes)
 
 
-def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, budget=1000, limit=8, per_type=1):
-    """Multi-point proposals.
+# How the stakes are chosen (both for single bet types and mixes):
+# * within a set of tickets the stakes keep every hit paying about the same (more on the shorter odds), so any
+#   single hit pays back at least the total -- possible only when the sum of 1/odds is at most 1 (no トリガミ);
+# * the total is chosen (in 100-yen steps, up to ``budget``) to maximise the expected log growth of the
+#   ``bankroll``, mean(log(1 + (payout - total) / bankroll)) over the simulated finishing orders -- the Kelly
+#   criterion: what makes the bankroll grow fastest when the same kind of bet is repeated;
+# * sets are ranked by that growth.  A negative best growth means that, by the model's probabilities, not
+#   betting is better; such sets are still listed (smallest stake), flagged by the sign.
+# The model's probabilities are trusted as they are, so a larger bankroll than the real one gives a more
+# cautious (fractional Kelly) stake.
+SEARCH_SAMPLES = 3000   # simulated orders used to screen candidate sets; the shortlist is re-scored on all
+GROWTH_STEPS = 14       # totals tried per set when screening
+POOL_PER_TYPE = 4       # best sets of each bet type that may enter a mix
+SHORTLIST = 40          # mixes re-scored exactly
 
-    For each bet type the tickets are ranked by hit probability and every leading set of 1..N
-    tickets is a candidate.  Candidates below ``min_hit`` are dropped.  With odds, the ``budget`` is
-    split so that every ticket pays about the same (more on the shorter odds), sets that would lose
-    money even when they hit (トリガミ) are dropped, and the rest are sorted by expected return.
-    Without odds every ticket gets 100 yen and the sets are sorted by hit rate.  The lower odds of
-    複勝 / ワイド ranges are used.
-    """
+
+def _totals(budget, minimum, unit=100):
+    """Up to GROWTH_STEPS totals between ``minimum`` and ``budget`` (multiples of ``unit``), denser at the low end."""
+    lowest, highest = max(unit, int(minimum)), int(budget) // unit * unit
+    if highest < lowest:
+        return np.asarray([], dtype=float)
+    grid = np.unique(np.round(np.geomspace(lowest, highest, GROWTH_STEPS) / unit) * unit)
+    return grid[(grid >= lowest) & (grid <= highest)].astype(float)
+
+
+def _screen(hits, values, bankroll, budget, unit=100):
+    """Approximate best (total, growth) of a ticket set under the equal-payout split, or None (トリガミ / budget).
+
+    ``hits``: (tickets, samples) booleans.  With stakes proportional to 1/odds every hit pays total / sum(1/odds),
+    so the payout of a sample is (number of hits) x total / sum(1/odds)."""
+    inverse = float(sum(1 / value for value in values))
+    if inverse > 1 + 1e-9:
+        return None
+    grid = _totals(min(budget, bankroll * .999), unit * len(values), unit)
+    if not len(grid):
+        return None
+    ratio = hits.sum(axis=0) / inverse - 1
+    growth = np.log1p(np.outer(grid, ratio) / bankroll).mean(axis=1)
+    best = int(np.argmax(growth))
+    return float(grid[best]), float(growth[best])
+
+
+def _exact(hits, values, total, bankroll):
+    """Stakes in 100-yen units for ``total`` and their outcome over all samples; None when a hit would lose."""
+    allocation = allocate(values, total)
+    if allocation is None:
+        return None
+    stakes, smallest, cost = allocation
+    if smallest < cost or cost > total:
+        return None
+    payout = (hits * (np.asarray(stakes, dtype=float) * np.asarray(values))[:, None]).sum(axis=0)
+    hit = payout > 0
+    return dict(stakes=stakes, cost=cost, payout=payout, hit_rate=float(hit.mean()),
+                growth=float(np.log1p((payout - cost) / bankroll).mean()),
+                expected_return=float(payout.mean() / cost), profit_rate=float((payout > cost).mean()),
+                min_payout=round(float(smallest)), max_payout=round(float(payout.max())))
+
+
+def _best_exact(hits, values, bankroll, budget, approximate_total, unit=100):
+    """Exact plan at the screened total, trying nearby totals when rounding to 100 yen breaks the no-loss rule."""
+    tried = sorted(set(float(total) for total in _totals(min(budget, bankroll * .999), unit * len(values), unit)),
+                   key=lambda total: abs(total - approximate_total))
+    best = None
+    for total in tried[:6]:
+        plan = _exact(hits, values, total, bankroll)
+        if plan is not None and (best is None or plan['growth'] > best['growth']):
+            best = plan
+    return best
+
+
+def _ticket_sets(bets, odds, bet, max_points):
+    """'The N most likely tickets' sets of one bet type with all odds known: (keys, values, probabilities, hits)."""
+    table = (odds or {}).get(bet) or {}
+    probabilities = bets.probabilities(bet)
+    if not table or not probabilities:
+        return []
+    order = sorted(probabilities.items(), key=lambda item: -item[1])[:CANDIDATES]
+    sets = []
+    for size in range(1, min(MAX_POINTS[bet], max_points, len(order)) + 1):
+        keys = [key for key, _ in order[:size]]
+        values = [_odds_value(table.get(key)) for key in keys]
+        if any(value is None for value in values):
+            break
+        sets.append((keys, values, [probabilities[key] for key in keys],
+                     np.stack([bets._hits(bet, key) for key in keys])))
+    return sets
+
+
+def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, budget=1000, bankroll=50000, limit=8,
+            per_type=1):
+    """Multi-point proposals of one bet type each: the N most likely tickets (N = 1..), at least ``min_hit``.
+
+    With odds: stakes and total by the Kelly criterion on ``bankroll`` (see above), sorted by growth.  Without
+    odds every ticket gets 100 yen and the sets are sorted by hit rate.  The lower odds of 複勝 / ワイド ranges
+    are used."""
     odds = odds or {}
     proposals = []
     for bet, name, _, _ in BET_TYPES:
@@ -202,37 +303,34 @@ def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, budget=1000
         if not probabilities:
             continue
         table = odds.get(bet) or {}
-        # Only "the N most likely tickets" sets: buying long shots because their odds look generous mostly
-        # buys the model's tail error, and a high hit rate was the goal.
+        priced_sets = {tuple(keys): (values, hits) for keys, values, _, hits in _ticket_sets(bets, odds, bet,
+                                                                                               max_points)}
         order = sorted(probabilities.items(), key=lambda item: -item[1])[:CANDIDATES]
         for size in range(1, min(MAX_POINTS[bet], max_points, len(order)) + 1):
             keys = tuple(key for key, _ in order[:size])
             hit = bets.hit_rate(bet, keys) if bet in ('place', 'wide') else sum(p for _, p in order[:size])
             if hit < min_hit:
                 continue
-            values = [_odds_value(table.get(key)) for key in keys]
-            priced = all(value is not None for value in values)
-            item = dict(bet=bet, name=name, points=size, hit_rate=hit, priced=priced)
-            if priced:
-                allocation = allocate(values, budget)
-                if allocation is None:
+            item = dict(bet=bet, name=name, points=size, hit_rate=hit, priced=keys in priced_sets)
+            if keys in priced_sets:
+                values, hits = priced_sets[keys]
+                screened = _screen(hits[:, :SEARCH_SAMPLES], values, bankroll, budget)
+                plan = screened and _best_exact(hits, values, bankroll, budget, screened[0])
+                if not plan:
                     continue
-                stakes, payout, total = allocation
-                if payout < total:  # a hit would still lose money
-                    continue
-                item.update(cost=total, stakes=stakes, min_payout=round(payout),
-                            max_payout=round(max(stake * value for stake, value in zip(stakes, values))),
-                            expected_return=sum(probabilities[key] * stake * value
-                                                for key, stake, value in zip(keys, stakes, values)) / total,
-                            synthetic_odds=1 / sum(1 / value for value in values))
+                stakes = plan['stakes']
+                item.update(cost=plan['cost'], stakes=stakes, min_payout=plan['min_payout'],
+                            max_payout=plan['max_payout'], expected_return=plan['expected_return'],
+                            growth=plan['growth'], growth_rate=math.expm1(plan['growth']),
+                            profit_rate=plan['profit_rate'], synthetic_odds=1 / sum(1 / value for value in values))
             else:
                 stakes = [100] * size
                 item.update(cost=100 * size, stakes=stakes, min_payout=None, max_payout=None, expected_return=None,
-                            synthetic_odds=None)
+                            growth=None, growth_rate=None, profit_rate=None, synthetic_odds=None)
             item['tickets'] = [dict(key=key, probability=probabilities[key], odds=table.get(key), stake=stake)
                                for key, stake in zip(keys, stakes)]
             proposals.append(item)
-    proposals.sort(key=lambda item: (item['expected_return'] is None, -(item['expected_return'] or 0),
+    proposals.sort(key=lambda item: (item['growth'] is None, -(item['growth'] if item['growth'] is not None else 0),
                                      -item['hit_rate'], item['points']))
     chosen, used = [], {}
     for item in proposals:
@@ -245,78 +343,61 @@ def propose(bets: RaceBets, odds=None, *, min_hit=.2, max_points=10, budget=1000
     return chosen
 
 
-def combine(bets: RaceBets, odds, *, min_hit=.2, max_points=10, budget=1000, limit=5, pool=14):
-    """Proposals that mix two or three bet types (e.g. 単勝 + 馬連 + 3連単).
+def combine(bets: RaceBets, odds, *, min_hit=.2, max_points=10, budget=1000, bankroll=50000, limit=5):
+    """Proposals that mix two or three bet types (e.g. 単勝 + 馬連 + 3連単), ranked by Kelly growth.
 
-    Parts are the "N most likely tickets" sets of each priced bet type.  The budget is split over all
-    tickets of the mix so that any single ticket that hits pays back at least the total (so a hit
-    never loses money even when only the cheapest part hits); hits of several parts add up.  Hit
-    rate, payouts and expected return come from the simulated finishing orders.
-    """
+    Every priced 'N most likely tickets' set may be a part, also when it alone hits rarely (a 3連単 set is
+    what a mix adds to a safer part); ``min_hit`` applies to the mix.  The best POOL_PER_TYPE sets of each
+    type by their own growth enter the search over all 2- and 3-type mixes; the shortlist is re-scored on all
+    simulated orders.  Hits of several parts add up."""
     from itertools import combinations as choose
     if not odds:
         return []
-    parts = []
+    pool = []
     for bet, name, _, _ in BET_TYPES:
-        table = odds.get(bet) or {}
-        probabilities = bets.probabilities(bet)
-        if not table or not probabilities:
+        ranked = []
+        for keys, values, probabilities, hits in _ticket_sets(bets, odds, bet, max_points - 1):
+            if sum(1 / value for value in values) > 1:
+                continue  # a part that loses money when it hits can never be in a no-loss mix
+            screened = _screen(hits[:, :SEARCH_SAMPLES], values, bankroll, budget)
+            score = screened[1] if screened else -math.inf
+            ranked.append((score, dict(bet=bet, name=name, keys=keys, values=values, probabilities=probabilities,
+                                       hits=hits)))
+        ranked.sort(key=lambda item: -item[0])
+        pool.extend(part for _, part in ranked[:POOL_PER_TYPE])
+    screened = []
+    for count in (2, 3):
+        for members in choose(pool, count):
+            if len({part['bet'] for part in members}) < count:
+                continue
+            values = [value for part in members for value in part['values']]
+            if len(values) > max_points or sum(1 / value for value in values) > 1:
+                continue
+            hits = np.concatenate([part['hits'] for part in members])
+            if hits[:, :SEARCH_SAMPLES].any(axis=0).mean() < min_hit:
+                continue
+            result = _screen(hits[:, :SEARCH_SAMPLES], values, bankroll, budget)
+            if result is not None:
+                screened.append((result[1], result[0], members, values, hits))
+    screened.sort(key=lambda item: -item[0])
+    mixes = []
+    for _, total, members, values, hits in screened[:SHORTLIST]:
+        plan = _best_exact(hits, values, bankroll, budget, total)
+        if plan is None or plan['hit_rate'] < min_hit:
             continue
-        order = sorted(probabilities.items(), key=lambda item: -item[1])[:CANDIDATES]
-        for size in range(1, min(MAX_POINTS[bet], max_points - 1, len(order)) + 1):
-            keys = [key for key, _ in order[:size]]
-            values = [_odds_value(table.get(key)) for key in keys]
-            if any(value is None for value in values):
-                break
-            hits = np.stack([bets._hits(bet, key) for key in keys])
-            parts.append(dict(bet=bet, name=name, keys=keys, values=values, hits=hits,
-                              probabilities=[probabilities[key] for key in keys]))
-    if len(parts) < 2:
-        return []
-
-    def evaluate(members):
-        tickets = [(part, index) for part in members for index in range(len(part['keys']))]
-        if len(tickets) > max_points:
-            return None
-        values = [part['values'][index] for part, index in tickets]
-        allocation = allocate(values, budget)
-        if allocation is None or allocation[1] < allocation[2]:
-            return None
-        stakes, smallest, total = allocation
-        payout = np.zeros(bets.samples)
-        for (part, index), stake, value in zip(tickets, stakes, values):
-            payout += part['hits'][index] * stake * value
-        hit = payout > 0
-        if hit.mean() < min_hit:
-            return None
         position, rows = 0, []
         for part in members:
             size = len(part['keys'])
-            share = stakes[position:position + size]
+            share = plan['stakes'][position:position + size]
             rows.append(dict(bet=part['bet'], name=part['name'], cost=sum(share), tickets=[
                 dict(key=key, probability=probability, odds=(odds[part['bet']] or {}).get(key), stake=stake)
                 for key, probability, stake in zip(part['keys'], part['probabilities'], share)]))
             position += size
-        return dict(parts=rows, points=len(tickets), cost=total, hit_rate=float(hit.mean()),
-                    expected_return=float(payout.mean() / total), min_payout=round(float(payout[hit].min())),
-                    max_payout=round(float(payout.max())), profit_rate=float((payout > total).mean()))
-
-    singles = []
-    for part in parts:
-        result = evaluate([part])
-        if result is not None:
-            singles.append((part, result))
-    singles.sort(key=lambda item: -item[1]['expected_return'])
-    top = [part for part, _ in singles[:pool]]
-    mixes = []
-    for count in (2, 3):
-        for members in choose(top, count):
-            if len({part['bet'] for part in members}) < count:
-                continue
-            result = evaluate(list(members))
-            if result is not None:
-                mixes.append(result)
-    mixes.sort(key=lambda item: (-item['expected_return'], -item['hit_rate']))
+        mixes.append(dict(parts=rows, points=len(values), cost=plan['cost'], hit_rate=plan['hit_rate'],
+                          expected_return=plan['expected_return'], growth=plan['growth'],
+                          growth_rate=math.expm1(plan['growth']), min_payout=plan['min_payout'],
+                          max_payout=plan['max_payout'], profit_rate=plan['profit_rate']))
+    mixes.sort(key=lambda item: (-item['growth'], -item['hit_rate']))
     chosen, seen = [], set()
     for item in mixes:
         kinds = tuple(part['bet'] for part in item['parts'])

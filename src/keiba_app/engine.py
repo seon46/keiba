@@ -387,7 +387,7 @@ class Engine:
                     pick_horse_number=pick['horse_number'], pick_win_probability=pick.get('win_probability'),
                     pick_top3_probability=pick.get('top3_probability'))
 
-    def bets(self, prediction_id, *, min_hit=.2, max_points=10, budget=1000):
+    def bets(self, prediction_id, *, min_hit=.2, max_points=10, budget=1000, bankroll=50000):
         from keiba_ai.bets import BET_NAMES, combine, propose
         prediction = self.logbook.prediction(prediction_id)
         if prediction is None:
@@ -395,9 +395,10 @@ class Engine:
         race_bets = self._race_bets(prediction)
         saved = self.saved.odds(prediction['region'], prediction['race_id'])
         table = (saved or {}).get('odds')
-        proposals = propose(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget)
-        mixes = combine(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget)
+        proposals = propose(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
+        mixes = combine(race_bets, table, min_hit=min_hit, max_points=max_points, budget=budget, bankroll=bankroll)
         return dict(prediction_id=prediction_id, proposals=proposals, mixes=mixes, bet_names=BET_NAMES, budget=budget,
+                    bankroll=bankroll,
                     approximate=getattr(race_bets, 'approximate', False), samples=race_bets.samples,
                     odds=None if saved is None else dict(retrieved_at=saved.get('retrieved_at'),
                                                          official_at=saved.get('official_at'), status=saved.get('status'),
