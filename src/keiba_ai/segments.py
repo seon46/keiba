@@ -1,4 +1,4 @@
-"""Race segments (surface x age x class) and segment-specific corrections of a fitted v4 group.
+"""Race segments (surface x distance x age x class) and segment-specific corrections of a fitted v4 group.
 
 Approach A: every model is first fitted on the whole group as before.  For each segment with enough races,
 the LightGBM+pedigree part (B) is continued with a few boosting rounds fitted on that segment only, starting
@@ -25,6 +25,16 @@ LOCAL_CLASSES = {6: 'A', 7: 'A', 8: 'A', 15: 'A', 9: 'B', 10: 'B', 11: 'B', 16: 
                  12: 'C', 13: 'C', 14: 'C', 17: 'C'}
 
 
+DISTANCES = (('短距離', 0, 1400), ('マイル', 1400, 1900), ('中距離', 1900, 2400), ('長距離', 2400, 10 ** 6))
+
+
+def _distance(meters):
+    import math
+    if math.isnan(meters):
+        return '距離不明'
+    return next(name for name, low, high in DISTANCES if low <= meters < high)
+
+
 def _age(minimum, maximum):
     import math
     if not math.isnan(maximum) and maximum <= 2:
@@ -37,27 +47,29 @@ def _age(minimum, maximum):
 
 
 def segment_labels(x, group):
-    """Label per row: central '芝・古馬・2・3勝', local '古馬・C' (local is almost all dirt)."""
+    """Label per row: central '芝・マイル・古馬・2・3勝', local 'マイル・古馬・C' (local is almost all dirt).
+    Distance bands: 短距離 (-1399m), マイル (1400-1899m), 中距離 (1900-2399m), 長距離 (2400m-)."""
     import math
     import numpy as np
     from .features import FEATURE_NAMES
     index = {name: FEATURE_NAMES.index(name) for name in
-             ('surface_code', 'race_age_min', 'race_age_max', 'race_class_code', 'race_grade_code')}
+             ('surface_code', 'distance_m', 'race_age_min', 'race_age_max', 'race_class_code', 'race_grade_code')}
     central = group.startswith('central')
     labels = np.empty(len(x), dtype=object)
     for row in range(len(x)):
         values = {name: float(x[row, column]) for name, column in index.items()}
         age = _age(values['race_age_min'], values['race_age_max'])
+        distance = _distance(values['distance_m'])
         code = values['race_class_code']
         if central:
             surface = {0.0: '芝', 1.0: 'ダ'}.get(values['surface_code'], 'その他')
             klass = ('OP・重賞' if not math.isnan(values['race_grade_code'])
                      else CENTRAL_CLASSES.get(int(code), 'その他') if not math.isnan(code) else 'その他')
-            labels[row] = f'{surface}・{age}・{klass}'
+            labels[row] = f'{surface}・{distance}・{age}・{klass}'
         else:
             klass = ('重賞' if not math.isnan(values['race_grade_code'])
                      else LOCAL_CLASSES.get(int(code), 'その他') if not math.isnan(code) else 'その他')
-            labels[row] = f'{age}・{klass}'
+            labels[row] = f'{distance}・{age}・{klass}'
     return labels
 
 
