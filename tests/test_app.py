@@ -52,6 +52,7 @@ class AppTests(unittest.TestCase):
             self.assertEqual(len(runner['distribution']), 11)
             self.assertAlmostEqual(sum(runner['distribution']), 1.0, places=6)
             self.assertTrue(runner['horse_name'])
+        self.assertIn('prior_starts', prediction['runners'][0])  # filled by the v4 pipeline (None for this fixture model)
         self.assertIsNone(prediction['outcome'])
 
         # Bet proposals from the logged prediction (no odds saved: sorted by hit rate)
@@ -85,6 +86,18 @@ class AppTests(unittest.TestCase):
         missing.pop(longshot)
         self.assertFalse(engine._race_bets(prediction, missing).blended)
         self.assertFalse(bets['blend']['applied'])  # no odds saved
+        # data/market.json (experiment_market output) switches to its recommended stage-wise mix
+        market = Path(self.fixture['data_dir']) / 'market.json'
+        market.write_text(json.dumps(dict(groups={f'{region}_flat': dict(recommended=dict(
+            variant='stages', params={'1st': dict(s=.1, m=.9), '2nd_3rd': dict(s=.6, m=.0)}))})), encoding='utf-8')
+        try:
+            self.assertEqual(engine.market_config()[region]['variant'], 'stages')
+            staged = engine._race_bets(prediction, odds)
+            self.assertTrue(staged.blended)
+            self.assertNotAlmostEqual(staged.probabilities('win')[longshot], blended.probabilities('win')[longshot], 3)
+        finally:
+            market.unlink()
+        self.assertEqual(engine.market_config()[region]['variant'], 'blend')
         capped = engine.bets(identifier, min_hit=.2, max_points=10, budget=10000, bankroll=10000)
         self.assertTrue(capped['budget_capped'])  # a cap at or above the bankroll is used up to the bankroll
         self.assertTrue(capped['proposals'])

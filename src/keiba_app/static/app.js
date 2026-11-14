@@ -722,7 +722,10 @@ async function loadBets(region, raceId, prediction) {
 function blendText(b, hasOdds) {
   if (!b || !b.requested) return hasOdds ? '<p class="small notice-text">モデルの確率だけで計算しています。2025年の検証では、モデルだけでケリー基準どおりに単勝を買うと1レースあたり資金が約3.5%ずつ減りました。</p>' : '';
   if (!b.applied) return hasOdds ? '<p class="small muted">単勝オッズがそろっていない馬がいるため、モデルの確率だけで計算しています。</p>' : '';
-  return `<p class="small muted">確率は、モデルと単勝オッズを合わせたものです（強さ＝${b.a}×モデル＋${b.b}×log オッズの勝率）。2025年の検証では、モデルだけ・オッズだけより1〜3着の並びをよく当て、単勝をケリー基準で買ったときの損も、モデルだけより大幅に小さくなりました（中央で約1/100、地方で約1/20）。ただし、どの設定でも長期的にプラスにはなっていないため、「資金の伸び」がプラスの買い目はまれです。</p>`;
+  const p = b.params || {};
+  const mix = (row) => `モデル${(row.s ?? 0).toFixed(2)}：オッズ${(row.m ?? 0).toFixed(2)}`;
+  const how = p['1st'] ? `1着は${mix(p['1st'])}、2着以降は${mix(p['2nd_3rd'])}の重み（人気薄の補正${b.standardization ? '・頭数と出走経験の補正' : ''}つき）` : `${mix(p.all || {})}の重み`;
+  return `<p class="small muted">確率は、モデルと単勝オッズを合わせたものです（${how}）。2025年の検証で1〜3着の並びを最もよく当てた混ぜ方で、単勝オッズは勝ち馬を当てるのには役立ちますが、2〜3着はモデルのほうが当てになります。どの設定でも長期的にプラスにはなっていないため、「資金の伸び」がプラスの買い目はまれです。</p>`;
 }
 
 function bankrollText(source, bankroll) {

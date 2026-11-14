@@ -91,6 +91,7 @@ class PipelineV4Tests(unittest.TestCase):
             with (root / 'prediction.csv').open(encoding='utf-8') as file:
                 predicted = list(csv.DictReader(file))
             self.assertEqual(len(predicted), 20)
+            self.assertTrue(any(row['prior_starts'] not in ('', None) for row in predicted))
             for group in ('central_flat', 'local_flat'):
                 with (root / 'model' / f'evaluation_{group}.csv').open(encoding='utf-8') as file:
                     reference = {(row['race_id'], row['horse_id']): row for row in csv.DictReader(file)

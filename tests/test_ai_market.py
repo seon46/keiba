@@ -43,6 +43,7 @@ class MarketBlendExperimentTests(unittest.TestCase):
         self.assertAlmostEqual(params['all']['m'], .8, delta=.15)
         result = evaluate_group(None, None, 'x', data=data)
         self.assertEqual(result['recommended']['variant'], 'blend')
+        self.assertEqual(set(result['recommended']['standardization']), {'field_mean', 'field_sd', 'exp_mean', 'exp_sd'})
 
     def test_detects_separate_weights_for_second_and_third(self):
         from keiba_ai.experiment_market import evaluate_group
