@@ -123,6 +123,7 @@ class Engine:
                 runner.update(win_probability=result['win_probability'], top3_probability=result['top3_probability'],
                               expected_rank=result['expected_rank_given_finish'],
                               strength_score=result['strength_score'], finish_probability=result['finish_probability'],
+                              prior_starts=result.get('prior_starts'),
                               distribution=[result[f'rank_{rank}_probability'] for rank in range(1, size + 1)]
                               + [result['nonfinish_probability']])
             runners.append(runner)
@@ -314,13 +315,28 @@ class Engine:
         return dict(value=value, tier=tier, thresholds=list(scale['thresholds']), approximate=approximate,
                     expected=dict(races=scale['races'], **scale['rates'][tier]), rates=scale['rates'])
 
+    def market_config(self):
+        """{region: market blend spec}: the recommended mix of data/market.json (keiba_ai.experiment_market)
+        when it is there, else the built-in blend.  Re-read when the file changes."""
+        from keiba_ai.bets import default_market_config, load_market_config
+        path = self.app.data_dir / 'market.json'
+        try:
+            stamp = path.stat().st_mtime
+        except OSError:
+            stamp = None
+        if getattr(self, '_market', (object(),))[0] != stamp:
+            self._market = (stamp, (load_market_config(path) if stamp is not None else None) or default_market_config())
+        return self._market[1]
+
     def _race_bets(self, prediction, win_odds=None):
         """Simulated finishing orders of a logged prediction (cached).  With ``win_odds`` ({horse number: odds})
-        the strengths are blended with the market (``keiba_ai.bets.MARKET_BLEND``); ``bets.blended`` says
-        whether that happened (it does not when a runner has no win odds)."""
+        the strengths are mixed with the market (``market_config``); ``bets.blended`` says whether that happened
+        (it does not when a runner has no win odds)."""
         from keiba_ai.bets import RaceBets, blend_with_market, simulate_top3
         from keiba_ai.rank_model import race_seed
-        identifier = (prediction['id'], tuple(sorted((str(k), str(v)) for k, v in (win_odds or {}).items())))
+        config = self.market_config()
+        identifier = (prediction['id'], tuple(sorted((str(k), str(v)) for k, v in (win_odds or {}).items())),
+                      self._market[0] if win_odds else None)
         if identifier in self._bets:
             self._bets.move_to_end(identifier)
             return self._bets[identifier]
@@ -332,8 +348,9 @@ class Engine:
             raise ValueError('この予想のモデルが見つからないため、馬券の確率を計算できません。予想し直してください。')
         scores = [runner['strength_score'] for runner in runners]
         blended = blend_with_market(prediction['region'], scores, temperatures,
-                                    [(win_odds or {}).get(str(runner['horse_number'])) for runner in runners]
-                                    ) if win_odds else None
+                                    [(win_odds or {}).get(str(runner['horse_number'])) for runner in runners],
+                                    prior_starts=[runner.get('prior_starts') for runner in runners],
+                                    config=config) if win_odds else None
         if blended is not None:
             scores, temperatures = blended
         top3 = simulate_top3(scores, [runner['finish_probability'] for runner in runners], temperatures,
@@ -401,7 +418,7 @@ class Engine:
                     pick_top3_probability=pick.get('top3_probability'))
 
     def bets(self, prediction_id, *, min_hit=.2, max_points=10, budget=1000, bankroll=50000, blend=True):
-        from keiba_ai.bets import BET_NAMES, MARKET_BLEND, combine, propose
+        from keiba_ai.bets import BET_NAMES, combine, propose
         prediction = self.logbook.prediction(prediction_id)
         if prediction is None:
             raise KeyError('予想がありません。')
@@ -418,7 +435,7 @@ class Engine:
                                                          official_at=saved.get('official_at'), status=saved.get('status'),
                                                          bets=sorted(saved.get('odds', {}))),
                     blend=dict(requested=blend, applied=getattr(race_bets, 'blended', False),
-                               **MARKET_BLEND['central' if prediction['region'] == 'central' else 'local']),
+                               **self.market_config()['central' if prediction['region'] == 'central' else 'local']),
                     odds_supported=True, odds_partial=prediction['region'] == 'local' and not {'trio', 'trifecta'} <= set(table or {}),
                     confidence=self.confidence(prediction))
 

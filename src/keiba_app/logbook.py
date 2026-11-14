@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS runs (
 
 RUNNER_FIELDS = ('horse_id', 'horse_number', 'frame', 'horse_name', 'sex', 'age', 'carried_weight_kg', 'jockey_name',
                  'trainer_name', 'weight_kg', 'weight_change_kg', 'status', 'win_probability', 'top3_probability',
-                 'expected_rank', 'strength_score', 'finish_probability')
+                 'expected_rank', 'strength_score', 'finish_probability', 'prior_starts')
 PREDICTION_FIELDS = ('created_at', 'race_id', 'region', 'race_date', 'course', 'race_number', 'race_name',
                      'start_time', 'surface', 'distance_m', 'track_condition', 'starters', 'timing', 'source',
                      'origin', 'model_dir', 'model_train_end', 'dataset', 'history_through', 'bodyweight_known',
@@ -60,6 +60,9 @@ class Logbook:
             columns = {row['name'] for row in connection.execute('PRAGMA table_info(predictions)')}
             if 'temperatures_json' not in columns:  # added with the bet proposals
                 connection.execute('ALTER TABLE predictions ADD COLUMN temperatures_json TEXT')
+            runner_columns = {row['name'] for row in connection.execute('PRAGMA table_info(prediction_runners)')}
+            if 'prior_starts' not in runner_columns:  # added with the stage-wise market blend
+                connection.execute('ALTER TABLE prediction_runners ADD COLUMN prior_starts REAL')
 
     @contextmanager
     def _connect(self):

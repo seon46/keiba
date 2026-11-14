@@ -619,7 +619,8 @@ class Predictor:
                               top3_probability=float(np.clip(ranks[:3].sum(), 0, 1)),
                               expected_rank_given_finish=float((ranks * np.arange(1, size + 1)).sum() / finish)
                               if finish > 0 else None,
-                              bodyweight_used=bool(config['weight'] and row.get('weight_kg') is not None))
+                              bodyweight_used=bool(config['weight'] and row.get('weight_kg') is not None),
+                              prior_starts=_finite(x[start + local, FEATURE_NAMES.index('horse_global_prior_starts')]))
                 result.update({f'rank_{rank}_probability': float(value) for rank, value in enumerate(ranks, 1)})
                 output.append(result)
             start += size
@@ -648,6 +649,12 @@ class Predictor:
                     self.report(event='predicting', day=day, group=group, races=len(group_races))
                     results.extend(self._group_day(group, day, group_races, history, priors, samples=samples))
         return results
+
+
+def _finite(value):
+    import math
+    value = float(value)
+    return value if math.isfinite(value) else None
 
 
 def predict(database, race_db, model_dir, entries, output, *, samples=4096, threads=2, report=None):

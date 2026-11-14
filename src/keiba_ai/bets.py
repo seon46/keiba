@@ -42,16 +42,66 @@ CANDIDATES = 40  # combinations per type considered for proposals
 MARKET_BLEND = {'central': dict(a=.2942, b=.8899), 'local': dict(a=.4991, b=.6561)}
 
 
-def blend_with_market(region, scores, temperatures, win_odds):
-    """(betting strengths, stage temperatures) blending the model with the win odds, or None when any runner's
-    win odds are missing.  ``win_odds`` lines up with ``scores``."""
+MARKET_TERMS = ('s', 'm', 'm2', 's_field', 'm_field', 's_exp', 'm_exp')
+
+
+def default_market_config():
+    """{region: spec} of the built-in blend (one set of weights for every finishing stage)."""
+    return {region: dict(variant='blend', params={'all': dict(s=weights['a'], m=weights['b'])}, standardization=None)
+            for region, weights in MARKET_BLEND.items()}
+
+
+def load_market_config(path):
+    """{region: spec} from the output of ``keiba_ai.experiment_market`` (its recommended variant per group), or
+    None when the file is missing or unusable.  Regions it does not cover keep the built-in blend."""
+    import json
+    from pathlib import Path
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        groups = json.loads(path.read_text(encoding='utf-8')).get('groups') or {}
+    except (OSError, ValueError):
+        return None
+    config = default_market_config()
+    for region, group in (('central', 'central_flat'), ('local', 'local_flat')):
+        recommended = (groups.get(group) or {}).get('recommended') or {}
+        params = recommended.get('params') or {}
+        rows = [params[name] for name in ('all', '1st', '2nd_3rd') if name in params]
+        if not rows or any(set(row) - set(MARKET_TERMS) for row in rows):
+            continue
+        uses_covariates = any(key.endswith(('_field', '_exp')) for row in rows for key in row)
+        standardization = recommended.get('standardization')
+        if uses_covariates and not standardization:
+            continue  # an older output without the covariates' scale: keep the built-in blend
+        config[region] = dict(variant=recommended.get('variant'), params=params, standardization=standardization)
+    return config
+
+
+def blend_with_market(region, scores, temperatures, win_odds, *, prior_starts=None, config=None):
+    """(betting strengths, stage temperatures relative to the first) mixing the model with the win odds, or None
+    when any runner's win odds are missing.  ``win_odds`` and ``prior_starts`` line up with ``scores``.
+
+    The strengths are one row per finishing stage group: a single row ('all'), or two rows (1st place, then
+    2nd place onwards) when the mix differs by stage, as fitted by keiba_ai.experiment_market."""
+    import math
     values = [_odds_value(value) for value in win_odds]
     if not values or any(value is None or value <= 1 for value in values):
         return None
-    weights = MARKET_BLEND['central' if region == 'central' else 'local']
+    spec = (config or default_market_config())['central' if region == 'central' else 'local']
     inverse = np.asarray([1 / value for value in values])
     market = np.log(inverse / inverse.sum())
-    blended = weights['a'] * np.asarray(scores, dtype=float) + weights['b'] * market
+    model = np.asarray(scores, dtype=float)
+    scale = spec.get('standardization') or {}
+    field_z = ((len(model) - scale['field_mean']) / scale['field_sd']) if scale else 0.0
+    starts = list(prior_starts or [None] * len(model))
+    exp_z = np.asarray([(math.log1p(max(float(value), 0.0)) - scale['exp_mean']) / scale['exp_sd']
+                        if scale and value is not None and math.isfinite(float(value)) else 0.0 for value in starts])
+    terms = dict(s=model, m=market, m2=market ** 2, s_field=model * field_z, m_field=market * field_z,
+                 s_exp=model * exp_z, m_exp=market * exp_z)
+    params = spec['params']
+    rows = [params['all']] if 'all' in params else [params['1st'], params['2nd_3rd']]
+    blended = np.asarray([sum(float(weight) * terms[name] for name, weight in row.items()) for row in rows])
     stages = np.asarray([float(value) for value in temperatures])
     return blended, list(stages / stages[0])
 
@@ -69,18 +119,37 @@ def available(bet, starters):
     return starters >= (3 if bet in ('wide', 'trio', 'trifecta') else 2)
 
 
+def _staged_orders_by_row(rows, per_stage, generator, batch):
+    """Like ranking_v3._staged_orders, with the strengths of finishing position k taken from row min(k, last)."""
+    count = rows.shape[1]
+    remaining = np.ones((batch, count), dtype=bool)
+    orders = np.empty((batch, count), dtype=np.int64)
+    index = np.arange(batch)
+    for position in range(count):
+        scores = rows[min(position, len(rows) - 1)]
+        uniforms = np.maximum(generator.random((batch, count)), np.finfo(float).tiny)
+        keys = (scores - scores.max())[None, :] / per_stage[position] - np.log(-np.log(uniforms))
+        keys[~remaining] = -np.inf
+        picks = np.argmax(keys, axis=1)
+        orders[:, position] = picks
+        remaining[index, picks] = False
+    return orders
+
+
 def simulate_top3(scores, completion, temperatures, *, samples=20000, seed=42):
-    """(samples, 3) indices of the first three finishers (-1 where fewer horses finish)."""
+    """(samples, 3) indices of the first three finishers (-1 where fewer horses finish).  ``scores`` is one
+    strength per runner, or rows of strengths by finishing stage (see blend_with_market)."""
     from .ranking_v3 import _staged_orders, stage_temperatures
     scores = np.asarray(scores, dtype=float)
     completion = np.clip(np.asarray(completion, dtype=float), 0, 1)
-    count = len(scores)
+    count = scores.shape[-1]
     per_stage = stage_temperatures(temperatures, count)
     generator = np.random.default_rng(int(seed))
     parts, remaining = [], int(samples)
     while remaining:
         batch = min(remaining, 4096)
-        orders = _staged_orders(scores - scores.max(), per_stage, generator, batch)
+        orders = (_staged_orders(scores - scores.max(), per_stage, generator, batch) if scores.ndim == 1
+                  else _staged_orders_by_row(scores, per_stage, generator, batch))
         finished = generator.random((batch, count)) < completion[orders]
         rank = np.cumsum(finished, axis=1)
         top = np.full((batch, 3), -1, dtype=np.int64)

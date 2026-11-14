@@ -123,9 +123,40 @@ class MarketBlendTests(unittest.TestCase):
         blended, stages = blend_with_market('local', scores, temperatures, [2.0, 4.0, [8.0, 9.0]])
         inverse = np.asarray([1 / 2, 1 / 4, 1 / 8])
         expected = MARKET_BLEND['local']['a'] * np.asarray(scores) + MARKET_BLEND['local']['b'] * np.log(inverse / inverse.sum())
-        np.testing.assert_allclose(blended, expected)
+        np.testing.assert_allclose(blended, [expected])
         self.assertEqual(stages, [1.0, 1.5, 2.0])
         self.assertIsNone(blend_with_market('central', scores, temperatures, [2.0, None, 5.0]))
+
+    def test_stagewise_mix_from_the_experiment_output(self):
+        import json
+        import math
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from keiba_ai.bets import blend_with_market, load_market_config, simulate_top3
+        params = {'1st': dict(s=.1, m=.8, m2=-.03, s_exp=-.1), '2nd_3rd': dict(s=.5, m=.0, m2=-.1, s_field=.02)}
+        scale = dict(field_mean=12.0, field_sd=3.0, exp_mean=2.0, exp_sd=1.0)
+        output = dict(groups=dict(local_flat=dict(recommended=dict(variant='all', params=params, standardization=scale)),
+                                  central_flat=dict(recommended=dict(variant='all', params=params))))
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'market.json'
+            path.write_text(json.dumps(output), encoding='utf-8')
+            config = load_market_config(path)
+            self.assertIsNone(load_market_config(Path(directory) / 'missing.json'))
+        self.assertEqual(config['local']['variant'], 'all')
+        self.assertEqual(config['central']['variant'], 'blend')  # covariates without their scale: built-in kept
+        scores, odds, starts = [1.0, 0.0, -1.0], [2.0, 4.0, 8.0], [10, None, 0]
+        rows, _ = blend_with_market('local', scores, [1.0, 1.0], odds, prior_starts=starts, config=config)
+        self.assertEqual(rows.shape, (2, 3))
+        inverse = np.asarray([1 / 2, 1 / 4, 1 / 8])
+        m = np.log(inverse / inverse.sum())
+        exp_z = np.asarray([math.log1p(10) - 2.0, 0.0, math.log1p(0) - 2.0])
+        np.testing.assert_allclose(rows[0], .1 * np.asarray(scores) + .8 * m - .03 * m ** 2 - .1 * np.asarray(scores) * exp_z)
+        np.testing.assert_allclose(rows[1], .5 * np.asarray(scores) - .1 * m ** 2 + .02 * np.asarray(scores) * (3 - 12) / 3)
+        # 1st place follows the first row, later places the second
+        first_only = np.asarray([[5.0, 0.0, 0.0], [0.0, 0.0, 5.0]])
+        top3 = simulate_top3(first_only, [1.0] * 3, [1.0], samples=4000, seed=1)
+        self.assertGreater((top3[:, 0] == 0).mean(), .95)
+        self.assertGreater((top3[:, 1] == 2).mean(), .95)
 
 
 if __name__ == '__main__':

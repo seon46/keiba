@@ -71,15 +71,21 @@ def load(model_dir, dataset, group):
     return with_terms(data)
 
 
-def with_terms(data):
-    """Add ``terms`` (races, runners, len(TERMS)); covariates standardised over the present runners."""
+def with_terms(data, standardization=None):
+    """Add ``terms`` (races, runners, len(TERMS)); the covariates are standardised over the present runners of
+    ``data`` unless ``standardization`` (field_mean, field_sd, exp_mean, exp_sd) is given.  ``experience`` is
+    log(1 + prior starts)."""
     present = data['present']
     s, m = data['model'], data['market']
     field = present.sum(axis=1).astype(float)
-    field_z = (field - field.mean()) / (field.std() or 1.0)
     experience = data.get('experience', np.zeros(s.shape))
     values = experience[present]
-    exp_z = np.where(present, (experience - values.mean()) / (values.std() or 1.0), 0.0)
+    if standardization is None:
+        standardization = dict(field_mean=float(field.mean()), field_sd=float(field.std() or 1.0),
+                               exp_mean=float(values.mean()), exp_sd=float(values.std() or 1.0))
+    data['standardization'] = standardization
+    field_z = (field - standardization['field_mean']) / standardization['field_sd']
+    exp_z = np.where(present, (experience - standardization['exp_mean']) / standardization['exp_sd'], 0.0)
     columns = dict(s=s, m=m, m2=m ** 2, s_field=s * field_z[:, None], m_field=m * field_z[:, None],
                    s_exp=s * exp_z, m_exp=m * exp_z)
     data['terms'] = np.stack([np.where(present, columns[name], 0.0) for name in TERMS], axis=2)
@@ -187,6 +193,7 @@ def evaluate_group(model_dir, dataset, group, report=None, data=None):
                   if variant != 'blend' and values and min(values) >= MIN_GAIN]
     best = max(candidates, key=lambda variant: np.mean(gains[variant])) if candidates else 'blend'
     result['recommended'] = dict(variant=best, params=result['full_year'][best]['params'],
+                                 standardization=data['standardization'],
                                  rule=f'out-of-sample gain over blend >= {MIN_GAIN} per race in both halves')
     return result
 
