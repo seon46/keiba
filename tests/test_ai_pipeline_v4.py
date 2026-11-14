@@ -71,6 +71,12 @@ class PipelineV4Tests(unittest.TestCase):
             self.assertEqual(set(result['full_year']), {'model', 'market', 'blend', 'model_uncertain', 'full'})
             self.assertGreaterEqual(result['full_year']['full']['log_likelihood'],
                                     result['full_year']['model']['log_likelihood'] - 1e-6)
+            from keiba_ai.experiment_market import evaluate_group as market
+            result = market(root / 'model', database, 'local_flat')
+            self.assertEqual(set(result['full_year']), {'blend', 'curve', 'stages', 'conditions', 'all'})
+            self.assertGreaterEqual(result['full_year']['all']['log_likelihood'],
+                                    result['full_year']['blend']['log_likelihood'] - 1e-6)
+            self.assertIn(result['recommended']['variant'], result['full_year'])
 
             with (root / 'model' / 'evaluation_local_flat.csv').open(encoding='utf-8') as file:
                 evaluated = list(csv.DictReader(file))

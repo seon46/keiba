@@ -35,6 +35,8 @@ def save_snapshot(store_dir, region, race_id, page, rows, retrieved_at):
                        carried_weight_kg=float(row['carried_weight_kg']), weight_kg=float(row['weight_kg']),
                        weight_change_kg=float(row['weight_change_kg']))
         if page == 'results':
+            if row.get('odds'):
+                payload['odds'] = float(row['odds'])
             payload.update(finish_position=int(row['finish_position']), finish_status=row['finish_status'],
                            time_seconds=float(row['time_seconds']))
         connection.execute('INSERT INTO runners VALUES (?,?,?,?)',

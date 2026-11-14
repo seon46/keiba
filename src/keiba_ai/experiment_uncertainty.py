@@ -80,12 +80,13 @@ def load_races(model_dir, dataset, group):
     width = max(len(members) for _, _, members, _, _ in kept)
     count = len(kept)
     shape = (count, width)
-    data = dict(race_ids=[], months=np.zeros(count, dtype=int), present=np.zeros(shape, dtype=bool),
+    data = dict(race_ids=[], horse_ids=[], months=np.zeros(count, dtype=int), present=np.zeros(shape, dtype=bool),
                 model=np.zeros(shape), market=np.zeros(shape), spread=np.zeros(shape), odds=np.ones(shape),
                 place=np.zeros((count, 3), dtype=int), temperatures=temperatures)
     for index, (race_id, day, members, positions, values) in enumerate(kept):
         n = len(members)
         data['race_ids'].append(race_id)
+        data['horse_ids'].append([member['horse_id'] for member in members])
         data['months'][index] = int(day[5:7])
         data['present'][index, :n] = True
         data['model'][index, :n] = [float(member['strength_score']) for member in members]
@@ -100,7 +101,9 @@ def load_races(model_dir, dataset, group):
 
 def _subset(data, mask):
     out = {key: value[mask] if isinstance(value, np.ndarray) else value for key, value in data.items()}
-    out['race_ids'] = [race for race, keep in zip(data['race_ids'], mask) if keep]
+    for key in ('race_ids', 'horse_ids'):
+        if key in data:
+            out[key] = [item for item, keep in zip(data[key], mask) if keep]
     return out
 
 
