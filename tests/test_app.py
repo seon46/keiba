@@ -185,6 +185,49 @@ class AppTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_odds_timing_buckets_snapshots_by_minutes_before_the_start(self):
+        import sqlite3
+        from unittest import mock
+        from app_fixtures import FakeScraper, races_on, save_snapshot
+        from keiba_app import odds_timing
+        from keiba_app.engine import Engine
+        app = self._app('timing')
+        day = self.fixture['days_after'][1]
+        races = sorted(races_on(self.fixture['rows'], day).items())[:3]
+        engine = Engine(app, scraper=FakeScraper({}), samples=128)
+        store = sqlite3.connect(Path(self.fixture['data_dir']) / 'keiba.sqlite3')
+        for (region, race_id), rows in races:
+            save_snapshot(self.fixture['data_dir'], region, race_id, 'entries', rows, f'{day}T09:00:00+09:00')
+            engine.predict_race(region, race_id)
+            finished = [dict(row, odds=str(2.0 + index)) for index, row in enumerate(rows)]
+            save_snapshot(self.fixture['data_dir'], region, race_id, 'results', finished, f'{day}T17:00:00+09:00')
+            win = {str(row['horse_number']): 3.0 + index for index, row in enumerate(rows)}
+            for stamp in ('09:00', '15:30', '16:00'):  # start 15:40: 6h40m before, 10 minutes before, after
+                snapshot = f'{race_id}-odds-{stamp}'
+                store.execute('INSERT INTO observations VALUES (?,?,?,?,?,?,?)',
+                              (snapshot, f'https://example.invalid/{race_id}/odds/{stamp}', f'{day}T{stamp}:00+09:00',
+                               200, 'utf-8', '0' * 64, 'raw/none'))
+                store.execute('INSERT INTO odds VALUES (?,?,?,?)', (snapshot, race_id, region, json.dumps(
+                    dict(race_id=race_id, region=region, odds=dict(win=win)))))
+            store.commit()
+        store.close()
+        with sqlite3.connect(app.logbook_path) as log:  # predicted in the morning of the race
+            log.execute('UPDATE predictions SET created_at=?', (f'{day}T08:00:00+09:00',))
+        samples = odds_timing.collect(app)
+        counts = {bucket: len(items) for bucket, items in samples.items()}
+        self.assertEqual(counts['3〜12時間前'], counts['15分以内'])
+        self.assertEqual(counts[odds_timing.FINAL], counts['15分以内'])
+        self.assertGreater(counts['15分以内'], 0)
+        self.assertEqual(counts['1〜3時間前'] + counts['12時間以上前'] + counts['15〜60分前'], 0)
+        sample = samples['15分以内'][0]
+        self.assertEqual(len(sample['place']), 3)
+        with mock.patch.object(odds_timing, 'MIN_RACES', 1):
+            report = odds_timing.analyse(samples)
+        region = races[0][0][0]
+        entry = report[region]['15分以内']
+        self.assertIn('fitted_weights', entry)
+        self.assertGreaterEqual(entry['fitted_blend'], entry['current_blend'] - 1e-6)
+
     def test_requests_from_other_sites_are_refused(self):
         import http.client
         from http.server import ThreadingHTTPServer
