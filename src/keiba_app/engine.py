@@ -440,21 +440,30 @@ class Engine:
                     confidence=self.confidence(prediction))
 
     def fetch_odds(self, region, race_id, *, axes=3):
-        """Fetch the odds; for a local race with a prediction also 3連複 / 3連単 for ``axes`` axis horses each."""
-        trio, trifecta = self.odds_axes(region, race_id, axes) if region == 'local' else ([], [])
-        return self.scraper.odds(region, race_id, trio_axes=trio, trifecta_axes=trifecta)
+        """Fetch the odds.  For a local race with a prediction, 3連複 / 3連単 are fetched afterwards for ``axes``
+        axis horses each, chosen with the just-fetched win odds mixed in (the same probabilities as the bets)."""
+        fetched = self.scraper.odds(region, race_id)
+        if region != 'local':
+            return fetched
+        trio, trifecta = self.odds_axes(region, race_id, axes)
+        if trio or trifecta:
+            fetched += self.scraper.odds(region, race_id, trio_axes=trio, trifecta_axes=trifecta, axes_only=True)
+        return fetched
 
     def odds_axes(self, region, race_id, count=3):
         """Axis horses whose local 3連複 / 3連単 pages cover the likeliest tickets: (trio axes, trifecta axes).
 
+        The probabilities are the ones the bet proposals use: mixed with the saved win odds when there are any.
         3連単 pages list the orders with the axis first, so the axes are the ``count`` most likely winners.  3連複
         pages list every trio containing the axis, so the axes are picked greedily to cover the most probability
         among the 60 likeliest trios.  ([], []) without a prediction."""
         predictions = self.logbook.predictions_for_race(race_id)
         if not predictions or count <= 0:
             return [], []
+        saved = self.saved.odds(region, race_id)
+        win_odds = ((saved or {}).get('odds') or {}).get('win')
         try:
-            bets = self._race_bets(predictions[0])
+            bets = self._race_bets(predictions[0], win_odds or None)
         except ValueError:
             return [], []
         winners = sorted(bets.probabilities('win').items(), key=lambda item: -item[1])

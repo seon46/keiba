@@ -81,6 +81,8 @@ def parser() -> argparse.ArgumentParser:
     odds.add_argument('--sample-dir', type=Path, help='形式確認用に受信した原本をこのフォルダーにも保存（地方はこれのみ）')
     odds.add_argument('--trio-axis', action='append', type=int, default=[],
                       help='地方：この馬を含む3連複のオッズも取得（軸1頭ごとに1ページ。複数回指定可）')
+    odds.add_argument('--axes-only', action='store_true',
+                      help='地方：単勝などのページは取らず、--trio-axis / --trifecta-axis の軸のページだけ取得')
     odds.add_argument('--trifecta-axis', action='append', type=int, default=[],
                       help='地方：この馬が1着の3連単のオッズも取得（軸1頭ごとに1ページ。複数回指定可）')
     listing = commands.add_parser('list', help='指定日のレースIDを表示')
@@ -332,7 +334,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.region == 'local':
                     from .parsers import LOCAL_ODDS_PAGES, parse_local_odds
                     kinds = ('b1', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8') if args.sample_dir else LOCAL_ODDS_PAGES
-                    counts = {}
+                    if args.axes_only:
+                        kinds = ()
+                    counts, observation = {}, None
                     for kind in kinds:
                         observation, html, _ = client.fetch(urls.odds_page_url(race_id, 'local', kind))
                         if args.sample_dir:
@@ -356,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
                         counts.update({bet: len(table) for bet, table in triples.items()})
                     if not counts:
                         raise ValueError('まだ発売前で、オッズがありません。発売が始まってから取得してください。')
-                    report(race_id=race_id, region='local', bets=counts, retrieved_at=observation.retrieved_at)
+                    report(race_id=race_id, region='local', bets=counts, retrieved_at=(observation or last).retrieved_at)
                     continue
                 observation, text, _ = client.fetch(urls.odds_url(race_id, 'central'), json_ok=True)
                 if args.sample_dir:
