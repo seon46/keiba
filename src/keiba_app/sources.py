@@ -254,8 +254,8 @@ class Scraper:
             failed += code != 0
         return failed
 
-    def odds(self, region, race_id, *, trio_axes=(), trifecta_axes=()):
-        arguments = ['odds', '--region', region, '--race-id', race_id]
+    def odds(self, region, race_id, *, trio_axes=(), trifecta_axes=(), axes_only=False):
+        arguments = ['odds', '--region', region, '--race-id', race_id] + (['--axes-only'] if axes_only else [])
         for axis in trio_axes:
             arguments += ['--trio-axis', str(axis)]
         for axis in trifecta_axes:

@@ -241,6 +241,56 @@ class AppTests(unittest.TestCase):
         self.assertIn('fitted_weights', entry)
         self.assertGreaterEqual(entry['fitted_blend'], entry['current_blend'] - 1e-6)
 
+    def test_local_axes_are_chosen_after_the_win_odds_with_the_market_mixed_in(self):
+        import sqlite3
+        from app_fixtures import FakeScraper, races_on, save_snapshot
+        from keiba_app.engine import Engine
+        app = self._app('axes')
+        day = self.fixture['days_after'][3]
+        races = races_on(self.fixture['rows'], day)
+        region, race_id = next(key for key in sorted(races) if key[0] == 'local') if any(
+            key[0] == 'local' for key in races) else sorted(races)[0]
+        rows = races[(region, race_id)]
+        save_snapshot(self.fixture['data_dir'], region, race_id, 'entries', rows, f'{day}T09:00:00+09:00')
+        database = Path(self.fixture['data_dir']) / 'keiba.sqlite3'
+
+        class Scraper(FakeScraper):
+            calls = []
+
+            def odds(self, region_, race_id_, *, trio_axes=(), trifecta_axes=(), axes_only=False):
+                self.calls.append((list(trio_axes), list(trifecta_axes), axes_only))
+                if not axes_only:  # the win page: the model's weakest runner is the market's clear favourite
+                    weakest = min(self.win, key=self.win.get)
+                    table = {number: (1.3 if number == weakest else 40.0) for number in self.win}
+                    store = sqlite3.connect(database)
+                    store.execute('INSERT INTO observations VALUES (?,?,?,?,?,?,?)',
+                                  (f'{race_id_}-win', f'https://example.invalid/{race_id_}/win', f'{day}T10:00:00+09:00',
+                                   200, 'utf-8', '0' * 64, 'raw/none'))
+                    store.execute('INSERT INTO odds VALUES (?,?,?,?)', (f'{race_id_}-win', race_id_, region_, json.dumps(
+                        dict(race_id=race_id_, region=region_, odds=dict(win=table)))))
+                    store.commit()
+                    store.close()
+                return [dict(bets={'win': 1})]
+
+        scraper = Scraper({})
+        engine = Engine(app, scraper=scraper, samples=128)
+        identifier = engine.predict_race(region, race_id)
+        prediction = engine.logbook.prediction(identifier)
+        scraper.win = {str(r['horse_number']): r['win_probability'] for r in prediction['runners']}
+        model_only = engine.odds_axes(region, race_id, 3)
+        fetched = engine.fetch_odds(region, race_id)
+        if region != 'local':
+            self.assertEqual(len(scraper.calls), 1)
+            return
+        self.assertEqual(len(fetched), 2)
+        (_, _, first), (trio, trifecta, second) = scraper.calls
+        self.assertFalse(first)
+        self.assertTrue(second)
+        favourite = int(min(scraper.win, key=scraper.win.get))
+        self.assertEqual(trifecta[0], favourite)  # the market favourite now leads the 3連単 axes
+        self.assertNotIn(favourite, model_only[1][:1])
+        self.assertEqual(len(trio), 3)
+
     def test_requests_from_other_sites_are_refused(self):
         import http.client
         from http.server import ThreadingHTTPServer

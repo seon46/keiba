@@ -103,6 +103,35 @@ class LocalOddsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             urls.local_axis_odds_url('202648111309', 'b4', 5)
 
+    def test_axes_only_fetches_just_the_axis_pages(self):
+        from unittest import mock
+        from keiba_scraper import cli
+        trifecta = '<table class="Odds_Table"><tr><td class="Odds" id="chk_1a6-48-9_b8_c0_5_1_2">12.5</td></tr></table>'
+        trio = trifecta.replace('_b8_', '_b7_')
+        fetched = []
+
+        class FakeClient:
+            def __init__(self, store, **options):
+                self.store, self.refresh = store, True
+
+            def fetch(self, url, **options):
+                fetched.append(url)
+                html = trifecta if 'type=b8' in url else trio if 'type=b7' in url else NAR_B1
+                return self.store.observe(url, html.encode('utf-8'), encoding='utf-8'), html, False
+
+            def close(self):
+                pass
+
+        with TemporaryDirectory() as directory, mock.patch.object(cli, 'Client', FakeClient):
+            code = cli.main(['--data-dir', directory, 'odds', '--region', 'local', '--race-id', '202648111309',
+                             '--axes-only', '--trio-axis', '5', '--trifecta-axis', '5'])
+            self.assertEqual(code, 0)
+            self.assertEqual(len(fetched), 2)
+            self.assertTrue(all('jiku=5' in url for url in fetched))
+            fetched.clear()
+            cli.main(['--data-dir', directory, 'odds', '--region', 'local', '--race-id', '202648111309'])
+            self.assertFalse(any('jiku=' in url for url in fetched))
+
     def test_presale_pages_have_no_odds(self):
         from keiba_scraper.parsers import parse_local_odds
         import re
