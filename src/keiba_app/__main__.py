@@ -48,8 +48,9 @@ def main(argv=None):
     app = App(args.data_dir)
     try:
         if args.command == 'init':
-            from .nightly import dataset_info, model_info
+            from .nightly import _index_days, dataset_info, model_info
             dataset, model = args.dataset.resolve(), args.model_dir.resolve()
+            _index_days(dataset)  # a database prepared by hand has no day index: the status page needs it
             info = dataset_info(dataset)
             summary = model_info(model)
             if summary is None:
